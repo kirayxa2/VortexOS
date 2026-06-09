@@ -213,8 +213,8 @@ int virtio_gpu_init(void) {
         pci_device_t *c = pci_get_device(i);
         if (c && c->vendor == 0x1AF4 && c->device == 0x1050) { d = c; break; }
     }
-    if (!d) { fb_puts("[virtio-gpu] устройство не найдено (нужен -vga virtio)\n"); return 0; }
-    fb_puts("[virtio-gpu] найдено устройство, инициализация...\n");
+    if (!d) { fb_puts("[virtio-gpu] device not found (run QEMU with -vga virtio)\n"); return 0; }
+    fb_puts("[virtio-gpu] device found, initializing...\n");
 
     /* включить Bus Master + Memory Space в PCI command (bit 1|2) */
     uint32_t cmd = pci_read32(d->bus, d->dev, d->func, 0x04);
@@ -242,7 +242,7 @@ int virtio_gpu_init(void) {
         }
         cap = pci_read8(d->bus, d->dev, d->func, cap + 1) & 0xFC;
     }
-    if (!cc_base || !notify_base) { fb_puts("[virtio-gpu] cap'ы не найдены\n"); return 0; }
+    if (!cc_base || !notify_base) { fb_puts("[virtio-gpu] caps not found\n"); return 0; }
 
     /* 3. reset + ACK|DRIVER */
     mmio_w8(cc_base + CC_DEV_STATUS, 0);
@@ -256,14 +256,14 @@ int virtio_gpu_init(void) {
     uint8_t st = VIRTIO_STAT_ACKNOWLEDGE | VIRTIO_STAT_DRIVER | VIRTIO_STAT_FEATURES_OK;
     mmio_w8(cc_base + CC_DEV_STATUS, st);
     if (!(mmio_r8(cc_base + CC_DEV_STATUS) & VIRTIO_STAT_FEATURES_OK)) {
-        fb_puts("[virtio-gpu] FEATURES_OK отклонён\n");
+        fb_puts("[virtio-gpu] FEATURES_OK rejected\n");
         mmio_w8(cc_base + CC_DEV_STATUS, VIRTIO_STAT_FAILED); return 0;
     }
 
     /* 5. controlq (queue 0): одна страница под desc|avail|used */
     mmio_w16(cc_base + CC_QUEUE_SEL, 0);
     uint16_t qsz = mmio_r16(cc_base + CC_QUEUE_SIZE);
-    if (qsz < QSIZE) { fb_puts("[virtio-gpu] controlq слишком мала\n"); return 0; }
+    if (qsz < QSIZE) { fb_puts("[virtio-gpu] controlq too small\n"); return 0; }
     if (qsz > QSIZE) { mmio_w16(cc_base + CC_QUEUE_SIZE, QSIZE); }
 
     ring_phys = pmm_alloc_zero();
@@ -309,11 +309,11 @@ int virtio_gpu_init(void) {
     uint64_t fb_bytes = (uint64_t)g_pitch * g_h;
     g_fb_pages = (fb_bytes + 0xFFF) / 0x1000;
     g_entry_page_count = (uint32_t)((g_fb_pages * sizeof(gpu_mem_entry_t) + 0xFFF) / 0x1000);
-    if (g_entry_page_count > MAX_ENTRY_PAGES) { fb_puts("[virtio-gpu] экран слишком большой\n"); return 0; }
+    if (g_entry_page_count > MAX_ENTRY_PAGES) { fb_puts("[virtio-gpu] screen too large\n"); return 0; }
 
     extern void *kmalloc(uint64_t);
     uint8_t *raw = (uint8_t *)kmalloc(fb_bytes + 0x1000);
-    if (!raw) { fb_puts("[virtio-gpu] нет памяти под fb\n"); return 0; }
+    if (!raw) { fb_puts("[virtio-gpu] out of memory for fb\n"); return 0; }
     g_fb = (uint32_t *)(((uint64_t)raw + 0xFFF) & ~0xFFFULL);
     for (uint64_t i = 0; i < fb_bytes / 4; i++) g_fb[i] = 0xFF000000;  /* чёрный ARGB */
 
@@ -367,7 +367,7 @@ int virtio_gpu_init(void) {
     }
 
     g_active = 1;
-    fb_puts("[virtio-gpu] OK — scanout переключён на GPU-ресурс ");
+    fb_puts("[virtio-gpu] OK - scanout switched to GPU resource ");
     put_dec(g_w); fb_puts("x"); put_dec(g_h); fb_puts("\n");
     /* первый present всего экрана */
     virtio_gpu_flush(0, 0, (int)g_w, (int)g_h);
