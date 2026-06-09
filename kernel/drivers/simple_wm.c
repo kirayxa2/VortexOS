@@ -348,6 +348,16 @@ static void wm_render_region(int rx, int ry, int rw, int rh) {
     if (rw <= 0 || rh <= 0) return;
     g_rendering = 1;
 
+    /* Накапливаем damage этого кадра с нуля. take_down/compose добавят сюда
+     * прямоугольники старого и нового положения курсора. */
+    comp_damage_reset();
+
+    /* Снимаем софт-курсор из back buffer ДО перекомпоновки: иначе старый спрайт
+     * (если он вне региона) попадёт в save-under следующего comp_cursor_compose
+     * и «штампанётся» белыми следами при движении мыши (эффект «стёрки»).
+     * take_down также добавит старый прямоугольник курсора в damage. */
+    comp_cursor_take_down();
+
     /* Фон только в регионе. */
     comp_fill_rect(rx, ry, rw, rh, 0xFF1A1A2E);
 
@@ -362,12 +372,13 @@ static void wm_render_region(int rx, int ry, int rw, int rh) {
         comp_blit_buffer(win->x, win->y + 20, win->w, win->h, win->pixels);
     }
 
-    /* Курсор поверх (он внутри региона при перетаскивании за title bar). */
+    /* Курсор поверх (он внутри региона при перетаскивании за title bar).
+     * compose добавит прямоугольник нового положения курсора в damage. */
     comp_cursor_compose();
     g_cursor_moved = 0;
 
-    /* Во front buffer уходит только этот прямоугольник. */
-    comp_damage_reset();
+    /* Во front buffer уходит этот прямоугольник + прямоугольники курсора
+     * (старый из take_down, новый из compose). */
     comp_damage_add(rx, ry, rw, rh);
     comp_present();
 

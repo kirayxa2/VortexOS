@@ -99,10 +99,18 @@ static void term_render(void) {
     /* фон всего окна */
     wm_draw_rect(g_win, 0, 0, WIN_W, WIN_H, COL_BG);
 
-    /* Снизу всегда строка ввода (prompt + input). Над ней — хвост scrollback. */
-    int visible_history = ROWS - 1;
-    int first = sb_count - visible_history;
-    if (first < 0) first = 0;
+    /* Поведение как в нормальном терминале / kitty: строка ввода (prompt) идёт
+     * СРАЗУ ПОД последней строкой вывода, а не приколочена к низу окна. Пока
+     * вывод+промпт влезают (sb_count+1 <= ROWS) — рисуем от верха, промпт сразу
+     * под историей. Когда экран заполнился — скроллим (показываем хвост так,
+     * чтобы промпт оказался в самой нижней строке). */
+    int total = sb_count + 1;                   /* история + строка ввода */
+    int first;
+    if (total <= ROWS) {
+        first = 0;                              /* всё влезает — от верха */
+    } else {
+        first = sb_count - (ROWS - 1);          /* хвост: последние ROWS-1 + ввод */
+    }
 
     int row = 0;
     for (int idx = first; idx < sb_count; idx++, row++) {
@@ -110,8 +118,8 @@ static void term_render(void) {
         wm_draw_string(g_win, 0, row * CH_H, sb[slot], COL_FG);
     }
 
-    /* строка ввода в самом низу */
-    int iy = (ROWS - 1) * CH_H;
+    /* строка ввода — прямо следующей строкой после последнего вывода */
+    int iy = row * CH_H;
     wm_draw_string(g_win, 0, iy, "vortex> ", COL_PROMPT);
     int px = 8 * CH_W;                          /* после "vortex> " */
     /* показываем хвост ввода, если он не влезает */

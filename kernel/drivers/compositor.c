@@ -431,6 +431,28 @@ static void cursor_unblit_back(void) {
 void comp_cursor_compose(void) {
     cursor_in_back = false;      /* старый save-under недействителен после clear */
     cursor_blit_back();
+    /* Помечаем прямоугольник курсора как damage — чтобы частичный present
+     * (wm_render_region) скопировал свежий курсор во front buffer, даже если он
+     * у края/вне перерисованного окна. На полном кадре damage_full перекроет. */
+    comp_damage_add(cursor_drawn_x, cursor_drawn_y, CURSOR_SPRITE_W, CURSOR_SPRITE_H);
+}
+
+/* Снять курсор из back buffer ДО частичной перекомпоновки окна (wm_render_region).
+ *
+ * Зачем: при частичном рендере comp_clear НЕ затирает старый спрайт курсора (он
+ * может быть вне перерисовываемого окна). Если просто бросить cursor_in_back=false
+ * и заново вкомпоновать курсор, то cursor_blit_back сохранит в save-under ПИКСЕЛИ
+ * САМОГО КУРСОРА (он ещё в буфере), и при следующем движении мыши они «штампуются»
+ * обратно → белые следы / эффект «стёрки» по тексту.
+ *
+ * Поэтому здесь восстанавливаем фон из save-under (back buffer снова чистый на
+ * старом месте) и помечаем старый прямоугольник как damage, чтобы present починил
+ * пиксели и вне перерисовываемого окна. Вызывать в НАЧАЛЕ wm_render_region, до
+ * перерисовки фона/окон. Не использовать после comp_clear (save-under протух). */
+void comp_cursor_take_down(void) {
+    if (!cursor_in_back) return;
+    comp_damage_add(cursor_drawn_x, cursor_drawn_y, CURSOR_SPRITE_W, CURSOR_SPRITE_H);
+    cursor_unblit_back();
 }
 
 /* Движение только курсора (сцена окон НЕ менялась): убираем курсор со старого

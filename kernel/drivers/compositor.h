@@ -64,6 +64,7 @@ void comp_update_mouse(int dx, int dy, uint8_t buttons);
  * полный кадр (звать до comp_present). comp_cursor_refresh() — лёгкий путь при
  * движении мыши: переносит курсор и выводит только два мелких прямоугольника. */
 void comp_cursor_compose(void);
+void comp_cursor_take_down(void);   /* снять курсор из back buffer до частичного рендера */
 void comp_cursor_refresh(void);
 
 /* Damage rectangles (#2): копировать во front buffer только изменившееся. */
