@@ -485,9 +485,25 @@ static void win_draw_shadow(int wx, int wy, int ww, int wh) {
     const int S = WIN_SHADOW, oy = WIN_SHADOW_OY;
     int x0 = wx - S, y0 = wy - S + oy;
     int x1 = wx + ww + S, y1 = wy + wh + S + oy;
+    const int r = WIN_CORNER;
     for (int y = y0; y < y1; y++) {
         for (int x = x0; x < x1; x++) {
-            if (x >= wx && x < wx + ww && y >= wy && y < wy + wh) continue;
+            /* Пропускаем только пиксели, РЕАЛЬНО закрытые окном — с учётом
+             * скруглённых углов. Вырезы углов (внутри прямоугольника, но за
+             * дугой скругления) НЕ пропускаем: туда тоже должна падать тень.
+             * Иначе в углу за скруглением остаётся голый фон десктопа без
+             * тени — он светлее окна и читается как «лишний светлый квадрат». */
+            if (x >= wx && x < wx + ww && y >= wy && y < wy + wh) {
+                int lx = x - wx, ly = y - wy, cx = -1, cy = -1;
+                if      (lx < r      && ly < r)      { cx = r;      cy = r;      }
+                else if (lx >= ww - r && ly < r)     { cx = ww - r; cy = r;      }
+                else if (lx < r      && ly >= wh - r){ cx = r;      cy = wh - r; }
+                else if (lx >= ww - r && ly >= wh - r){ cx = ww - r; cy = wh - r; }
+                if (cx < 0) continue;  /* не в углу — закрыто окном */
+                int ddx = lx - cx, ddy = ly - cy;
+                if (ddx * ddx + ddy * ddy <= r * r) continue;  /* внутри дуги — закрыто */
+                /* иначе: вырез скруглённого угла — даём тени упасть сюда */
+            }
             int dx = 0, dy = 0;
             if (x < wx)            dx = wx - x;
             else if (x >= wx + ww) dx = x - (wx + ww) + 1;
