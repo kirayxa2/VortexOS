@@ -595,7 +595,8 @@ static int win_button_hit(const wm_window_t *win, int mx, int my) {
 /* AA-рамка со скруглёнными углами: прямые стороны + 4 дуги-обводки по той же
  * дуге (радиус r), что и заливка углов. Нужна, потому что bg окна по цвету
  * почти сливается с тенью — без обводки скругление НЕ ВИДНО и угол кажется
- * прямым. Кольцо обводки = покрытие(r) − покрытие(r−2), сглажено по краям. */
+ * прямым. Кольцо обводки = покрытие(r) − покрытие(r−1): тонкая ~1px линия,
+ * чтобы дуга совпадала по толщине с прямыми сторонами рамки. */
 static void draw_round_border(int x, int y, int w, int fh, int r, uint32_t color) {
     uint32_t rgb = color & 0x00FFFFFF;
     for (int i = r; i < w - r; i++) {
@@ -615,7 +616,7 @@ static void draw_round_border(int x, int y, int w, int fh, int r, uint32_t color
             for (int i = 0; i < r; i++) {
                 int px = bxs[k] + i, py = bys[k] + j;
                 int ring = circ_cov(px, py, cxs[k], cys[k], r)
-                         - circ_cov(px, py, cxs[k], cys[k], r - 2);
+                         - circ_cov(px, py, cxs[k], cys[k], r - 1);
                 if (ring <= 0) continue;
                 if (ring >= 255) comp_put_pixel(x + px, y + py, color);
                 else comp_blend_pixel(x + px, y + py, ((uint32_t)ring << 24) | rgb);
