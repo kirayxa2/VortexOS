@@ -15,6 +15,43 @@ static uint32_t *back_buffer_storage = 0;
 static uint32_t bb_width = 0;
 static uint32_t bb_height = 0;
 
+/* -------------------------------------------------------------------------
+ * VSync — устранение разрывов (tearing)
+ *
+ * Разрывы возникают потому, что мы копируем back buffer в scanout-буфер
+ * (Limine linear framebuffer = то, что прямо сейчас читает видеолуч) в
+ * произвольный момент. Если копия идёт, пока луч в видимой области, верх кадра
+ * успевает получить новые пиксели, низ — старые → горизонтальный «разрыв».
+ *
+ * Лечится синхронизацией копии с вертикальным гашением (vblank): ждём начала
+ * vblank, и только потом копируем. Аппаратного page-flip без GPU-драйвера нет,
+ * поэтому ждём vblank программно через VGA Input Status Register 1 (порт 0x3DA),
+ * бит 3 = идёт вертикальная развёртка.
+ *
+ * ВАЖНО: на части реального UEFI/GOP-железа legacy-регистр 0x3DA может быть не
+ * подключён. Чтобы это никогда не вешало ядро, оба цикла ограничены таймаутом —
+ * если vblank «не приходит», просто выходим и копируем как раньше. */
+static int vsync_enabled = 1;   /* можно выключить, если на железе хуже */
+
+static inline uint8_t vga_inb(uint16_t port) {
+    uint8_t r;
+    __asm__ volatile ("inb %1, %0" : "=a"(r) : "Nd"(port));
+    return r;
+}
+
+static void vsync_wait(void) {
+    if (!vsync_enabled) return;
+    uint32_t guard;
+    /* Если мы уже внутри vblank — дождёмся его конца (иначе поймаем хвост). */
+    guard = 1000000;
+    while ((vga_inb(0x3DA) & 0x08) && --guard) { }
+    if (!guard) { vsync_enabled = 0; return; }   /* регистр мёртв → больше не ждём */
+    /* Ждём начала следующего vblank — лучший момент для копии. */
+    guard = 1000000;
+    while (!(vga_inb(0x3DA) & 0x08) && --guard) { }
+    if (!guard) vsync_enabled = 0;
+}
+
 void compositor_init(uint32_t *fb, uint32_t w, uint32_t h, uint32_t pitch) {
     extern void fb_puts(const char *);
     extern void fb_puthex(uint64_t);
@@ -311,6 +348,9 @@ static void blit_region_to_front(int x, int y, int w, int h) {
 /* Выводит на экран только damage-прямоугольники (или весь экран, если стоит
  * флаг damage_full). После — список сбрасывается. */
 void comp_present(void) {
+    /* Ждём vblank ОДИН раз перед любой записью в scanout-буфер — так копия
+     * (damage-прямоугольники или полный flip) ложится в гашение, без разрывов. */
+    vsync_wait();
     if (damage_full) {
         comp_flip();
         comp_damage_reset();
