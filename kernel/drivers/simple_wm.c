@@ -576,6 +576,38 @@ static int win_button_hit(const wm_window_t *win, int mx, int my) {
     return -1;
 }
 
+/* AA-рамка со скруглёнными углами: прямые стороны + 4 дуги-обводки по той же
+ * дуге (радиус r), что и заливка углов. Нужна, потому что bg окна по цвету
+ * почти сливается с тенью — без обводки скругление НЕ ВИДНО и угол кажется
+ * прямым. Кольцо обводки = покрытие(r) − покрытие(r−2), сглажено по краям. */
+static void draw_round_border(int x, int y, int w, int fh, int r, uint32_t color) {
+    uint32_t rgb = color & 0x00FFFFFF;
+    for (int i = r; i < w - r; i++) {
+        comp_put_pixel(x + i, y,          color);   /* верх */
+        comp_put_pixel(x + i, y + fh - 1, color);   /* низ  */
+    }
+    for (int j = r; j < fh - r; j++) {
+        comp_put_pixel(x,         y + j, color);     /* лево  */
+        comp_put_pixel(x + w - 1, y + j, color);     /* право */
+    }
+    int cxs[4] = { r, w - r, r,      w - r  };
+    int cys[4] = { r, r,     fh - r, fh - r };
+    int bxs[4] = { 0, w - r, 0,      w - r  };
+    int bys[4] = { 0, 0,     fh - r, fh - r };
+    for (int k = 0; k < 4; k++) {
+        for (int j = 0; j < r; j++) {
+            for (int i = 0; i < r; i++) {
+                int px = bxs[k] + i, py = bys[k] + j;
+                int ring = circ_cov(px, py, cxs[k], cys[k], r)
+                         - circ_cov(px, py, cxs[k], cys[k], r - 2);
+                if (ring <= 0) continue;
+                if (ring >= 255) comp_put_pixel(x + px, y + py, color);
+                else comp_blend_pixel(x + px, y + py, ((uint32_t)ring << 24) | rgb);
+            }
+        }
+    }
+}
+
 /* Рисует chrome окна: тень, скруглённый заголовок, три кнопки-светофора,
  * текст заголовка, контент и тонкую рамку. focused — окно в фокусе. */
 static void wm_draw_window_chrome(wm_window_t *win) {
@@ -626,17 +658,10 @@ static void wm_draw_window_chrome(wm_window_t *win) {
     if (rb * 2 <= win->w && rb <= fh)
         round_bottom_aa(win->x, win->y, win->w, fh, rb, bgL, bgR);
 
-    /* тонкая рамка вокруг окна для чёткости. Все стороны утоплены на WIN_CORNER
-     * от углов, чтобы рамка не «квадратила» скруглённые углы (ни верх, ни низ). */
+    /* AA-рамка, обводящая скруглённые углы (дуги + прямые стороны). Делает
+     * скругление видимым даже когда bg окна сливается с тенью по цвету. */
     uint32_t bord = focused ? 0xFF4A4A72 : 0xFF34343E;
-    comp_draw_line(win->x + WIN_CORNER, win->y,
-                   win->x + win->w - 1 - WIN_CORNER, win->y, bord);                   /* верх */
-    comp_draw_line(win->x, win->y + WIN_CORNER,
-                   win->x, win->y + fh - 1 - WIN_CORNER, bord);                       /* лево */
-    comp_draw_line(win->x + win->w - 1, win->y + WIN_CORNER,
-                   win->x + win->w - 1, win->y + fh - 1 - WIN_CORNER, bord);          /* право */
-    comp_draw_line(win->x + WIN_CORNER, win->y + fh - 1,
-                   win->x + win->w - 1 - WIN_CORNER, win->y + fh - 1, bord);          /* низ */
+    draw_round_border(win->x, win->y, win->w, fh, WIN_CORNER, bord);
 }
 
 void wm_render_all(void) {
