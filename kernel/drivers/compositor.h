@@ -58,6 +58,11 @@ void comp_draw_string(int x, int y, const char *s, uint32_t fg, uint32_t bg);
 /* Курсор мыши */
 void comp_draw_cursor(void);
 void comp_update_mouse(int dx, int dy, uint8_t buttons);
+/* Save-under софт-курсор (#1, софтовый аналог аппаратного курсора):
+ * рисует курсор поверх готовой сцены прямо во front buffer и стирает его со
+ * старого места копией из back buffer. Позволяет двигать курсор БЕЗ recomposite
+ * окон. Зови после comp_flip() (полный кадр) или сам по себе при движении мыши. */
+void comp_cursor_refresh(void);
 
 /* Обновление экрана */
 void comp_clear(uint32_t color);

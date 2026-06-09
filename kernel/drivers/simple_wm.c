@@ -17,6 +17,9 @@ static uint64_t last_cursor_update = 0;
  * (таймерный IRQ vs. wm_flush из задачи). */
 static volatile int g_needs_redraw = 0;
 static volatile int g_rendering = 0;
+/* Курсор сдвинулся, но сцена окон НЕ менялась — обновляем только спрайт курсора
+ * (save-under), без полного recomposite. См. comp_cursor_refresh / fix #1. */
+static volatile int g_cursor_moved = 0;
 
 /* Состояние перетаскивания */
 static struct {
@@ -257,11 +260,14 @@ void wm_render_all(void) {
         comp_blit_buffer(win->x, win->y + 20, win->w, win->h, win->pixels);
     }
     
-    /* Draw cursor */
-    comp_draw_cursor();
-    
-    /* Flip back buffer to screen */
+    /* Flip back buffer to screen.
+     * Курсор в back buffer НЕ блитим — он рисуется поверх во front buffer, чтобы
+     * его движение не требовало recomposite (save-under, fix #1). */
     comp_flip();
+
+    /* Курсор поверх готовой сцены прямо во front buffer. */
+    comp_cursor_refresh();
+    g_cursor_moved = 0;  /* полный кадр уже перерисовал курсор */
 
     g_rendering = 0;
 }
@@ -270,9 +276,19 @@ void wm_render_all(void) {
  * что-то изменилось и compositor уже инициализирован. */
 void wm_tick_render(void) {
     if (!compositor_initialized) return;
-    if (!g_needs_redraw) return;
-    g_needs_redraw = 0;
-    wm_render_all();
+
+    if (g_needs_redraw) {
+        /* Сцена менялась (перетаскивание окна, wm_flush и т.п.) — полный render,
+         * он же перерисует курсор. */
+        g_needs_redraw = 0;
+        wm_render_all();
+    } else if (g_cursor_moved) {
+        /* Двигался ТОЛЬКО курсор — лёгкий путь без recomposite окон: стираем
+         * старое место (фон из back buffer) и рисуем курсор на новом. */
+        if (g_rendering) return;  /* полный render идёт в задаче — подождём тик */
+        g_cursor_moved = 0;
+        comp_cursor_refresh();
+    }
 }
 
 int wm_get_event(uint64_t win_id, void *event_out) {
@@ -313,8 +329,13 @@ void wm_handle_mouse_move(int dx, int dy) {
         }
     }
     
-    /* Render отвязан от ввода: в IRQ только ставим флаг, рисует таймер. */
-    g_needs_redraw = 1;
+    /* Render отвязан от ввода: в IRQ только ставим флаг, рисует таймер.
+     * Тащим окно — менялась сцена → полный render. Иначе двигается только
+     * курсор → лёгкий save-under путь, без recomposite окон (fix #1). */
+    if (drag_state.dragging)
+        g_needs_redraw = 1;
+    else
+        g_cursor_moved = 1;
 }
 
 void wm_handle_mouse_button(uint8_t buttons) {

@@ -249,6 +249,76 @@ void comp_update_mouse(int dx, int dy, uint8_t buttons) {
 }
 
 /* -------------------------------------------------------------------------
+ * Save-under софт-курсор (#1)
+ *
+ * Курсор рисуется НЕ в back buffer, а прямо во front buffer (VRAM) поверх уже
+ * скомпонованной сцены. «Фон под курсором» — это back buffer (он всегда чистый,
+ * без курсора), поэтому отдельное хранилище save-under не нужно: чтобы стереть
+ * курсор, просто копируем нужный кусок back buffer во front buffer.
+ *
+ * Итог: движение мыши не требует recomposite окон — только стереть старое место
+ * курсора (~12x18 пикселей) и нарисовать на новом. Это софтовый аналог того,
+ * что в железе делает аппаратный курсор/спрайт.
+ * ---------------------------------------------------------------------- */
+#define CURSOR_SPRITE_W 12
+#define CURSOR_SPRITE_H 18
+
+static int  cursor_drawn_x = 0;
+static int  cursor_drawn_y = 0;
+static bool cursor_shown   = false;
+
+/* Копирует прямоугольник из back buffer прямо во front buffer (восстановление
+ * фона под курсором). С клипом по экрану/буферу и учётом pitch. */
+static void present_region(int x, int y, int w, int h) {
+    if (!comp.back_buffer || !comp.fb_addr) return;
+    uint32_t fb_stride = comp.pitch / 4;
+    for (int row = 0; row < h; row++) {
+        int yy = y + row;
+        if (yy < 0 || yy >= (int)comp.height || yy >= (int)bb_height) continue;
+        int x0 = x, ww = w;
+        if (x0 < 0) { ww += x0; x0 = 0; }
+        if (x0 + ww > (int)comp.width) ww = (int)comp.width - x0;
+        if (x0 + ww > (int)bb_width)   ww = (int)bb_width   - x0;
+        if (ww <= 0) continue;
+        uint32_t       *d = &comp.fb_addr[(uint32_t)yy * fb_stride + x0];
+        const uint32_t *s = &comp.back_buffer[(uint32_t)yy * bb_width + x0];
+        for (int i = 0; i < ww; i++) d[i] = s[i];
+    }
+}
+
+/* Пишет один пиксель прямо во front buffer (с клипом по экрану). */
+static void put_pixel_front(int x, int y, uint32_t color) {
+    if (x < 0 || x >= (int)comp.width || y < 0 || y >= (int)comp.height) return;
+    comp.fb_addr[(uint32_t)y * (comp.pitch / 4) + x] = color;
+}
+
+/* Рисует спрайт курсора-стрелки прямо во front buffer. */
+static void draw_cursor_front(void) {
+    int x = comp.mouse_x;
+    int y = comp.mouse_y;
+    for (int dy = 0; dy < 17; dy++) {
+        int width = (dy < 11) ? (dy + 1) : (17 - dy);
+        for (int dx = 0; dx < width; dx++) {
+            put_pixel_front(x + dx, y + dy, COLOR_WHITE);
+        }
+        if (width < 11) put_pixel_front(x + width, y + dy, COLOR_BLACK);
+    }
+}
+
+void comp_cursor_refresh(void) {
+    /* Стираем курсор со старого места (фон берём из чистого back buffer). */
+    if (cursor_shown) {
+        present_region(cursor_drawn_x, cursor_drawn_y,
+                       CURSOR_SPRITE_W, CURSOR_SPRITE_H);
+    }
+    /* Рисуем курсор на текущей позиции. */
+    draw_cursor_front();
+    cursor_drawn_x = comp.mouse_x;
+    cursor_drawn_y = comp.mouse_y;
+    cursor_shown   = true;
+}
+
+/* -------------------------------------------------------------------------
  * Утилиты
  * ---------------------------------------------------------------------- */
 
