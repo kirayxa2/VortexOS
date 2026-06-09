@@ -1,0 +1,23 @@
+    static void task_a(void) {
+    uint64_t last = pit_ticks();
+    for (;;) {
+        uint64_t t = pit_ticks();
+        if (t - last >= 200) {
+            last = t;
+            fb_puts("[task_a] tick\n");
+        }
+        __asm__ volatile("hlt");
+    }
+}
+
+static void task_b(void) {
+    uint64_t last = pit_ticks();
+    for (;;) {
+        uint64_t t = pit_ticks();
+        if (t - last >= 350) {
+            last = t;
+            fb_puts("[task_b] hello\n");
+        }
+        __asm__ volatile("hlt");
+    }
+}

@@ -1,0 +1,163 @@
+/* =============================================================================
+ * VOS — kernel/sched/sched.c
+ * Фрейм задачи точно как VortexOS/src/sys/process.c (kernel thread)
+ * ============================================================================= */
+
+#include "sched.h"
+#include "heap.h"
+#include "vmm.h"
+#include "pmm.h"
+#include "gdt.h"
+
+static task_t   tasks[MAX_TASKS];
+static uint32_t task_count = 0;
+static task_t  *current    = 0;
+static task_t  *run_queue  = 0;
+static uint32_t next_pid   = 1;
+
+int vos_need_resched = 0;
+
+static void queue_push(task_t *t) {
+    t->state = TASK_READY;
+    if (!run_queue) { run_queue = t; t->next = t; return; }
+    task_t *tail = run_queue;
+    while (tail->next != run_queue) tail = tail->next;
+    tail->next = t; t->next = run_queue;
+}
+
+static void queue_remove(task_t *t) {
+    if (!run_queue) return;
+    if (run_queue == t && t->next == t) { run_queue = 0; return; }
+    task_t *prev = run_queue;
+    while (prev->next != t && prev->next != run_queue) prev = prev->next;
+    if (prev->next != t) return;
+    prev->next = t->next;
+    if (run_queue == t) run_queue = t->next;
+    t->next = 0;
+}
+
+static task_t *pick_next(void) {
+    if (!run_queue) return 0;
+    task_t *start = current ? current->next : run_queue;
+    task_t *t = start;
+    do { if (t->state == TASK_READY) return t; t = t->next; } while (t != start);
+    return 0;
+}
+
+void sched_init(void) {
+    task_t *idle     = &tasks[task_count++];
+    idle->pid        = next_pid++;
+    idle->state      = TASK_RUNNING;
+    idle->priority   = 1;
+    idle->ticks      = 1;
+    idle->stack      = 0;
+    idle->saved_rsp  = 0;
+    idle->name[0] = 'i'; idle->name[1] = 'd';
+    idle->name[2] = 'l'; idle->name[3] = 'e'; idle->name[4] = 0;
+    queue_push(idle);
+    idle->state = TASK_RUNNING;
+    current = idle;
+}
+
+task_t *task_create(const char *name, void (*entry)(void), uint8_t priority) {
+    if (task_count >= MAX_TASKS) return 0;
+    if (priority < 1)  priority = 1;
+    if (priority > 10) priority = 10;
+
+    task_t *t = &tasks[task_count++];
+    t->pid      = next_pid++;
+    t->state    = TASK_READY;
+    t->priority = priority;
+    t->ticks    = priority;
+    t->next     = 0;
+
+    int i = 0;
+    while (name[i] && i < 31) { t->name[i] = name[i]; i++; }
+    t->name[i] = 0;
+
+    /* Kernel stack — выровнен на 32768 как в VortexOS */
+    t->stack = (uint8_t *)kmalloc_aligned(TASK_STACK_SIZE, TASK_STACK_SIZE);
+    if (!t->stack) return 0;
+
+    /*
+     * Строим фрейм точно как VortexOS kernel thread в process_create():
+     *
+     * uint64_t* stack_ptr = top_of_stack;
+     * *(--stack_ptr) = 0x10;           // SS
+     * stack_ptr--;
+     * *stack_ptr = (uint64_t)stack_ptr; // RSP — указывает сам на себя
+     * *(--stack_ptr) = 0x202;           // RFLAGS
+     * *(--stack_ptr) = 0x08;            // CS
+     * *(--stack_ptr) = entry_point;     // RIP
+     * *(--stack_ptr) = 0;               // int_no
+     * *(--stack_ptr) = 0;               // err_code
+     * for 15: *(--stack_ptr) = 0;       // GPR r15..rax
+     * stack_ptr -= 512/8;               // fxsave (обнулить)
+     */
+    uint64_t *sp = (uint64_t *)(t->stack + TASK_STACK_SIZE);
+
+    *(--sp) = 0x10;                  /* SS  */
+    sp--;
+    *sp = (uint64_t)sp;              /* RSP = указывает сам на себя */
+    *(--sp) = 0x202;                 /* RFLAGS */
+    *(--sp) = 0x08;                  /* CS */
+    *(--sp) = (uint64_t)entry;       /* RIP */
+    *(--sp) = 0;                     /* int_no */
+    *(--sp) = 0;                     /* err_code */
+
+    /* 15 GPR (r15..rax) */
+    for (int k = 0; k < 15; k++) *(--sp) = 0;
+
+    /* fxsave area — 512 байт */
+    sp = (uint64_t *)((uint8_t *)sp - 512);
+    __builtin_memset(sp, 0, 512);
+
+    t->saved_rsp = (uint64_t)sp;
+
+    queue_push(t);
+    return t;
+}
+
+void task_exit(void) {
+    __asm__ volatile("cli");
+    current->state = TASK_DEAD;
+    queue_remove(current);
+    vos_need_resched = 1;
+    for (;;) __asm__ volatile("hlt");
+}
+
+void sched_irq_tick(void) {
+    if (!current) return;
+    if (--current->ticks > 0) return;
+    current->ticks = current->priority;
+    vos_need_resched = 1;
+}
+
+void sched_yield(void) {
+    vos_need_resched = 1;
+}
+
+task_t *sched_current(void) { return current; }
+void    sched_clear_resched(void) { vos_need_resched = 0; }
+
+uint64_t sched_pick(uint64_t frame_rsp) {
+    current->saved_rsp = frame_rsp;
+    current->state     = TASK_READY;
+    vos_need_resched   = 0;
+
+    task_t *next = pick_next();
+    if (!next || next == current) {
+        current->state = TASK_RUNNING;
+        return current->saved_rsp;
+    }
+
+    current        = next;
+    current->state = TASK_RUNNING;
+
+    /* TSS.RSP0 = вершина kernel stack следующей задачи */
+    if (current->stack) {
+        gdt_set_kernel_stack((uint64_t)(current->stack + TASK_STACK_SIZE));
+    }
+
+    return current->saved_rsp;
+}
