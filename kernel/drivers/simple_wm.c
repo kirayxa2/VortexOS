@@ -502,24 +502,65 @@ static void win_draw_shadow(int wx, int wy, int ww, int wh) {
     }
 }
 
-/* Заливка прямоугольника со скруглёнными ВЕРХНИМИ углами (нижние — прямые,
- * под ними контент окна). Пиксели за пределами скругления не трогаем — там
- * остаётся фон/тень, отчего угол выглядит круглым. */
+/* Доля пикселя [px,px+1)x[py,py+1), попавшая внутрь окружности радиуса r с
+ * центром в узле сетки (cx,cy). Суперсэмплинг 4x4 (16 подвыборок) даёт мягкий
+ * край (anti-aliasing) без float/sqrt — всё в целочисленной арифметике (×8).
+ * Возвращает покрытие 0..255 (0 — пиксель снаружи, 255 — полностью внутри). */
+static int circ_cov(int px, int py, int cx, int cy, int r) {
+    int r2x64 = r * r * 64;          /* (r*8)^2 */
+    int in = 0;
+    for (int sy = 0; sy < 4; sy++) {
+        for (int sx = 0; sx < 4; sx++) {
+            int fx = (px - cx) * 8 + sx * 2 + 1;   /* центр под-пикселя ×8 */
+            int fy = (py - cy) * 8 + sy * 2 + 1;
+            if (fx * fx + fy * fy <= r2x64) in++;
+        }
+    }
+    return in * 255 / 16;
+}
+
+/* Заливка прямоугольника со скруглёнными ВЕРХНИМИ углами + сглаживанием.
+ * Внутри — сплошная заливка, на дуге углов — альфа-смешивание с тем, что под
+ * окном (тень/фон), отчего край выглядит гладким, а не «лесенкой». */
 static void fill_round_top(int x, int y, int w, int h, int r, uint32_t color) {
     if (r * 2 > w) r = w / 2;
     if (r > h) r = h;
+    uint32_t rgb = color & 0x00FFFFFF;
     for (int j = 0; j < h; j++) {
         for (int i = 0; i < w; i++) {
-            if (j < r) {
-                int cx = -1, cy = r;
-                if (i < r)            cx = r;
-                else if (i >= w - r)  cx = w - r - 1;
-                if (cx >= 0) {
-                    int ddx = i - cx, ddy = j - cy;
-                    if (ddx * ddx + ddy * ddy > r * r) continue;
-                }
+            if (j < r && (i < r || i >= w - r)) {
+                int cx  = (i < r) ? r : (w - r);   /* узел сетки центра дуги */
+                int cov = circ_cov(i, j, cx, r, r);
+                if (cov <= 0) continue;                 /* снаружи дуги */
+                if (cov >= 255) comp_put_pixel(x + i, y + j, color);
+                else comp_blend_pixel(x + i, y + j, ((uint32_t)cov << 24) | rgb);
+            } else {
+                comp_put_pixel(x + i, y + j, color);
             }
-            comp_put_pixel(x + i, y + j, color);
+        }
+    }
+}
+
+/* Скругление НИЖНИХ углов окна со сглаживанием. Вызывается ПОСЛЕ блита
+ * контента: на дуге угла смешиваем сохранённый ДО блита фон (bgL/bgR — два
+ * массива r×r) обратно поверх контента с альфой (255−покрытие). Так контент
+ * «съедается» к краям ровно по дуге, давая гладкий скруглённый угол. */
+static void round_bottom_aa(int x, int y, int w, int fh, int r,
+                            const uint32_t *bgL, const uint32_t *bgR) {
+    for (int j = 0; j < r; j++) {
+        int py = (fh - r) + j;                 /* строки от fh-r до fh-1 */
+        for (int i = 0; i < r; i++) {
+            int covL = circ_cov(i, py, r, fh - r, r);
+            if (covL < 255) {
+                uint32_t a = (uint32_t)(255 - covL);
+                comp_blend_pixel(x + i, y + py, (a << 24) | (bgL[j * r + i] & 0x00FFFFFF));
+            }
+            int ii = w - r + i;
+            int covR = circ_cov(ii, py, w - r, fh - r, r);
+            if (covR < 255) {
+                uint32_t a = (uint32_t)(255 - covR);
+                comp_blend_pixel(x + ii, y + py, (a << 24) | (bgR[j * r + i] & 0x00FFFFFF));
+            }
         }
     }
 }
@@ -564,19 +605,38 @@ static void wm_draw_window_chrome(wm_window_t *win) {
     int tx = win->x + BTN_X0 + 2 * BTN_GAP + BTN_R + 10;
     comp_draw_string(tx, win->y + 2, win->title, 0xFFE0E0E0, tcol);
 
+    /* Сохраняем фон ДО блита под двумя нижними углами (r×r каждый), чтобы потом
+     * скруглить их со сглаживанием (смешать фон обратно по дуге). */
+    const int rb = WIN_CORNER;
+    uint32_t bgL[WIN_CORNER * WIN_CORNER], bgR[WIN_CORNER * WIN_CORNER];
+    if (rb * 2 <= win->w && rb <= fh) {
+        for (int j = 0; j < rb; j++) {
+            int py = (fh - rb) + j;
+            for (int i = 0; i < rb; i++) {
+                bgL[j * rb + i] = comp_get_pixel(win->x + i,                 win->y + py);
+                bgR[j * rb + i] = comp_get_pixel(win->x + win->w - rb + i,   win->y + py);
+            }
+        }
+    }
+
     /* контент окна (быстрый блит целыми строками) */
     comp_blit_buffer(win->x, win->y + TITLEBAR_H, win->w, win->h, win->pixels);
 
-    /* тонкая рамка вокруг окна для чёткости (верх — между скруглениями, чтобы
-     * не «квадратить» углы заголовка). */
+    /* скругляем нижние углы (со сглаживанием) поверх блита */
+    if (rb * 2 <= win->w && rb <= fh)
+        round_bottom_aa(win->x, win->y, win->w, fh, rb, bgL, bgR);
+
+    /* тонкая рамка вокруг окна для чёткости. Все стороны утоплены на WIN_CORNER
+     * от углов, чтобы рамка не «квадратила» скруглённые углы (ни верх, ни низ). */
     uint32_t bord = focused ? 0xFF4A4A72 : 0xFF34343E;
     comp_draw_line(win->x + WIN_CORNER, win->y,
-                   win->x + win->w - 1 - WIN_CORNER, win->y, bord);            /* верх */
-    comp_draw_line(win->x, win->y + WIN_CORNER, win->x, win->y + fh - 1, bord); /* лево */
+                   win->x + win->w - 1 - WIN_CORNER, win->y, bord);                   /* верх */
+    comp_draw_line(win->x, win->y + WIN_CORNER,
+                   win->x, win->y + fh - 1 - WIN_CORNER, bord);                       /* лево */
     comp_draw_line(win->x + win->w - 1, win->y + WIN_CORNER,
-                   win->x + win->w - 1, win->y + fh - 1, bord);                /* право */
-    comp_draw_line(win->x, win->y + fh - 1,
-                   win->x + win->w - 1, win->y + fh - 1, bord);                /* низ */
+                   win->x + win->w - 1, win->y + fh - 1 - WIN_CORNER, bord);          /* право */
+    comp_draw_line(win->x + WIN_CORNER, win->y + fh - 1,
+                   win->x + win->w - 1 - WIN_CORNER, win->y + fh - 1, bord);          /* низ */
 }
 
 void wm_render_all(void) {
