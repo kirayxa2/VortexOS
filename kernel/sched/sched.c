@@ -40,8 +40,22 @@ static void queue_remove(task_t *t) {
     t->next = 0;
 }
 
+/* Задача рендера — регистрируется в kmain. Когда PIT просит кадр
+ * (pit_render_pending), планировщик отдаёт процессор ИМЕННО ей в обход обычной
+ * round-robin-очереди — иначе курсор замирал, пока крутится busy-loop чужой
+ * задачи (vsh) на весь её квант. Рендер сам сдаёт процессор (sched_yield) сразу
+ * после кадра, так что в промежутках (~20 мс) нормально работают vsh/dock/idle. */
+static task_t *g_render_task = 0;
+void sched_register_render(task_t *t) { g_render_task = t; }
+
 static task_t *pick_next(void) {
     if (!run_queue) return 0;
+
+    /* Приоритет задаче рендера, если есть невзятый запрос на кадр. */
+    extern int pit_render_pending(void);
+    if (g_render_task && g_render_task->state == TASK_READY && pit_render_pending())
+        return g_render_task;
+
     task_t *start = current ? current->next : run_queue;
     task_t *t = start;
     do { if (t->state == TASK_READY) return t; t = t->next; } while (t != start);

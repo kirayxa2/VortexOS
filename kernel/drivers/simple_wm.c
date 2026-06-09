@@ -597,11 +597,19 @@ static void wm_render_region(int rx, int ry, int rw, int rh) {
  * реентерабельности с wm_flush из userspace-задач. */
 void wm_render_task(void) {
     extern int pit_consume_render_request(void);
+    extern void sched_yield(void);
     for (;;) {
         if (pit_consume_render_request()) {
             wm_tick_render();
         }
-        /* Спим до следующего прерывания (PIT/мышь/клавиатура) и проверяем снова. */
+        /* Нарисовали кадр (или нечего рисовать) — ОБЯЗАТЕЛЬНО сдаём процессор
+         * обратно в round-robin. Планировщик отдаёт нам процессор по запросу PIT
+         * (pit_render_pending), а сразу после кадра мы должны уступить, иначе при
+         * следующем тике нас бы выбрали снова и vsh/dock/клавиатура голодали бы.
+         * После yield на ближайшем прерывании произойдёт переключение на другую
+         * задачу; следующий кадр PIT снова вытеснит её к нам через ~20 мс. */
+        sched_yield();
+        /* Спим до следующего прерывания (PIT/мышь/клавиатура). */
         __asm__ volatile("hlt");
     }
 }
