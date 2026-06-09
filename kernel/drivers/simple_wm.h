@@ -5,7 +5,7 @@
 
 #define MAX_WINDOWS 2
 #define MAX_WM_EVENTS 16
-#define MAX_WINDOW_PIXELS (640 * 480)  // Maximum pixels per window
+#define MAX_WINDOW_PIXELS (1024 * 768)  // Maximum pixels per window (vsh terminal = 720x432)
 
 typedef struct {
     uint32_t id;
