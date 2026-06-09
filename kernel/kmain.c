@@ -594,8 +594,7 @@ void kmain(void) {
      * не стопоря планировщик и остальные IRQ. Высокий приоритет, чтобы кадры
      * шли ровно ~50 FPS. */
     extern void wm_render_task(void);
-    task_t *render_task = task_create("render", wm_render_task, 8);
-    if (render_task) sched_register_render(render_task);
+    task_create("render", wm_render_task, 8);
     fb_puts("[OK] Render task started\n");
 
     /* Dock launcher — запускает терминал по клику на иконку в доке. */

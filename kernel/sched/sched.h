@@ -29,7 +29,6 @@ typedef struct task {
 void    sched_init(void);
 void    sched_irq_tick(void);
 void    sched_yield(void);
-void    sched_register_render(task_t *t);
 void    sched_clear_resched(void);
 task_t *task_create(const char *name, void (*entry)(void), uint8_t priority);
 void    task_exit(void);

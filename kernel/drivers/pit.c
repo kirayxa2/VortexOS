@@ -41,12 +41,6 @@ int pit_consume_render_request(void) {
     return 1;
 }
 
-/* Подсмотреть запрос на отрисовку БЕЗ сброса. Зовётся планировщиком
- * (pick_next), чтобы дать задаче рендера приоритет, когда есть что рисовать. */
-int pit_render_pending(void) {
-    return render_request;
-}
-
 static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile("outb %0, %1" :: "a"(val), "Nd"(port));
 }
@@ -72,15 +66,6 @@ static void pit_handler(interrupt_frame_t *frame) {
      * максимум 50 раз/сек, а не на каждый PS/2-пакет. */
     if ((tick_count & 1) == 0) {
         render_request = 1;
-        /* Просим планировщик пересмотреть выбор задачи ПРЯМО СЕЙЧАС: на возврате
-         * из IRQ sched_pick() увидит флаг render_request и отдаст процессор
-         * задаче рендера (см. pick_next), вытеснив busy-loop userspace-задачу
-         * (например, poll-цикл vsh, priority 10 = 100 мс квант). Без этого
-         * курсор замирал на весь квант чужой задачи — отсюда «фриз раз в ~секунду»
-         * при перетаскивании. Теперь рендер вклинивается каждые 2 тика (~20 мс =>
-         * 50 FPS), и максимальная задержка курсора ограничена 20 мс. */
-        extern int vos_need_resched;
-        vos_need_resched = 1;
     }
 
     extern void sched_irq_tick(void);
