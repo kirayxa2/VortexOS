@@ -327,7 +327,10 @@ int virtio_gpu_init(void) {
         uint32_t ep = (uint32_t)(pg / per_page), eo = (uint32_t)(pg % per_page);
         if (eo == 0) ent = (gpu_mem_entry_t *)phys_to_virt(g_entry_pages[ep]);
         uint64_t v = (uint64_t)g_fb + pg * 0x1000;
-        ent[eo].addr   = vmm_kernel_virt_to_phys(v);
+        /* fb лежит в kernel-heap (mapped через vmm_map, НЕ HHDM!) — поэтому
+         * простое "virt - hhdm" даёт мусорный phys и ATTACH_BACKING падает.
+         * Берём реальный physical из page-table walk по каждой странице. */
+        ent[eo].addr   = vmm_virt_to_phys(vmm_kernel_pml4, v);
         ent[eo].length = 0x1000;
         ent[eo].padding = 0;
     }
