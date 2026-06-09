@@ -589,6 +589,14 @@ void kmain(void) {
     /* Shell как фоновая задача */
     // task_create("vos-sh", shell_run, 2);
 
+    /* Задача рендера (fix #1) — рендер вынесен из PIT IRQ0 в отдельную задачу.
+     * PIT лишь ставит флаг, а эта задача рисует кадр с включёнными прерываниями,
+     * не стопоря планировщик и остальные IRQ. Высокий приоритет, чтобы кадры
+     * шли ровно ~50 FPS. */
+    extern void wm_render_task(void);
+    task_create("render", wm_render_task, 8);
+    fb_puts("[OK] Render task started\n");
+
     /* Dock launcher — запускает терминал по клику на иконку в доке. */
     task_create("dock", dock_launcher_task, 3);
     fb_puts("[OK] Dock launcher started\n");

@@ -24,6 +24,23 @@ static uint64_t g_focused_win_id = 0;
  * (таймерный IRQ vs. wm_flush из задачи). */
 static volatile int g_needs_redraw = 0;
 static volatile int g_rendering = 0;
+
+/* Атомарный «захват» рендера. Раньше рендер шёл в IRQ0 (прерывания off — захват
+ * был атомарен сам собой). Теперь рендер вынесен в задачу (fix #1) и может быть
+ * вытеснен планировщиком, поэтому простой `if (g_rendering) ...; g_rendering=1`
+ * стал гонкой: две задачи (задача рендера и wm_flush из userspace) могли пройти
+ * проверку до того, как любая выставит флаг, и зайти в композитор одновременно.
+ * Делаем проверку-и-установку атомарной, кратко погасив прерывания (сам тяжёлый
+ * рендер по-прежнему идёт с ВКЛЮЧЁННЫМИ прерываниями — гасим лишь пару инструкций
+ * захвата). Возвращает 1, если рендер захвачен нами; 0 — если уже идёт. */
+static inline int render_try_enter(void) {
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    int busy = g_rendering;
+    if (!busy) g_rendering = 1;
+    if (flags & (1ULL << 9)) __asm__ volatile("sti" ::: "memory");
+    return !busy;
+}
 /* Курсор сдвинулся, но сцена окон НЕ менялась — обновляем только спрайт курсора
  * (save-under), без полного recomposite. См. comp_cursor_refresh / fix #1. */
 static volatile int g_cursor_moved = 0;
@@ -433,8 +450,7 @@ void wm_render_all(void) {
     /* Защита от реентерабельности: если рендер уже идёт (например, таймерный IRQ
      * прилетел посреди wm_flush из задачи) — не входим повторно, а лишь помечаем,
      * что нужна свежая перерисовка. */
-    if (g_rendering) { g_needs_redraw = 1; return; }
-    g_rendering = 1;
+    if (!render_try_enter()) { g_needs_redraw = 1; return; }
 
     /* Используем compositor для отрисовки */
     comp_clear(0xFF1A1A2E);  // Dark background
@@ -512,9 +528,8 @@ static int win_intersects(const wm_window_t *win, int rx, int ry, int rw, int rh
  * копирует во front buffer только этот регион. Остальной back buffer остаётся
  * валидным с прошлого кадра (double buffer персистентный). */
 static void wm_render_region(int rx, int ry, int rw, int rh) {
-    if (g_rendering) { g_needs_redraw = 1; return; }
     if (rw <= 0 || rh <= 0) return;
-    g_rendering = 1;
+    if (!render_try_enter()) { g_needs_redraw = 1; return; }
 
     /* Накапливаем damage этого кадра с нуля. take_down/compose добавят сюда
      * прямоугольники старого и нового положения курсора. */
@@ -565,8 +580,34 @@ static void wm_render_region(int rx, int ry, int rw, int rh) {
     g_rendering = 0;
 }
 
-/* Вызывается из таймерного IRQ (PIT) с троттлингом. Рисует только если
- * что-то изменилось и compositor уже инициализирован. */
+/* -------------------------------------------------------------------------
+ * Задача рендера (fix #1) — рендер вынесен из прерывания PIT в отдельную
+ * kernel-задачу.
+ *
+ * Раньше wm_tick_render() крутился прямо внутри обработчика IRQ0 (PIT): кадр
+ * рисовался с ЗАПРЕЩЁННЫМИ прерываниями, что стопорило планировщик и остальные
+ * IRQ (мышь/клавиатура/диск) на всё время отрисовки. Теперь, когда есть
+ * полноценная многозадачность, PIT лишь выставляет флаг (render_request), а эта
+ * задача забирает его (pit_consume_render_request) и рисует кадр с ВКЛЮЧЁННЫМИ
+ * прерываниями. Между кадрами задача спит на hlt до следующего прерывания.
+ *
+ * Троттлинг (~50 FPS) задаёт PIT, выставляя флаг раз в 2 тика, поэтому даже если
+ * задача успевает забрать флаг быстрее — лишних кадров не будет, она просто
+ * уснёт до следующего запроса. g_rendering по-прежнему защищает от
+ * реентерабельности с wm_flush из userspace-задач. */
+void wm_render_task(void) {
+    extern int pit_consume_render_request(void);
+    for (;;) {
+        if (pit_consume_render_request()) {
+            wm_tick_render();
+        }
+        /* Спим до следующего прерывания (PIT/мышь/клавиатура) и проверяем снова. */
+        __asm__ volatile("hlt");
+    }
+}
+
+/* Вызывается из задачи рендера (wm_render_task) с троттлингом от PIT. Рисует
+ * только если что-то изменилось и compositor уже инициализирован. */
 void wm_tick_render(void) {
     if (!compositor_initialized) return;
 

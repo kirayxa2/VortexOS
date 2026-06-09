@@ -27,6 +27,20 @@
 
 static volatile uint64_t tick_count = 0;
 
+/* Флаг «пора рисовать кадр». PIT (IRQ0) лишь ВЫСТАВЛЯЕТ его с троттлингом
+ * ~каждые 2 тика (=> ~50 FPS при 100 Hz). Сам рендер делает отдельная задача
+ * "render" (см. wm_render_task), а НЕ обработчик прерывания — поэтому кадр
+ * рисуется с ВКЛЮЧЁННЫМИ прерываниями и не стопорит планировщик и другие IRQ. */
+static volatile int render_request = 0;
+
+/* Забрать запрос на отрисовку (атомарно «прочитать и сбросить»). Возвращает 1,
+ * если с прошлого вызова PIT просил перерисовку. Зовётся из задачи рендера. */
+int pit_consume_render_request(void) {
+    if (!render_request) return 0;
+    render_request = 0;
+    return 1;
+}
+
 static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile("outb %0, %1" :: "a"(val), "Nd"(port));
 }
@@ -44,13 +58,14 @@ static void pit_handler(interrupt_frame_t *frame) {
     (void)frame;
     tick_count++;
 
-    /* Render отвязан от ввода (fix #4): перерисовываем экран здесь, с
-     * троттлингом ~каждые 2 тика (=> ~50 FPS при 100 Hz), и только если
-     * что-то менялось. Сколько бы пакетов ни сыпала мышь, recomposite
-     * случится максимум 50 раз/сек, а не на каждый PS/2-пакет. */
+    /* Render отвязан от ввода (fix #4) И вынесен из IRQ в отдельную задачу
+     * (fix #1): здесь, в обработчике прерывания, мы НИЧЕГО не рисуем — лишь с
+     * троттлингом ~каждые 2 тика (=> ~50 FPS при 100 Hz) ставим флаг. Реальную
+     * отрисовку делает задача "render" (wm_render_task) с включёнными
+     * прерываниями. Сколько бы пакетов ни сыпала мышь, recomposite случится
+     * максимум 50 раз/сек, а не на каждый PS/2-пакет. */
     if ((tick_count & 1) == 0) {
-        extern void wm_tick_render(void);
-        wm_tick_render();
+        render_request = 1;
     }
 
     extern void sched_irq_tick(void);

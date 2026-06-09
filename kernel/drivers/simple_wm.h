@@ -30,8 +30,11 @@ void wm_draw_string(uint64_t win_id, int32_t x, int32_t y, const char *str, uint
 void wm_flush(uint64_t win_id);
 int wm_get_event(uint64_t win_id, void *event_out);
 void wm_render_all(void);
-/* Троттлированная перерисовка из таймера: рисует только если что-то менялось. */
+/* Троттлированная перерисовка: рисует только если что-то менялось. */
 void wm_tick_render(void);
+/* Задача рендера (fix #1): забирает запрос от PIT и рисует кадр вне IRQ, с
+ * включёнными прерываниями. Создаётся через task_create("render", ...). */
+void wm_render_task(void);
 void wm_handle_mouse_move(int dx, int dy);
 void wm_handle_mouse_button(uint8_t buttons);
 /* Доставка нажатого символа в окно с фокусом (зовётся из IRQ клавиатуры). */
