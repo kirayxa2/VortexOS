@@ -164,6 +164,7 @@ int vfs_unlink(const char *path) {
     if (!path || path[0] != '/') return -1;
 
     char buf[VFS_MAX_PATH];
+    char name[VFS_MAX_NAME];
     int i = 0;
     while (path[i] && i < VFS_MAX_PATH - 1) { buf[i] = path[i]; i++; }
     buf[i] = 0;
@@ -171,10 +172,15 @@ int vfs_unlink(const char *path) {
     int last = i - 1;
     while (last > 0 && buf[last] != '/') last--;
 
-    char *name = buf + last + 1;
+    /* Копируем имя ДО обрезания родительского пути (иначе buf[1]=0 затрёт имя) */
+    int j = 0;
+    for (int k = last + 1; buf[k] && j < VFS_MAX_NAME - 1; k++) name[j++] = buf[k];
+    name[j] = 0;
+    if (j == 0) return -1;
+
     if (last == 0) buf[1] = 0; else buf[last] = 0;
 
-    vfs_node_t *parent = vfs_open(last == 0 ? "/" : buf, 0);
+    vfs_node_t *parent = vfs_open(buf, 0);
     if (!parent || !parent->ops || !parent->ops->unlink) return -1;
     return parent->ops->unlink(parent, name);
 }

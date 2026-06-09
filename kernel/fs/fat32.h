@@ -82,6 +82,9 @@ typedef struct {
     uint32_t sectors_per_cluster;
     uint32_t root_cluster;
     uint32_t bytes_per_sector;
+    uint32_t num_fats;          /* кол-во копий FAT (обычно 2) */
+    uint32_t sectors_per_fat;   /* размер одной FAT в секторах */
+    uint32_t total_clusters;    /* всего кластеров данных */
 } fat32_volume_t;
 
 /* Инициализация */
@@ -97,5 +100,6 @@ void*   fat32_readdir_vfs(void *node, uint32_t index);
 void*   fat32_finddir_vfs(void *node, const char *name);
 int     fat32_mkdir_vfs(void *node, const char *name);
 int     fat32_create_vfs(void *node, const char *name);
+int     fat32_unlink_vfs(void *node, const char *name);
 
 #endif
