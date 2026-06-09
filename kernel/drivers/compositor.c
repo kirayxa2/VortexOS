@@ -127,6 +127,12 @@ void comp_put_pixel(int x, int y, uint32_t color) {
     comp.back_buffer[y * bb_width + x] = color;
 }
 
+uint32_t comp_get_pixel(int x, int y) {
+    if (x < 0 || x >= (int)bb_width || y < 0 || y >= (int)bb_height)
+        return 0;
+    return comp.back_buffer[y * bb_width + x];
+}
+
 /* Быстрый блит буфера окна целыми строками.
  * В отличие от попиксельного comp_put_pixel (cross-TU вызов + 4 проверки
  * границ на КАЖДЫЙ пиксель), здесь все проверки вынесены за внутренний цикл,

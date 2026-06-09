@@ -42,6 +42,8 @@ compositor_t *compositor_get(void);
 
 /* Примитивы */
 void comp_put_pixel(int x, int y, uint32_t color);
+/* Прочитать пиксель из back buffer (для альфа-смешивания, напр. док). */
+uint32_t comp_get_pixel(int x, int y);
 /* Быстрый блит готового буфера (целыми строками) в back buffer.
  * dx,dy — позиция в экранных координатах; src — w*h пикселей ARGB. */
 void comp_blit_buffer(int dx, int dy, int w, int h, const uint32_t *src);

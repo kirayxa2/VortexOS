@@ -37,4 +37,11 @@ void wm_handle_mouse_button(uint8_t buttons);
 /* Доставка нажатого символа в окно с фокусом (зовётся из IRQ клавиатуры). */
 void wm_handle_key(char ascii);
 
+/* --- Dock (панель в стиле macOS) --- */
+/* Сколько окон сейчас активно. */
+int wm_active_window_count(void);
+/* Забрать запрос на запуск терминала из dock (клик по иконке). Возвращает 1
+ * один раз на каждый клик; зовётся из kmain dock_launcher_task. */
+int wm_dock_consume_launch(void);
+
 #endif

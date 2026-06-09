@@ -48,6 +48,163 @@ static bool g_scene_presented = false;
 /* Частичная перерисовка прямоугольника (определена ниже). */
 static void wm_render_region(int rx, int ry, int rw, int rh);
 
+/* =========================================================================
+ *  Dock — панель в стиле macOS (скруглённая «пилюля» по центру снизу).
+ *
+ *  Рисуется поверх рабочего стола и окон (как плавающий dock в macOS), прямо в
+ *  back buffer композитора (полупрозрачное «стекло» через альфа-смешивание с
+ *  тем, что под ней). Пока содержит одну иконку — терминал (/vsh).
+ *  Клик по иконке просит ядро запустить терминал (если ни одного окна нет —
+ *  см. wm_dock_consume_launch / dock_launcher_task в kmain.c).
+ * ===================================================================== */
+#define DOCK_ICON     48          /* размер иконки (px) */
+#define DOCK_PAD      12          /* отступ внутри пилюли вокруг иконок */
+#define DOCK_GAP      12          /* зазор между иконками */
+#define DOCK_BOTTOM   16          /* отступ пилюли от низа экрана */
+#define DOCK_NITEMS   1           /* пока только терминал */
+
+static volatile int g_dock_launch_request = 0; /* mouse IRQ ставит, kmain-задача забирает */
+static int g_dock_hover   = -1;   /* индекс иконки под курсором, -1 если нет */
+static int g_dock_pressed = 0;    /* нажата ли иконка под курсором */
+static volatile int g_dock_dirty = 0; /* нужно перерисовать только область дока */
+
+static void wm_draw_dock(void);
+
+/* Геометрия пилюли (зависит от разрешения экрана). */
+static void dock_geometry(int *dx, int *dy, int *dw, int *dh) {
+    extern uint32_t fb_width, fb_height;
+    int h = DOCK_ICON + DOCK_PAD * 2;
+    int w = DOCK_NITEMS * DOCK_ICON + (DOCK_NITEMS - 1) * DOCK_GAP + DOCK_PAD * 2;
+    *dx = ((int)fb_width - w) / 2;
+    *dy = (int)fb_height - h - DOCK_BOTTOM;
+    *dw = w;
+    *dh = h;
+}
+
+static void dock_icon_rect(int idx, int *ix, int *iy) {
+    int dx, dy, dw, dh;
+    dock_geometry(&dx, &dy, &dw, &dh);
+    (void)dw; (void)dh;
+    *ix = dx + DOCK_PAD + idx * (DOCK_ICON + DOCK_GAP);
+    *iy = dy + DOCK_PAD;
+}
+
+/* hit-test: >=0 — индекс иконки, -2 — на пилюле мимо иконок, -1 — мимо дока. */
+static int dock_hit(int mx, int my) {
+    int dx, dy, dw, dh;
+    dock_geometry(&dx, &dy, &dw, &dh);
+    if (mx < dx || mx >= dx + dw || my < dy || my >= dy + dh) return -1;
+    for (int k = 0; k < DOCK_NITEMS; k++) {
+        int ix, iy;
+        dock_icon_rect(k, &ix, &iy);
+        if (mx >= ix && mx < ix + DOCK_ICON && my >= iy && my < iy + DOCK_ICON)
+            return k;
+    }
+    return -2;
+}
+
+/* Альфа-смешивание src поверх того, что уже в back buffer (a: 0..255). */
+static inline uint32_t dock_blend(uint32_t bg, uint32_t fg, int a) {
+    int br = (bg >> 16) & 0xFF, bg2 = (bg >> 8) & 0xFF, bb = bg & 0xFF;
+    int fr = (fg >> 16) & 0xFF, fg2 = (fg >> 8) & 0xFF, fb = fg & 0xFF;
+    int r = (fr * a + br * (255 - a)) / 255;
+    int g = (fg2 * a + bg2 * (255 - a)) / 255;
+    int b = (fb * a + bb * (255 - a)) / 255;
+    return 0xFF000000u | (r << 16) | (g << 8) | b;
+}
+
+static void dock_put_blend(int x, int y, uint32_t color, int a) {
+    if (a >= 255) { comp_put_pixel(x, y, color); return; }
+    comp_put_pixel(x, y, dock_blend(comp_get_pixel(x, y), color, a));
+}
+
+/* Заливка скруглённого прямоугольника с альфой (углы радиусом r). */
+static void dock_fill_round(int x, int y, int w, int h, int r, uint32_t color, int a) {
+    if (r * 2 > w) r = w / 2;
+    if (r * 2 > h) r = h / 2;
+    for (int j = 0; j < h; j++) {
+        for (int i = 0; i < w; i++) {
+            int cx = -1, cy = -1;
+            if (i < r && j < r)              { cx = r;         cy = r;         }
+            else if (i >= w - r && j < r)    { cx = w - r - 1; cy = r;         }
+            else if (i < r && j >= h - r)    { cx = r;         cy = h - r - 1; }
+            else if (i >= w - r && j >= h - r){ cx = w - r - 1; cy = h - r - 1; }
+            if (cx >= 0) {
+                int ddx = i - cx, ddy = j - cy;
+                if (ddx * ddx + ddy * ddy > r * r) continue;  /* за пределами скругления */
+            }
+            dock_put_blend(x + i, y + j, color, a);
+        }
+    }
+}
+
+/* Иконка терминала: тёмная скруглённая плитка, три «светофора» и зелёный
+ * промпт «>» с курсор-блоком. pressed — слегка утоплена. */
+static void dock_draw_terminal(int x, int y, int s, int pressed) {
+    if (pressed) { x += 1; y += 1; }
+    /* плитка */
+    dock_fill_round(x, y, s, s, 11, 0xFF16161F, 255);
+    /* лёгкий верхний блик */
+    for (int i = 3; i < s - 3; i++) dock_put_blend(x + i, y + 2, 0xFFFFFFFF, 16);
+    /* три «светофора» сверху */
+    int cy = y + 9;
+    comp_fill_circle(x + 11, cy, 3, 0xFFFF5F56);
+    comp_fill_circle(x + 21, cy, 3, 0xFFFFBD2E);
+    comp_fill_circle(x + 31, cy, 3, 0xFF27C93F);
+    /* зелёный промпт «>» из двух линий потолще + курсор-блок */
+    uint32_t green = 0xFF3BE06F;
+    int px = x + 10, py = y + 23;
+    for (int t = 0; t < 2; t++) {
+        comp_draw_line(px,     py + t,     px + 7, py + 6 + t, green);
+        comp_draw_line(px + 7, py + 6 + t, px,     py + 12 + t, green);
+    }
+    comp_fill_rect(x + 23, py + 9, 12, 4, green);
+}
+
+/* Рисует весь dock в back buffer (поверх уже скомпонованной сцены). */
+static void wm_draw_dock(void) {
+    int dx, dy, dw, dh;
+    dock_geometry(&dx, &dy, &dw, &dh);
+    int r = dh / 2;
+    /* мягкая тень */
+    dock_fill_round(dx - 2, dy + 5, dw + 4, dh, r, 0xFF000000, 45);
+    /* «стеклянная» пилюля (полупрозрачная тёмная) */
+    dock_fill_round(dx, dy, dw, dh, r, 0xFF22222F, 205);
+    /* верхняя световая кромка */
+    for (int i = r; i < dw - r; i++) dock_put_blend(dx + i, dy + 1, 0xFFFFFFFF, 30);
+    /* иконки */
+    for (int k = 0; k < DOCK_NITEMS; k++) {
+        int ix, iy;
+        dock_icon_rect(k, &ix, &iy);
+        int hovered = (g_dock_hover == k);
+        int pressed = (g_dock_pressed && g_dock_hover == k);
+        if (hovered)
+            dock_fill_round(ix - 4, iy - 4, DOCK_ICON + 8, DOCK_ICON + 8, 14,
+                            0xFFFFFFFF, pressed ? 60 : 35);
+        dock_draw_terminal(ix, iy, DOCK_ICON, pressed);
+    }
+}
+
+/* Прямоугольник, охватывающий весь dock + тень (для damage/региона). */
+static void dock_bounds(int *x, int *y, int *w, int *h) {
+    int dx, dy, dw, dh;
+    dock_geometry(&dx, &dy, &dw, &dh);
+    *x = dx - 4; *y = dy - 4; *w = dw + 8; *h = dh + 12;
+}
+
+/* Сколько окон сейчас активно (для решения, запускать ли терминал). */
+int wm_active_window_count(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) if (windows[i].id != 0) n++;
+    return n;
+}
+
+/* Забрать запрос на запуск терминала (зовётся из kmain dock_launcher_task). */
+int wm_dock_consume_launch(void) {
+    if (g_dock_launch_request) { g_dock_launch_request = 0; return 1; }
+    return 0;
+}
+
 /* Виртуальный адрес для маппинга окон (в пространстве ядра) */
 #define WINDOW_BUFFER_VADDR_BASE 0xFFFFFFFF92000000ULL
 
@@ -289,6 +446,9 @@ void wm_render_all(void) {
         comp_blit_buffer(win->x, win->y + 20, win->w, win->h, win->pixels);
     }
 
+    /* Dock поверх окон (плавающая панель, как в macOS). */
+    wm_draw_dock();
+
     /* Вкомпоновываем курсор прямо в back buffer (save-under, #1), чтобы полный
      * вывод кадра не стирал его и не мигал. */
     comp_cursor_compose();
@@ -372,6 +532,18 @@ static void wm_render_region(int rx, int ry, int rw, int rh) {
         comp_blit_buffer(win->x, win->y + 20, win->w, win->h, win->pixels);
     }
 
+    /* Если регион задевает dock — перерисовываем dock (он поверх окон) и
+     * помечаем его полный прямоугольник как damage, чтобы свежие пиксели
+     * (вкл. hover/press) скопировались во front buffer. */
+    {
+        int bx, by, bw, bh;
+        dock_bounds(&bx, &by, &bw, &bh);
+        if (!(rx >= bx + bw || rx + rw <= bx || ry >= by + bh || ry + rh <= by)) {
+            wm_draw_dock();
+            comp_damage_add(bx, by, bw, bh);
+        }
+    }
+
     /* Курсор поверх (он внутри региона при перетаскивании за title bar).
      * compose добавит прямоугольник нового положения курсора в damage. */
     comp_cursor_compose();
@@ -392,6 +564,7 @@ void wm_tick_render(void) {
 
     if (g_needs_redraw) {
         g_needs_redraw = 0;
+        g_dock_dirty = 0;  /* полный/drag-рендер всё равно перерисует dock */
         /* Перетаскивание окна — частичная перерисовка только объединения
          * старого и нового положения окна (как делают настоящие композиторы),
          * вместо полного clear+flip всего экрана. */
@@ -415,6 +588,13 @@ void wm_tick_render(void) {
         }
         /* Сцена менялась иначе (создание окна, wm_flush и т.п.) — полный render. */
         wm_render_all();
+    } else if (g_dock_dirty) {
+        /* Менялось только состояние dock (hover/press) — перерисовываем лишь
+         * область dock (region), без полного кадра всего экрана. */
+        g_dock_dirty = 0;
+        int bx, by, bw, bh;
+        dock_bounds(&bx, &by, &bw, &bh);
+        wm_render_region(bx, by, bw, bh);
     } else if (g_cursor_moved) {
         /* Двигался ТОЛЬКО курсор — лёгкий путь без recomposite окон: стираем
          * старое место (фон из back buffer) и рисуем курсор на новом. */
@@ -501,6 +681,18 @@ void wm_handle_mouse_move(int dx, int dy) {
         }
     }
     
+    /* Hover над dock: если иконка под курсором сменилась — перерисуем dock. */
+    if (!drag_state.dragging) {
+        compositor_t *c = compositor_get();
+        int hit = dock_hit(c->mouse_x, c->mouse_y);
+        int hov = (hit >= 0) ? hit : -1;
+        if (hov != g_dock_hover) {
+            g_dock_hover = hov;
+            if (hov < 0) g_dock_pressed = 0; /* ушли с иконки — снимаем нажатие */
+            g_dock_dirty = 1;
+        }
+    }
+
     /* Render отвязан от ввода: в IRQ только ставим флаг, рисует таймер.
      * Тащим окно — менялась сцена → полный render. Иначе двигается только
      * курсор → лёгкий save-under путь, без recomposite окон (fix #1). */
@@ -516,7 +708,28 @@ void wm_handle_mouse_button(uint8_t buttons) {
     
     int mouse_x = comp->mouse_x;
     int mouse_y = comp->mouse_y;
-    
+
+    /* --- Dock имеет приоритет: он поверх окон --- */
+    int dh = dock_hit(mouse_x, mouse_y);
+    if (buttons & 1) {
+        if (dh >= 0) {
+            /* Нажатие на иконку: визуальный отклик + запрос на запуск.
+             * Запускаем терминал только если сейчас НЕТ окон (один usermode-
+             * процесс за раз — единый kernel-стек для syscall). */
+            g_dock_hover = dh;
+            g_dock_pressed = 1;
+            g_dock_dirty = 1;
+            if (dh == 0 && wm_active_window_count() == 0)
+                g_dock_launch_request = 1;
+            return;  /* не таскаем окно под доком */
+        }
+        if (dh == -2) {  /* клик по пилюле мимо иконки — просто гасим */
+            return;
+        }
+    } else {
+        if (g_dock_pressed) { g_dock_pressed = 0; g_dock_dirty = 1; }
+    }
+
     // Проверяем клик на title bar окна (идем с конца, чтобы верхние окна были первыми)
     if (buttons & 1) {  // Левая кнопка нажата
         /* Фокус ввода переходит к окну, по которому кликнули (title или тело). */

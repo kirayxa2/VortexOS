@@ -357,6 +357,27 @@ void userspace_hello_task(void) {
     userspace_elf_loader_task();
 }
 
+/* --- Dock launcher ------------------------------------------------------
+ * Фоновая kernel-задача: ждёт запрос от dock (клик по иконке терминала) и
+ * запускает /vsh. Запуск делается в контексте задачи (а НЕ в IRQ мыши), где
+ * kmalloc/планировщик безопасны. wm_handle_mouse_button лишь ставит флаг,
+ * который мы здесь забираем через wm_dock_consume_launch(). */
+void dock_launcher_task(void) {
+    extern int wm_dock_consume_launch(void);
+    for (;;) {
+        if (wm_dock_consume_launch()) {
+            vfs_node_t *vsh = vfs_open("/vsh", 0);
+            if (vsh) {
+                vfs_close(vsh);
+                task_t *t = task_create("vsh", userspace_elf_loader_task, 10);
+                if (t) t->userdata = (void *)"/vsh";
+            }
+        }
+        /* Спим до следующего прерывания таймера (≈10 мс) и проверяем снова. */
+        __asm__ volatile("hlt");
+    }
+}
+
 /* --- kmain -------------------------------------------------------------- */
 
 void kmain(void) {
@@ -552,6 +573,10 @@ void kmain(void) {
     
     /* Shell как фоновая задача */
     // task_create("vos-sh", shell_run, 2);
+
+    /* Dock launcher — запускает терминал по клику на иконку в доке. */
+    task_create("dock", dock_launcher_task, 3);
+    fb_puts("[OK] Dock launcher started\n");
 
     fb_puts("[OK] All tasks created\n");
     fb_puts("[SCHEDULER] Starting multitasking...\n\n");
