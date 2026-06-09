@@ -9,6 +9,12 @@ static uint32_t next_win_id = 1;
 static bool compositor_initialized = false;
 static uint64_t last_cursor_update = 0;
 
+/* Окно, которое сейчас получает ввод с клавиатуры (focus). Клавиатурный IRQ
+ * (keyboard.c -> wm_handle_key) кладёт нажатые символы в очередь событий этого
+ * окна; userspace читает их через wm_get_event (type=4, key). По умолчанию фокус
+ * получает последнее созданное окно и окно, по которому кликнули. */
+static uint64_t g_focused_win_id = 0;
+
 /* --- Render отвязан от ввода (fix #4) ---
  * IRQ мыши больше НЕ вызывает wm_render_all() напрямую — он только обновляет
  * координаты/перетаскивание и ставит флаг g_needs_redraw. Реальная отрисовка
@@ -33,6 +39,14 @@ static struct {
 
 /* НЕ используем статические буферы - выделим через PMM при создании окна */
 static uint32_t *window_buffers[MAX_WINDOWS] = {0};
+
+/* Был ли уже хотя бы один полный кадр (фон рабочего стола + все окна) выведен
+ * в back buffer. До этого wm_flush обязан сделать полный render, иначе частичная
+ * (region) перерисовка оставит остальной экран неинициализированным. */
+static bool g_scene_presented = false;
+
+/* Частичная перерисовка прямоугольника (определена ниже). */
+static void wm_render_region(int rx, int ry, int rw, int rh);
 
 /* Виртуальный адрес для маппинга окон (в пространстве ядра) */
 #define WINDOW_BUFFER_VADDR_BASE 0xFFFFFFFF92000000ULL
@@ -84,6 +98,9 @@ uint64_t wm_create_window(const char *title, int32_t x, int32_t y, int32_t w, in
     win->dirty = 1;
     win->event_head = 0;
     win->event_tail = 0;
+
+    /* Новое окно получает фокус ввода с клавиатуры. */
+    g_focused_win_id = win->id;
     
     // Copy title from userspace byte by byte
     int i = 0;
@@ -234,7 +251,17 @@ void wm_flush(uint64_t win_id) {
     wm_window_t *win = find_window(win_id);
     if (!win) return;
     win->dirty = 1;
-    wm_render_all();
+    /* Первый кадр обязан быть полным (нужно инициализировать фон рабочего стола
+     * и back buffer целиком). Дальше перерисовываем ТОЛЬКО область этого окна
+     * (damage-rect): копия во front buffer маленькая => укладывается в окно
+     * вертикального гашения (vsync) => почти нет tearing, и это во много раз
+     * быстрее полного flip всего экрана на каждом wm_flush (важно для часто
+     * перерисовывающихся окон вроде терминала). */
+    if (!g_scene_presented) {
+        wm_render_all();
+        return;
+    }
+    wm_render_region(win->x, win->y, win->w, win->h + 20);
 }
 
 void wm_render_all(void) {
@@ -269,6 +296,8 @@ void wm_render_all(void) {
     /* Полный кадр: весь экран — damage. comp_present сделает один comp_flip. */
     comp_damage_full();
     comp_present();
+
+    g_scene_presented = true;  /* фон + окна теперь корректны в back buffer */
 
     g_cursor_moved = 0;  /* полный кадр уже перерисовал курсор */
 
@@ -384,6 +413,45 @@ void wm_tick_render(void) {
     }
 }
 
+/* -------------------------------------------------------------------------
+ * Доставка клавиатуры в userspace окно (focus).
+ *
+ * Раньше очередь событий окна (events[]) НИКОГДА не заполнялась — wm_get_event
+ * всегда возвращал 0, поэтому userspace-приложения не могли читать клавиатуру.
+ * Теперь клавиатурный IRQ (keyboard.c) на каждый символ зовёт wm_handle_key(),
+ * и мы кладём событие в очередь окна с фокусом. Формат события совпадает с
+ * userspace `wm_event_t` (8 x uint32 = 32 байта):
+ *   слово[0]      = type (4 = key)
+ *   байт[12]      = mouse_buttons
+ *   байт[14..15]  = key_code  (мы кладём ASCII в младший байт)
+ *   байт[16]      = key_pressed (1 = нажата)
+ * Один производитель (IRQ) и один потребитель (syscall) — блокировки не нужны.
+ * ------------------------------------------------------------------------- */
+static void wm_enqueue_key(wm_window_t *win, char ascii) {
+    uint32_t next = (win->event_tail + 1) % MAX_WM_EVENTS;
+    if (next == win->event_head) return;   /* очередь полна — теряем символ */
+
+    uint32_t *slot = &win->events[win->event_tail * 8];
+    for (int i = 0; i < 8; i++) slot[i] = 0;
+    slot[0] = 4;                           /* type = key */
+    uint8_t *b = (uint8_t *)slot;
+    b[14] = (uint8_t)ascii;                /* key_code низкий байт = ASCII */
+    b[15] = 0;
+    b[16] = 1;                             /* key_pressed = 1 */
+
+    win->event_tail = next;                /* публикуем событие последним */
+}
+
+/* Зовётся из IRQ клавиатуры (keyboard.c). Кладёт символ в окно с фокусом.
+ * Если окон/фокуса нет — тихо игнорируем (символ всё равно попадает в kernel
+ * kb-буфер для встроенного шелла). */
+void wm_handle_key(char ascii) {
+    if (!ascii) return;
+    wm_window_t *win = find_window(g_focused_win_id);
+    if (!win) return;
+    wm_enqueue_key(win, ascii);
+}
+
 int wm_get_event(uint64_t win_id, void *event_out) {
     wm_window_t *win = find_window(win_id);
     if (!win) return 0;
@@ -440,6 +508,16 @@ void wm_handle_mouse_button(uint8_t buttons) {
     
     // Проверяем клик на title bar окна (идем с конца, чтобы верхние окна были первыми)
     if (buttons & 1) {  // Левая кнопка нажата
+        /* Фокус ввода переходит к окну, по которому кликнули (title или тело). */
+        for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
+            wm_window_t *win = &windows[i];
+            if (win->id == 0 || !win->visible) continue;
+            if (mouse_x >= win->x && mouse_x < win->x + win->w &&
+                mouse_y >= win->y && mouse_y < win->y + win->h + 20) {
+                g_focused_win_id = win->id;
+                break;
+            }
+        }
         if (!drag_state.dragging) {
             // Начинаем перетаскивание
             for (int i = MAX_WINDOWS - 1; i >= 0; i--) {

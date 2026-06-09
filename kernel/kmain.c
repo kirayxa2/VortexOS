@@ -490,10 +490,22 @@ void kmain(void) {
     /* Создаём тестовые задачи */
     /* GUI теперь полностью в userspace через window manager */
     
-    /* Запускаем window test сначала, потом vgraph если нет */
-    fb_puts("[TEST] Checking for /testwin...\n");
-    vfs_node_t *tw_node = vfs_open("/testwin", 0);
-    if (tw_node) {
+    /* Сначала пробуем терминал /vsh (userspace Vortex Shell), потом
+     * window test / vgraph если терминала нет на диске. */
+    fb_puts("[TEST] Checking for /vsh...\n");
+    vfs_node_t *vsh_node = vfs_open("/vsh", 0);
+    vfs_node_t *tw_node = vsh_node ? 0 : vfs_open("/testwin", 0);
+    if (vsh_node) {
+        fb_puts("[OK] /vsh FOUND! Launching Vortex Shell\n");
+        vfs_close(vsh_node);
+
+        /* ЗАДЕРЖКА 3 секунды (как у остальных GUI-задач) */
+        uint64_t start = pit_ticks();
+        while (pit_ticks() - start < 300);
+
+        task_t *vsh_task = task_create("vsh", userspace_elf_loader_task, 10);
+        if (vsh_task) vsh_task->userdata = (void *)"/vsh";
+    } else if (tw_node) {
         fb_puts("[OK] /testwin FOUND!\n");
         vfs_close(tw_node);
         fb_puts("[OK] /testwin found, creating window test task\n");

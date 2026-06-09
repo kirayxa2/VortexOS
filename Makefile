@@ -161,4 +161,5 @@ disk-with-apps: disk userspace
 	python3 tools/add_file.py build/disk.img userspace/hello hello
 	python3 tools/add_file.py build/disk.img userspace/vortexgraph vgraph
 	python3 tools/add_file.py build/disk.img userspace/test_window testwin
+	python3 tools/add_file.py build/disk.img userspace/vsh vsh
 	@echo "=== Disk with apps ready ==="

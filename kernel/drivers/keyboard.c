@@ -7,6 +7,7 @@
 #include "idt.h"
 #include "sched.h"
 #include "fb.h"
+#include "simple_wm.h"  /* wm_handle_key — доставка клавиш в окно с фокусом */
 
 #define KB_DATA 0x60   /* порт данных PS/2 */
 #define KB_STATUS 0x64 /* порт статуса */
@@ -82,12 +83,16 @@ static void kb_handler(interrupt_frame_t *frame) {
     if (caps && c >= 'a' && c <= 'z') c -= 32;
     if (caps && c >= 'A' && c <= 'Z') c += 32;
 
-    /* Кладём в буфер */
+    /* Кладём в буфер (для встроенного kernel-шелла / keyboard_getchar). */
     uint32_t next = (kb_head + 1) % KB_BUF_SIZE;
     if (next != kb_tail) {
         kb_buf[kb_head] = c;
         kb_head = next;
     }
+
+    /* Доставляем символ в GUI-окно с фокусом (userspace терминал и т.п.).
+     * Если фокуса/окон нет — функция тихо ничего не делает. */
+    wm_handle_key(c);
 }
 
 void keyboard_init(void) {

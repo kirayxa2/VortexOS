@@ -34,5 +34,7 @@ void wm_render_all(void);
 void wm_tick_render(void);
 void wm_handle_mouse_move(int dx, int dy);
 void wm_handle_mouse_button(uint8_t buttons);
+/* Доставка нажатого символа в окно с фокусом (зовётся из IRQ клавиатуры). */
+void wm_handle_key(char ascii);
 
 #endif
