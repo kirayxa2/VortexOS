@@ -27,6 +27,8 @@ static struct {
     uint64_t win_id;
     int32_t offset_x;  // Offset мыши относительно окна
     int32_t offset_y;
+    int32_t rendered_x; // Позиция окна, которая сейчас на экране (последний вывод)
+    int32_t rendered_y;
 } drag_state = {0};
 
 /* НЕ используем статические буферы - выделим через PMM при создании окна */
@@ -270,6 +272,76 @@ void wm_render_all(void) {
 
     g_cursor_moved = 0;  /* полный кадр уже перерисовал курсор */
 
+    /* Полный кадр нарисовал все окна на их текущих местах — синхронизируем
+     * «нарисованную» позицию перетаскиваемого окна, чтобы следующий частичный
+     * кадр посчитал damage-объединение от правильного старого положения. */
+    if (drag_state.dragging) {
+        wm_window_t *dw = find_window(drag_state.win_id);
+        if (dw) { drag_state.rendered_x = dw->x; drag_state.rendered_y = dw->y; }
+    }
+
+    g_rendering = 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Частичная перерисовка (damage region) — путь «как у настоящих композиторов».
+ *
+ * KWin / wlroots / Weston НИКОГДА не перерисовывают и не копируют весь экран на
+ * каждый кадр. Они накапливают damage (изменившиеся прямоугольники) и трогают
+ * ТОЛЬКО их: перерисовывают фон+окна внутри damage-региона и копируют во front
+ * buffer только эти пиксели. При перетаскивании окна damage = объединение
+ * старого и нового положения окна, а не весь экран.
+ *
+ * Раньше wm_render_all() на КАЖДЫЙ кадр делал:
+ *   comp_clear(весь экран ~width*height) + recomposite + comp_flip(весь экран).
+ * При 1080p это ~8 МБ записи в back buffer + ~8 МБ копии в (WC) framebuffer
+ * каждый кадр => ~5 FPS, и damage-rect «не давал разницы», т.к. полный кадр
+ * всё равно помечал весь экран как damage. Здесь мы перерисовываем и копируем
+ * лишь маленький прямоугольник (размер окна + смещение), а не весь экран.
+ * ---------------------------------------------------------------------- */
+static inline int imin(int a, int b) { return a < b ? a : b; }
+static inline int imax(int a, int b) { return a > b ? a : b; }
+
+/* Пересекается ли окно (вместе с title bar высотой 20) с прямоугольником? */
+static int win_intersects(const wm_window_t *win, int rx, int ry, int rw, int rh) {
+    int wx = win->x, wy = win->y, ww = win->w, wh = win->h + 20;
+    if (wx >= rx + rw || wx + ww <= rx) return 0;
+    if (wy >= ry + rh || wy + wh <= ry) return 0;
+    return 1;
+}
+
+/* Перерисовывает ТОЛЬКО прямоугольник (rx,ry,rw,rh): чистит фон в нём,
+ * перекомпоновывает окна, которые его задевают, вкомпоновывает курсор и
+ * копирует во front buffer только этот регион. Остальной back buffer остаётся
+ * валидным с прошлого кадра (double buffer персистентный). */
+static void wm_render_region(int rx, int ry, int rw, int rh) {
+    if (g_rendering) { g_needs_redraw = 1; return; }
+    if (rw <= 0 || rh <= 0) return;
+    g_rendering = 1;
+
+    /* Фон только в регионе. */
+    comp_fill_rect(rx, ry, rw, rh, 0xFF1A1A2E);
+
+    /* Перерисовываем окна, задевающие регион (рисуем целиком — примитивы сами
+     * клипуют к экрану; пиксели вне региона в back buffer и так корректны). */
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        wm_window_t *win = &windows[i];
+        if (win->id == 0 || !win->visible || !win->pixels) continue;
+        if (!win_intersects(win, rx, ry, rw, rh)) continue;
+        comp_fill_rect(win->x, win->y, win->w, 20, 0xFF3A3A5E);
+        comp_draw_string(win->x + 5, win->y + 2, win->title, 0xFFE0E0E0, 0xFF3A3A5E);
+        comp_blit_buffer(win->x, win->y + 20, win->w, win->h, win->pixels);
+    }
+
+    /* Курсор поверх (он внутри региона при перетаскивании за title bar). */
+    comp_cursor_compose();
+    g_cursor_moved = 0;
+
+    /* Во front buffer уходит только этот прямоугольник. */
+    comp_damage_reset();
+    comp_damage_add(rx, ry, rw, rh);
+    comp_present();
+
     g_rendering = 0;
 }
 
@@ -279,9 +351,29 @@ void wm_tick_render(void) {
     if (!compositor_initialized) return;
 
     if (g_needs_redraw) {
-        /* Сцена менялась (перетаскивание окна, wm_flush и т.п.) — полный render,
-         * он же перерисует курсор. */
         g_needs_redraw = 0;
+        /* Перетаскивание окна — частичная перерисовка только объединения
+         * старого и нового положения окна (как делают настоящие композиторы),
+         * вместо полного clear+flip всего экрана. */
+        if (drag_state.dragging) {
+            wm_window_t *win = find_window(drag_state.win_id);
+            if (win) {
+                int ox = drag_state.rendered_x, oy = drag_state.rendered_y;
+                int nx = win->x,               ny = win->y;
+                int fh = win->h + 20;          /* окно + title bar */
+                int minx = imin(ox, nx);
+                int miny = imin(oy, ny);
+                int maxx = imax(ox + win->w, nx + win->w);
+                int maxy = imax(oy + fh,     ny + fh);
+                /* +2 px запас под чёрный контур курсора / округления. */
+                wm_render_region(minx - 1, miny - 1,
+                                 (maxx - minx) + 2, (maxy - miny) + 2);
+                drag_state.rendered_x = nx;
+                drag_state.rendered_y = ny;
+                return;
+            }
+        }
+        /* Сцена менялась иначе (создание окна, wm_flush и т.п.) — полный render. */
         wm_render_all();
     } else if (g_cursor_moved) {
         /* Двигался ТОЛЬКО курсор — лёгкий путь без recomposite окон: стираем
@@ -361,6 +453,10 @@ void wm_handle_mouse_button(uint8_t buttons) {
                     drag_state.win_id = win->id;
                     drag_state.offset_x = mouse_x - win->x;
                     drag_state.offset_y = mouse_y - win->y;
+                    /* Окно сейчас нарисовано в (win->x, win->y) — отсюда считаем
+                     * damage-объединение на первом кадре перетаскивания. */
+                    drag_state.rendered_x = win->x;
+                    drag_state.rendered_y = win->y;
                     break;
                 }
             }
