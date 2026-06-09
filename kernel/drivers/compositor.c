@@ -284,24 +284,50 @@ void comp_draw_string(int x, int y, const char *s, uint32_t fg, uint32_t bg) {
 }
 
 /* -------------------------------------------------------------------------
- * Курсор мыши
+ * Курсор мыши — классическая стрелка (белая заливка + чёрный контур),
+ * hotspot в левом-верхнем углу (0,0), точь-в-точь как системный курсор.
  * ---------------------------------------------------------------------- */
+#define CURSOR_SPRITE_W 12
+#define CURSOR_SPRITE_H 19
 
-void comp_draw_cursor(void) {
-    int x = comp.mouse_x;
-    int y = comp.mouse_y;
-    
-    /* Простой курсор-стрелка 11x17 пикселей */
-    for (int dy = 0; dy < 17; dy++) {
-        int width = (dy < 11) ? (dy + 1) : (17 - dy);
-        for (int dx = 0; dx < width; dx++) {
-            comp_put_pixel(x + dx, y + dy, COLOR_WHITE);
-        }
-        /* Контур черный */
-        if (width < 11) {
-            comp_put_pixel(x + width, y + dy, COLOR_BLACK);
+/* 'X' = чёрный контур, '.' = белая заливка, ' ' = прозрачно */
+static const char *const cursor_arrow[CURSOR_SPRITE_H] = {
+    "X           ",
+    "XX          ",
+    "X.X         ",
+    "X..X        ",
+    "X...X       ",
+    "X....X      ",
+    "X.....X     ",
+    "X......X    ",
+    "X.......X   ",
+    "X........X  ",
+    "X.........X ",
+    "X......XXXXX",
+    "X...X..X    ",
+    "X..XX..X    ",
+    "X.X  X..X   ",
+    "XX   X..X   ",
+    "X     X..X  ",
+    "      X..X  ",
+    "       XX   ",
+};
+
+/* Рисует спрайт-стрелку в текущий буфер (через comp_put_pixel) в позиции (x,y). */
+static void cursor_draw_sprite(int x, int y) {
+    for (int dy = 0; dy < CURSOR_SPRITE_H; dy++) {
+        const char *row = cursor_arrow[dy];
+        for (int dx = 0; dx < CURSOR_SPRITE_W; dx++) {
+            char c = row[dx];
+            if (c == 'X')      comp_put_pixel(x + dx, y + dy, COLOR_BLACK);
+            else if (c == '.') comp_put_pixel(x + dx, y + dy, COLOR_WHITE);
+            /* ' ' — прозрачно, пропускаем */
         }
     }
+}
+
+void comp_draw_cursor(void) {
+    cursor_draw_sprite(comp.mouse_x, comp.mouse_y);
 }
 
 void comp_update_mouse(int dx, int dy, uint8_t buttons) {
@@ -432,9 +458,6 @@ void comp_present(void) {
  * Инвариант: между кадрами back buffer чистый (без курсора) ВЕЗДЕ, кроме места,
  * где курсор сейчас «вкомпонован», а cursor_saveunder хранит фон под ним.
  * ---------------------------------------------------------------------- */
-#define CURSOR_SPRITE_W 12
-#define CURSOR_SPRITE_H 18
-
 static uint32_t cursor_saveunder[CURSOR_SPRITE_W * CURSOR_SPRITE_H];
 static int  cursor_drawn_x = 0;
 static int  cursor_drawn_y = 0;
@@ -454,12 +477,8 @@ static void cursor_blit_back(void) {
             cursor_saveunder[dy * CURSOR_SPRITE_W + dx] = v;
         }
     }
-    /* спрайт-стрелка (11x17 + чёрный контур) — рисуем в back buffer */
-    for (int dy = 0; dy < 17; dy++) {
-        int width = (dy < 11) ? (dy + 1) : (17 - dy);
-        for (int dx = 0; dx < width; dx++) comp_put_pixel(x + dx, y + dy, COLOR_WHITE);
-        if (width < 11) comp_put_pixel(x + width, y + dy, COLOR_BLACK);
-    }
+    /* спрайт-стрелка — рисуем в back buffer */
+    cursor_draw_sprite(x, y);
     cursor_drawn_x = x;
     cursor_drawn_y = y;
     cursor_in_back = true;
