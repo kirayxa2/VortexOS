@@ -284,13 +284,22 @@ void userspace_elf_loader_task(void) {
     
     /* Стек уже замапен в elf_load() */
     uint64_t user_stack_top = 0x800000 + 16384;
-    
-    // Set kernel stack for this task (already set by task_create)
-    void *kernel_stack_bottom = kmalloc_aligned(32768, 4096);
-    uint64_t kernel_stack_top = (uint64_t)kernel_stack_bottom + 32768;
-    gdt_set_kernel_stack(kernel_stack_top);
-    syscall_set_kernel_stack(kernel_stack_top);
-    
+
+    /* Запоминаем адресное пространство процесса В ЗАДАЧЕ — теперь планировщик
+     * будет грузить именно его CR3 при каждом свитче на эту задачу (раньше CR3
+     * выставлялся один раз тут и не переключался → только 1 usermode-процесс). */
+    task_t *self = sched_current();
+    if (self) self->pml4 = (void *)elf_result.user_pml4;
+
+    /* Kernel-стек для ловушек/syscall — СОБСТВЕННЫЙ стек этой задачи (тот же,
+     * что планировщик ставит в TSS.rsp0/syscall_kernel_stack на свитче). Так у
+     * каждого процесса свой kernel-стек, и они не топчут друг друга. */
+    if (self && self->stack) {
+        uint64_t kstk_top = (uint64_t)(self->stack + TASK_STACK_SIZE);
+        gdt_set_kernel_stack(kstk_top);
+        syscall_set_kernel_stack(kstk_top);
+    }
+
     // Switch to user page table
     vmm_switch((pte_t*)elf_result.user_pml4);
     
