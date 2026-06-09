@@ -105,6 +105,7 @@ void wm_set_dock_task(task_t *t) { g_dock_task = t; }
 static int g_dock_hover   = -1;   /* индекс иконки под курсором, -1 если нет */
 static int g_dock_pressed = 0;    /* нажата ли иконка под курсором */
 static volatile int g_dock_dirty = 0; /* нужно перерисовать только область дока */
+static volatile int g_panel_dirty = 0; /* нужно перерисовать верхнюю панель (часы) */
 
 static void wm_draw_dock(void);
 
@@ -221,6 +222,100 @@ static void wm_draw_dock(void) {
                             0xFFFFFFFF, pressed ? 60 : 35);
         dock_draw_terminal(ix, iy, DOCK_ICON, pressed);
     }
+}
+
+/* =========================================================================
+ * Верхняя панель (Hyprland-style top bar)
+ *  Полоса вверху экрана: слева — логотип + заголовок активного окна,
+ *  справа — часы HH:MM:SS. Рисуется в back buffer поверх сцены и окон.
+ * ======================================================================= */
+#define PANEL_H   24                /* высота верхней панели (px) */
+#define PANEL_BG  0xFF15151Fu       /* фон панели (непрозрачный) */
+
+/* QEMU по умолчанию хранит RTC в UTC. Если часы показывают не местное время —
+ * поправь это смещение (Москва = UTC+3). Если QEMU настроен на localtime,
+ * оставь 0. */
+#define RTC_TZ_OFFSET_HOURS  0
+
+static inline void rtc_outb(uint16_t port, uint8_t val) {
+    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+static inline uint8_t rtc_inb(uint16_t port) {
+    uint8_t r; __asm__ volatile("inb %1, %0" : "=a"(r) : "Nd"(port)); return r;
+}
+static uint8_t cmos_read(uint8_t reg) {
+    rtc_outb(0x70, (uint8_t)(0x80 | reg));  /* bit7=1: NMI off на время чтения */
+    return rtc_inb(0x71);
+}
+static int cmos_update_in_progress(void) {
+    rtc_outb(0x70, 0x8A);
+    return rtc_inb(0x71) & 0x80;
+}
+/* Возвращает часы/минуты/секунды (24ч), с учётом BCD/12ч и смещения TZ. */
+static void rtc_read_hms(int *hh, int *mm, int *ss) {
+    /* Дождаться, пока RTC не в процессе обновления (UIP flag). */
+    int guard = 100000;
+    while (cmos_update_in_progress() && --guard) { }
+    uint8_t s    = cmos_read(0x00);
+    uint8_t mi   = cmos_read(0x02);
+    uint8_t h    = cmos_read(0x04);
+    uint8_t regB = cmos_read(0x0B);
+    int second, minute, hour;
+    if (!(regB & 0x04)) {                 /* BCD режим — конвертируем */
+        second = (s  & 0x0F) + ((s  >> 4) * 10);
+        minute = (mi & 0x0F) + ((mi >> 4) * 10);
+        hour   = (h  & 0x0F) + (((h & 0x70) >> 4) * 10);
+        if (h & 0x80) hour = (hour + 12) % 24;   /* 12ч формат с PM-битом */
+    } else {                              /* бинарный режим */
+        second = s; minute = mi; hour = h & 0x7F;
+        if (h & 0x80) hour = (hour + 12) % 24;
+    }
+    hour = (hour + RTC_TZ_OFFSET_HOURS) % 24;
+    if (hour < 0) hour += 24;
+    *hh = hour; *mm = minute; *ss = second;
+}
+
+static wm_window_t* find_window(uint64_t win_id);  /* forward */
+
+/* Прямоугольник, охватывающий панель (для damage/региона). */
+static void panel_bounds(int *x, int *y, int *w, int *h) {
+    extern uint32_t fb_width;
+    *x = 0; *y = 0; *w = (int)fb_width; *h = PANEL_H;
+}
+
+/* Рисует верхнюю панель в back buffer. */
+static void wm_draw_panel(void) {
+    extern uint32_t fb_width;
+    int W = (int)fb_width;
+
+    comp_fill_rect(0, 0, W, PANEL_H, PANEL_BG);
+    /* нижняя акцентная линия (синяя — фирменная граница VortexOS) */
+    comp_fill_rect(0, PANEL_H - 1, W, 1, 0xFF007ACC);
+
+    int ty = (PANEL_H - 16) / 2;   /* шрифт 8x16 → вертикальное центрирование */
+
+    /* слева: логотип-квадрат + "VortexOS" */
+    comp_fill_rect(8, PANEL_H / 2 - 4, 8, 8, 0xFF007ACC);
+    int lx = 24;
+    comp_draw_string(lx, ty, "VortexOS", 0xFFE0E0E0, PANEL_BG);
+    lx += 8 * 8;   /* "VortexOS" = 8 символов * 8px */
+
+    /* заголовок активного окна после разделителя */
+    wm_window_t *fw = find_window(g_focused_win_id);
+    if (fw && fw->title[0]) {
+        comp_fill_rect(lx + 8, ty + 1, 1, 14, 0xFF44445A);  /* разделитель */
+        comp_draw_string(lx + 16, ty, fw->title, 0xFF9AB8D8, PANEL_BG);
+    }
+
+    /* справа: часы HH:MM:SS */
+    int hh, mm, ss;
+    rtc_read_hms(&hh, &mm, &ss);
+    char clk[9];
+    clk[0] = '0' + hh / 10; clk[1] = '0' + hh % 10; clk[2] = ':';
+    clk[3] = '0' + mm / 10; clk[4] = '0' + mm % 10; clk[5] = ':';
+    clk[6] = '0' + ss / 10; clk[7] = '0' + ss % 10; clk[8] = 0;
+    int cx = W - 8 * 8 - 10;   /* 8 символов * 8px + правый отступ */
+    comp_draw_string(cx, ty, clk, 0xFFFFFFFF, PANEL_BG);
 }
 
 /* Прямоугольник, охватывающий весь dock + тень (для damage/региона). */
@@ -697,6 +792,9 @@ void wm_render_all(void) {
         wm_draw_window_chrome(win);
     }
 
+    /* Верхняя панель (часы + активное окно) поверх окон. */
+    wm_draw_panel();
+
     /* Dock поверх окон (плавающая панель, как в macOS). */
     wm_draw_dock();
 
@@ -796,6 +894,17 @@ static void wm_render_region(int rx, int ry, int rw, int rh) {
         }
     }
 
+    /* Если регион задевает верхнюю панель — перерисовываем её (она поверх окон)
+     * и помечаем её прямоугольник как damage. */
+    {
+        int px, py, pw, ph;
+        panel_bounds(&px, &py, &pw, &ph);
+        if (!(rx >= px + pw || rx + rw <= px || ry >= py + ph || ry + rh <= py)) {
+            wm_draw_panel();
+            comp_damage_add(px, py, pw, ph);
+        }
+    }
+
     /* Курсор поверх (он внутри региона при перетаскивании за title bar).
      * compose добавит прямоугольник нового положения курсора в damage. */
     comp_cursor_compose();
@@ -840,8 +949,17 @@ void wm_render_task(void) {
 void wm_tick_render(void) {
     if (!compositor_initialized) return;
 
+    /* Тикаем часы на панели ~раз в секунду (PIT = 100 Hz). */
+    {
+        extern uint64_t pit_ticks(void);
+        static uint64_t last_panel_sec = 0;
+        uint64_t sec = pit_ticks() / 100;
+        if (sec != last_panel_sec) { last_panel_sec = sec; g_panel_dirty = 1; }
+    }
+
     if (g_needs_redraw) {
         g_needs_redraw = 0;
+        g_panel_dirty = 0; /* полный рендер всё равно перерисует панель */
         g_dock_dirty = 0;  /* полный/drag-рендер всё равно перерисует dock */
         /* Перетаскивание окна — частичная перерисовка только объединения
          * старого и нового положения окна (как делают настоящие композиторы),
@@ -867,6 +985,13 @@ void wm_tick_render(void) {
         }
         /* Сцена менялась иначе (создание окна, wm_flush и т.п.) — полный render. */
         wm_render_all();
+    } else if (g_panel_dirty) {
+        /* Тикнули часы — перерисовываем только полосу верхней панели (region),
+         * без полного кадра. */
+        g_panel_dirty = 0;
+        int px, py, pw, ph;
+        panel_bounds(&px, &py, &pw, &ph);
+        wm_render_region(px, py, pw, ph);
     } else if (g_dock_dirty) {
         /* Менялось только состояние dock (hover/press) — перерисовываем лишь
          * область dock (region), без полного кадра всего экрана. */
