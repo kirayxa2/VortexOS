@@ -58,11 +58,19 @@ void comp_draw_string(int x, int y, const char *s, uint32_t fg, uint32_t bg);
 /* Курсор мыши */
 void comp_draw_cursor(void);
 void comp_update_mouse(int dx, int dy, uint8_t buttons);
-/* Save-under софт-курсор (#1, софтовый аналог аппаратного курсора):
- * рисует курсор поверх готовой сцены прямо во front buffer и стирает его со
- * старого места копией из back buffer. Позволяет двигать курсор БЕЗ recomposite
- * окон. Зови после comp_flip() (полный кадр) или сам по себе при движении мыши. */
+/* Save-under софт-курсор (#1) + damage (#2). Курсор компонуется прямо в back
+ * buffer поверх сцены с сохранением фона (save-under), поэтому comp_flip его не
+ * стирает (нет мигания). comp_cursor_compose() — вкомпоновать курсор в свежий
+ * полный кадр (звать до comp_present). comp_cursor_refresh() — лёгкий путь при
+ * движении мыши: переносит курсор и выводит только два мелких прямоугольника. */
+void comp_cursor_compose(void);
 void comp_cursor_refresh(void);
+
+/* Damage rectangles (#2): копировать во front buffer только изменившееся. */
+void comp_damage_reset(void);
+void comp_damage_full(void);                  /* пометить весь экран */
+void comp_damage_add(int x, int y, int w, int h);
+void comp_present(void);                       /* вывести damage (или весь экран) */
 
 /* Обновление экрана */
 void comp_clear(uint32_t color);

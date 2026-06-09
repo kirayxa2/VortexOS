@@ -249,27 +249,49 @@ void comp_update_mouse(int dx, int dy, uint8_t buttons) {
 }
 
 /* -------------------------------------------------------------------------
- * Save-under софт-курсор (#1)
+ * Damage rectangles (#2)
  *
- * Курсор рисуется НЕ в back buffer, а прямо во front buffer (VRAM) поверх уже
- * скомпонованной сцены. «Фон под курсором» — это back buffer (он всегда чистый,
- * без курсора), поэтому отдельное хранилище save-under не нужно: чтобы стереть
- * курсор, просто копируем нужный кусок back buffer во front buffer.
- *
- * Итог: движение мыши не требует recomposite окон — только стереть старое место
- * курсора (~12x18 пикселей) и нарисовать на новом. Это софтовый аналог того,
- * что в железе делает аппаратный курсор/спрайт.
+ * Вместо того чтобы на каждый кадр копировать ВЕСЬ back buffer во front buffer
+ * (целый экран -> огромные разрывы/tearing при движении курсора), мы копируем
+ * только изменившиеся прямоугольники. Полный кадр (recomposite окон) помечает
+ * весь экран как damage; движение курсора — только два мелких прямоугольника
+ * (старое и новое место спрайта).
  * ---------------------------------------------------------------------- */
-#define CURSOR_SPRITE_W 12
-#define CURSOR_SPRITE_H 18
+typedef struct { int x, y, w, h; } comp_rect_t;
+#define MAX_DAMAGE 32
+static comp_rect_t damage_rects[MAX_DAMAGE];
+static int  damage_count = 0;
+static bool damage_full  = false;   /* перерисовать весь экран */
 
-static int  cursor_drawn_x = 0;
-static int  cursor_drawn_y = 0;
-static bool cursor_shown   = false;
+void comp_damage_reset(void) {
+    damage_count = 0;
+    damage_full  = false;
+}
 
-/* Копирует прямоугольник из back buffer прямо во front buffer (восстановление
- * фона под курсором). С клипом по экрану/буферу и учётом pitch. */
-static void present_region(int x, int y, int w, int h) {
+void comp_damage_full(void) {
+    damage_full = true;
+}
+
+void comp_damage_add(int x, int y, int w, int h) {
+    if (damage_full) return;
+    /* Клип к размеру буфера */
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (int)bb_width)  w = (int)bb_width  - x;
+    if (y + h > (int)bb_height) h = (int)bb_height - y;
+    if (w <= 0 || h <= 0) return;
+    /* Слишком много прямоугольников — дешевле перелить весь экран. */
+    if (damage_count >= MAX_DAMAGE) { damage_full = true; return; }
+    damage_rects[damage_count].x = x;
+    damage_rects[damage_count].y = y;
+    damage_rects[damage_count].w = w;
+    damage_rects[damage_count].h = h;
+    damage_count++;
+}
+
+/* Копирует один прямоугольник из back buffer во front buffer (с клипом и
+ * учётом pitch). Один тугой проход по строке — компилятор векторизует. */
+static void blit_region_to_front(int x, int y, int w, int h) {
     if (!comp.back_buffer || !comp.fb_addr) return;
     uint32_t fb_stride = comp.pitch / 4;
     for (int row = 0; row < h; row++) {
@@ -286,36 +308,104 @@ static void present_region(int x, int y, int w, int h) {
     }
 }
 
-/* Пишет один пиксель прямо во front buffer (с клипом по экрану). */
-static void put_pixel_front(int x, int y, uint32_t color) {
-    if (x < 0 || x >= (int)comp.width || y < 0 || y >= (int)comp.height) return;
-    comp.fb_addr[(uint32_t)y * (comp.pitch / 4) + x] = color;
+/* Выводит на экран только damage-прямоугольники (или весь экран, если стоит
+ * флаг damage_full). После — список сбрасывается. */
+void comp_present(void) {
+    if (damage_full) {
+        comp_flip();
+        comp_damage_reset();
+        return;
+    }
+    for (int i = 0; i < damage_count; i++) {
+        blit_region_to_front(damage_rects[i].x, damage_rects[i].y,
+                             damage_rects[i].w, damage_rects[i].h);
+    }
+    comp_damage_reset();
 }
 
-/* Рисует спрайт курсора-стрелки прямо во front buffer. */
-static void draw_cursor_front(void) {
+/* -------------------------------------------------------------------------
+ * Save-under софт-курсор (#1) + damage (#2) — без мигания
+ *
+ * Курсор компонуется ПРЯМО В back buffer поверх готовой сцены, с сохранением
+ * перекрытых пикселей (save-under). За счёт этого:
+ *   • Полный comp_flip больше НЕ стирает курсор (он часть кадра) — нет мигания.
+ *   • Движение курсора = unblit(старое) + blit(новое) в back buffer, затем
+ *     present только двух мелких damage-прямоугольников. Каждый прямоугольник
+ *     уходит во front buffer ОДНОЙ записью (фон+курсор уже скомпонованы), без
+ *     промежуточного «стерли фон → рисуем курсор», т.е. без разрывов/мигания.
+ *
+ * Инвариант: между кадрами back buffer чистый (без курсора) ВЕЗДЕ, кроме места,
+ * где курсор сейчас «вкомпонован», а cursor_saveunder хранит фон под ним.
+ * ---------------------------------------------------------------------- */
+#define CURSOR_SPRITE_W 12
+#define CURSOR_SPRITE_H 18
+
+static uint32_t cursor_saveunder[CURSOR_SPRITE_W * CURSOR_SPRITE_H];
+static int  cursor_drawn_x = 0;
+static int  cursor_drawn_y = 0;
+static bool cursor_in_back = false;
+
+/* Сохраняет фон под курсором и рисует спрайт-стрелку прямо в back buffer. */
+static void cursor_blit_back(void) {
     int x = comp.mouse_x;
     int y = comp.mouse_y;
+    /* save-under: запоминаем фон, который перекроет курсор */
+    for (int dy = 0; dy < CURSOR_SPRITE_H; dy++) {
+        for (int dx = 0; dx < CURSOR_SPRITE_W; dx++) {
+            int px = x + dx, py = y + dy;
+            uint32_t v = 0;
+            if (px >= 0 && px < (int)bb_width && py >= 0 && py < (int)bb_height)
+                v = comp.back_buffer[(uint32_t)py * bb_width + px];
+            cursor_saveunder[dy * CURSOR_SPRITE_W + dx] = v;
+        }
+    }
+    /* спрайт-стрелка (11x17 + чёрный контур) — рисуем в back buffer */
     for (int dy = 0; dy < 17; dy++) {
         int width = (dy < 11) ? (dy + 1) : (17 - dy);
-        for (int dx = 0; dx < width; dx++) {
-            put_pixel_front(x + dx, y + dy, COLOR_WHITE);
-        }
-        if (width < 11) put_pixel_front(x + width, y + dy, COLOR_BLACK);
+        for (int dx = 0; dx < width; dx++) comp_put_pixel(x + dx, y + dy, COLOR_WHITE);
+        if (width < 11) comp_put_pixel(x + width, y + dy, COLOR_BLACK);
     }
+    cursor_drawn_x = x;
+    cursor_drawn_y = y;
+    cursor_in_back = true;
 }
 
-void comp_cursor_refresh(void) {
-    /* Стираем курсор со старого места (фон берём из чистого back buffer). */
-    if (cursor_shown) {
-        present_region(cursor_drawn_x, cursor_drawn_y,
-                       CURSOR_SPRITE_W, CURSOR_SPRITE_H);
+/* Восстанавливает фон из save-under (стирает курсор из back buffer). */
+static void cursor_unblit_back(void) {
+    if (!cursor_in_back) return;
+    int x = cursor_drawn_x, y = cursor_drawn_y;
+    for (int dy = 0; dy < CURSOR_SPRITE_H; dy++) {
+        for (int dx = 0; dx < CURSOR_SPRITE_W; dx++) {
+            int px = x + dx, py = y + dy;
+            if (px >= 0 && px < (int)bb_width && py >= 0 && py < (int)bb_height)
+                comp.back_buffer[(uint32_t)py * bb_width + px] =
+                    cursor_saveunder[dy * CURSOR_SPRITE_W + dx];
+        }
     }
-    /* Рисуем курсор на текущей позиции. */
-    draw_cursor_front();
-    cursor_drawn_x = comp.mouse_x;
-    cursor_drawn_y = comp.mouse_y;
-    cursor_shown   = true;
+    cursor_in_back = false;
+}
+
+/* Полный кадр: сцена только что перекомпонована (comp_clear затёр всё, включая
+ * курсор), поэтому просто вкомпоновываем курсор поверх свежего фона. Вызывать
+ * ДО comp_present()/comp_damage_full(). */
+void comp_cursor_compose(void) {
+    cursor_in_back = false;      /* старый save-under недействителен после clear */
+    cursor_blit_back();
+}
+
+/* Движение только курсора (сцена окон НЕ менялась): убираем курсор со старого
+ * места, ставим на новое, помечаем оба прямоугольника как damage и выводим. */
+void comp_cursor_refresh(void) {
+    int  ox  = cursor_drawn_x;
+    int  oy  = cursor_drawn_y;
+    bool had = cursor_in_back;
+
+    cursor_unblit_back();   /* back buffer снова чистый на старом месте */
+    cursor_blit_back();     /* курсор вкомпонован на новом месте */
+
+    if (had) comp_damage_add(ox, oy, CURSOR_SPRITE_W, CURSOR_SPRITE_H);
+    comp_damage_add(cursor_drawn_x, cursor_drawn_y, CURSOR_SPRITE_W, CURSOR_SPRITE_H);
+    comp_present();
 }
 
 /* -------------------------------------------------------------------------

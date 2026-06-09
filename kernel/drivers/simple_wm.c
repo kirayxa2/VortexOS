@@ -259,14 +259,15 @@ void wm_render_all(void) {
         // Draw window content from offscreen buffer (быстрый блит целыми строками)
         comp_blit_buffer(win->x, win->y + 20, win->w, win->h, win->pixels);
     }
-    
-    /* Flip back buffer to screen.
-     * Курсор в back buffer НЕ блитим — он рисуется поверх во front buffer, чтобы
-     * его движение не требовало recomposite (save-under, fix #1). */
-    comp_flip();
 
-    /* Курсор поверх готовой сцены прямо во front buffer. */
-    comp_cursor_refresh();
+    /* Вкомпоновываем курсор прямо в back buffer (save-under, #1), чтобы полный
+     * вывод кадра не стирал его и не мигал. */
+    comp_cursor_compose();
+
+    /* Полный кадр: весь экран — damage. comp_present сделает один comp_flip. */
+    comp_damage_full();
+    comp_present();
+
     g_cursor_moved = 0;  /* полный кадр уже перерисовал курсор */
 
     g_rendering = 0;
