@@ -44,6 +44,12 @@ compositor_t *compositor_get(void);
 void comp_put_pixel(int x, int y, uint32_t color);
 /* Прочитать пиксель из back buffer (для альфа-смешивания, напр. док). */
 uint32_t comp_get_pixel(int x, int y);
+/* Per-pixel alpha: смешать argb поверх того, что уже в back buffer. Прозрачность
+ * берётся из старшего байта argb (0x00 = полностью прозрачно, 0xFF = непрозрачно).
+ * Используется для теней под окнами, матового стекла, сглаженных кромок. */
+void comp_blend_pixel(int x, int y, uint32_t argb);
+/* Заливка прямоугольника с постоянной альфой a (0..255) — полупрозрачные панели. */
+void comp_fill_rect_alpha(int x, int y, int w, int h, uint32_t color, uint8_t a);
 /* Быстрый блит готового буфера (целыми строками) в back buffer.
  * dx,dy — позиция в экранных координатах; src — w*h пикселей ARGB. */
 void comp_blit_buffer(int dx, int dy, int w, int h, const uint32_t *src);

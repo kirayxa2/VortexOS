@@ -8,6 +8,20 @@
 
 static wm_window_t windows[MAX_WINDOWS];
 static uint32_t next_win_id = 1;
+
+/* -------------------------------------------------------------------------
+ *  Оконный chrome (#3) + per-pixel alpha (#2):
+ *  заголовок со скруглёнными верхними углами, три кнопки-«светофора»
+ *  (закрыть/свернуть/развернуть) и мягкая тень под окном.
+ * ---------------------------------------------------------------------- */
+#define TITLEBAR_H   20          /* высота заголовка окна (px) */
+#define WIN_CORNER   6           /* радиус скругления верхних углов */
+#define WIN_SHADOW   10          /* радиус мягкой тени вокруг окна */
+#define WIN_SHADOW_OY 4          /* смещение тени вниз (глубина) */
+#define WIN_MARGIN   (WIN_SHADOW + WIN_SHADOW_OY)  /* запас для damage/region */
+#define BTN_R        5           /* радиус кнопки-светофора */
+#define BTN_GAP      16          /* шаг между кнопками */
+#define BTN_X0       14          /* центр первой кнопки от левого края окна */
 static bool compositor_initialized = false;
 static uint64_t last_cursor_update = 0;
 
@@ -450,7 +464,119 @@ void wm_flush(uint64_t win_id) {
         wm_render_all();
         return;
     }
-    wm_render_region(win->x, win->y, win->w, win->h + 20);
+    /* Регион включает заголовок + запас под тень окна. */
+    int m = WIN_MARGIN;
+    wm_render_region(win->x - m, win->y - m,
+                     win->w + 2 * m, win->h + TITLEBAR_H + 2 * m);
+}
+
+/* Целочисленный квадратный корень (для плавного спада тени). */
+static int isqrt32(int v) {
+    if (v <= 0) return 0;
+    int r = 0;
+    while ((r + 1) * (r + 1) <= v) r++;
+    return r;
+}
+
+/* Мягкая тень под окном: чёрный с альфой, спадающей к краям (per-pixel alpha).
+ * (wx,wy,ww,wh) — полный прямоугольник окна вместе с заголовком. Пиксели под
+ * самим окном пропускаем — они будут непрозрачными. */
+static void win_draw_shadow(int wx, int wy, int ww, int wh) {
+    const int S = WIN_SHADOW, oy = WIN_SHADOW_OY;
+    int x0 = wx - S, y0 = wy - S + oy;
+    int x1 = wx + ww + S, y1 = wy + wh + S + oy;
+    for (int y = y0; y < y1; y++) {
+        for (int x = x0; x < x1; x++) {
+            if (x >= wx && x < wx + ww && y >= wy && y < wy + wh) continue;
+            int dx = 0, dy = 0;
+            if (x < wx)            dx = wx - x;
+            else if (x >= wx + ww) dx = x - (wx + ww) + 1;
+            if (y < wy)            dy = wy - y;
+            else if (y >= wy + wh) dy = y - (wy + wh) + 1;
+            int d2 = dx * dx + dy * dy;
+            if (d2 >= S * S) continue;
+            int a = 78 * (S - isqrt32(d2)) / S;   /* спад к краям */
+            if (a <= 0) continue;
+            comp_blend_pixel(x, y, (uint32_t)a << 24);  /* чёрная тень */
+        }
+    }
+}
+
+/* Заливка прямоугольника со скруглёнными ВЕРХНИМИ углами (нижние — прямые,
+ * под ними контент окна). Пиксели за пределами скругления не трогаем — там
+ * остаётся фон/тень, отчего угол выглядит круглым. */
+static void fill_round_top(int x, int y, int w, int h, int r, uint32_t color) {
+    if (r * 2 > w) r = w / 2;
+    if (r > h) r = h;
+    for (int j = 0; j < h; j++) {
+        for (int i = 0; i < w; i++) {
+            if (j < r) {
+                int cx = -1, cy = r;
+                if (i < r)            cx = r;
+                else if (i >= w - r)  cx = w - r - 1;
+                if (cx >= 0) {
+                    int ddx = i - cx, ddy = j - cy;
+                    if (ddx * ddx + ddy * ddy > r * r) continue;
+                }
+            }
+            comp_put_pixel(x + i, y + j, color);
+        }
+    }
+}
+
+/* hit-test кнопок заголовка: 0=закрыть, 1=свернуть, 2=развернуть, -1=мимо. */
+static int win_button_hit(const wm_window_t *win, int mx, int my) {
+    int cy = win->y + TITLEBAR_H / 2;
+    for (int k = 0; k < 3; k++) {
+        int cx = win->x + BTN_X0 + k * BTN_GAP;
+        int dx = mx - cx, dy = my - cy;
+        if (dx * dx + dy * dy <= (BTN_R + 2) * (BTN_R + 2)) return k;
+    }
+    return -1;
+}
+
+/* Рисует chrome окна: тень, скруглённый заголовок, три кнопки-светофора,
+ * текст заголовка, контент и тонкую рамку. focused — окно в фокусе. */
+static void wm_draw_window_chrome(wm_window_t *win) {
+    int focused = (win->id == g_focused_win_id);
+    int fh = win->h + TITLEBAR_H;
+
+    /* мягкая тень под окном (per-pixel alpha) */
+    win_draw_shadow(win->x, win->y, win->w, fh);
+
+    /* заголовок со скруглёнными верхними углами */
+    uint32_t tcol = focused ? 0xFF3A3A5E : 0xFF2C2C3A;
+    fill_round_top(win->x, win->y, win->w, TITLEBAR_H, WIN_CORNER, tcol);
+    /* верхняя световая кромка */
+    for (int i = WIN_CORNER; i < win->w - WIN_CORNER; i++)
+        comp_blend_pixel(win->x + i, win->y, 0x28FFFFFFu);
+
+    /* три кнопки-светофора (приглушены, если окно не в фокусе) */
+    uint32_t cclose = focused ? 0xFFFF5F56 : 0xFF6E6E78;
+    uint32_t cmin   = focused ? 0xFFFFBD2E : 0xFF6E6E78;
+    uint32_t cmax   = focused ? 0xFF27C93F : 0xFF6E6E78;
+    int cy = win->y + TITLEBAR_H / 2;
+    comp_fill_circle(win->x + BTN_X0,               cy, BTN_R, cclose);
+    comp_fill_circle(win->x + BTN_X0 + BTN_GAP,     cy, BTN_R, cmin);
+    comp_fill_circle(win->x + BTN_X0 + 2 * BTN_GAP, cy, BTN_R, cmax);
+
+    /* текст заголовка после кнопок */
+    int tx = win->x + BTN_X0 + 2 * BTN_GAP + BTN_R + 10;
+    comp_draw_string(tx, win->y + 2, win->title, 0xFFE0E0E0, tcol);
+
+    /* контент окна (быстрый блит целыми строками) */
+    comp_blit_buffer(win->x, win->y + TITLEBAR_H, win->w, win->h, win->pixels);
+
+    /* тонкая рамка вокруг окна для чёткости (верх — между скруглениями, чтобы
+     * не «квадратить» углы заголовка). */
+    uint32_t bord = focused ? 0xFF4A4A72 : 0xFF34343E;
+    comp_draw_line(win->x + WIN_CORNER, win->y,
+                   win->x + win->w - 1 - WIN_CORNER, win->y, bord);            /* верх */
+    comp_draw_line(win->x, win->y + WIN_CORNER, win->x, win->y + fh - 1, bord); /* лево */
+    comp_draw_line(win->x + win->w - 1, win->y + WIN_CORNER,
+                   win->x + win->w - 1, win->y + fh - 1, bord);                /* право */
+    comp_draw_line(win->x, win->y + fh - 1,
+                   win->x + win->w - 1, win->y + fh - 1, bord);                /* низ */
 }
 
 void wm_render_all(void) {
@@ -466,15 +592,7 @@ void wm_render_all(void) {
     for (int i = 0; i < MAX_WINDOWS; i++) {
         wm_window_t *win = &windows[i];
         if (win->id == 0 || !win->visible || !win->pixels) continue;
-        
-        // Draw title bar using compositor
-        comp_fill_rect(win->x, win->y, win->w, 20, 0xFF3A3A5E);
-        
-        // Draw title text
-        comp_draw_string(win->x + 5, win->y + 2, win->title, 0xFFE0E0E0, 0xFF3A3A5E);
-        
-        // Draw window content from offscreen buffer (быстрый блит целыми строками)
-        comp_blit_buffer(win->x, win->y + 20, win->w, win->h, win->pixels);
+        wm_draw_window_chrome(win);
     }
 
     /* Dock поверх окон (плавающая панель, как в macOS). */
@@ -524,7 +642,11 @@ static inline int imax(int a, int b) { return a > b ? a : b; }
 
 /* Пересекается ли окно (вместе с title bar высотой 20) с прямоугольником? */
 static int win_intersects(const wm_window_t *win, int rx, int ry, int rw, int rh) {
-    int wx = win->x, wy = win->y, ww = win->w, wh = win->h + 20;
+    /* Учитываем тень: расширяем footprint окна на WIN_MARGIN со всех сторон,
+     * иначе тень окна, задетого регионом краем, не перерисуется и «смажется». */
+    int m = WIN_MARGIN;
+    int wx = win->x - m, wy = win->y - m;
+    int ww = win->w + 2 * m, wh = win->h + TITLEBAR_H + 2 * m;
     if (wx >= rx + rw || wx + ww <= rx) return 0;
     if (wy >= ry + rh || wy + wh <= ry) return 0;
     return 1;
@@ -557,9 +679,7 @@ static void wm_render_region(int rx, int ry, int rw, int rh) {
         wm_window_t *win = &windows[i];
         if (win->id == 0 || !win->visible || !win->pixels) continue;
         if (!win_intersects(win, rx, ry, rw, rh)) continue;
-        comp_fill_rect(win->x, win->y, win->w, 20, 0xFF3A3A5E);
-        comp_draw_string(win->x + 5, win->y + 2, win->title, 0xFFE0E0E0, 0xFF3A3A5E);
-        comp_blit_buffer(win->x, win->y + 20, win->w, win->h, win->pixels);
+        wm_draw_window_chrome(win);
     }
 
     /* Если регион задевает dock — перерисовываем dock (он поверх окон) и
@@ -629,14 +749,15 @@ void wm_tick_render(void) {
             if (win) {
                 int ox = drag_state.rendered_x, oy = drag_state.rendered_y;
                 int nx = win->x,               ny = win->y;
-                int fh = win->h + 20;          /* окно + title bar */
+                int fh = win->h + TITLEBAR_H;  /* окно + title bar */
                 int minx = imin(ox, nx);
                 int miny = imin(oy, ny);
                 int maxx = imax(ox + win->w, nx + win->w);
                 int maxy = imax(oy + fh,     ny + fh);
-                /* +2 px запас под чёрный контур курсора / округления. */
-                wm_render_region(minx - 1, miny - 1,
-                                 (maxx - minx) + 2, (maxy - miny) + 2);
+                /* Запас WIN_MARGIN под мягкую тень окна (иначе она «смажется»). */
+                int m = WIN_MARGIN;
+                wm_render_region(minx - m, miny - m,
+                                 (maxx - minx) + 2 * m, (maxy - miny) + 2 * m);
                 drag_state.rendered_x = nx;
                 drag_state.rendered_y = ny;
                 return;
@@ -778,7 +899,7 @@ void wm_handle_mouse_move(int dx, int dy) {
             if (win->x < 0) win->x = 0;
             if (win->y < 0) win->y = 0;
             if (win->x + win->w > (int)comp->width) win->x = comp->width - win->w;
-            if (win->y + win->h + 20 > (int)comp->height) win->y = comp->height - win->h - 20;
+            if (win->y + win->h + TITLEBAR_H > (int)comp->height) win->y = comp->height - win->h - TITLEBAR_H;
         }
     }
     
@@ -837,6 +958,34 @@ void wm_handle_mouse_button(uint8_t buttons) {
         if (g_dock_pressed) { g_dock_pressed = 0; g_dock_dirty = 1; }
     }
 
+    /* --- Кнопки заголовка (закрыть/свернуть/развернуть) имеют приоритет над
+     * перетаскиванием. Идём сверху вниз; берём верхнее окно под курсором. --- */
+    if (buttons & 1) {
+        for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
+            wm_window_t *win = &windows[i];
+            if (win->id == 0 || !win->visible) continue;
+            int inside = (mouse_x >= win->x && mouse_x < win->x + win->w &&
+                          mouse_y >= win->y && mouse_y < win->y + win->h + TITLEBAR_H);
+            if (!inside) continue;
+            int b = win_button_hit(win, mouse_x, mouse_y);
+            if (b == 0) {            /* 🔴 закрыть окно */
+                uint64_t id = win->id;
+                if (g_focused_win_id == id) g_focused_win_id = 0;
+                if (drag_state.dragging && drag_state.win_id == id)
+                    drag_state.dragging = false;
+                wm_destroy_window(id);
+                g_needs_redraw = 1;
+                return;
+            }
+            if (b >= 0) {            /* 🟡/🟢 свернуть/развернуть: пока зарезервировано
+                                      * (нужен taskbar для restore + resize-протокол) */
+                g_needs_redraw = 1;
+                return;
+            }
+            break;  /* верхнее окно под курсором, но не по кнопке → обычная обработка */
+        }
+    }
+
     // Проверяем клик на title bar окна (идем с конца, чтобы верхние окна были первыми)
     if (buttons & 1) {  // Левая кнопка нажата
         /* Фокус ввода переходит к окну, по которому кликнули (title или тело). */
@@ -844,7 +993,7 @@ void wm_handle_mouse_button(uint8_t buttons) {
             wm_window_t *win = &windows[i];
             if (win->id == 0 || !win->visible) continue;
             if (mouse_x >= win->x && mouse_x < win->x + win->w &&
-                mouse_y >= win->y && mouse_y < win->y + win->h + 20) {
+                mouse_y >= win->y && mouse_y < win->y + win->h + TITLEBAR_H) {
                 g_focused_win_id = win->id;
                 break;
             }
@@ -857,7 +1006,7 @@ void wm_handle_mouse_button(uint8_t buttons) {
                 
                 // Проверяем попадание в title bar (высота 20 пикселей)
                 if (mouse_x >= win->x && mouse_x < win->x + win->w &&
-                    mouse_y >= win->y && mouse_y < win->y + 20) {
+                    mouse_y >= win->y && mouse_y < win->y + TITLEBAR_H) {
                     drag_state.dragging = true;
                     drag_state.win_id = win->id;
                     drag_state.offset_x = mouse_x - win->x;

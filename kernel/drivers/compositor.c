@@ -134,6 +134,31 @@ uint32_t comp_get_pixel(int x, int y) {
     return comp.back_buffer[y * bb_width + x];
 }
 
+/* Per-pixel alpha: смешиваем argb поверх пикселя в back buffer. Альфа — в
+ * старшем байте argb. dst = src*a + dst*(255-a). */
+void comp_blend_pixel(int x, int y, uint32_t argb) {
+    if (x < 0 || x >= (int)bb_width || y < 0 || y >= (int)bb_height)
+        return;
+    uint32_t a = (argb >> 24) & 0xFF;
+    if (a == 0) return;
+    uint32_t *p = &comp.back_buffer[y * bb_width + x];
+    if (a == 0xFF) { *p = 0xFF000000u | (argb & 0x00FFFFFF); return; }
+    uint32_t dst = *p;
+    uint32_t fr = (argb >> 16) & 0xFF, fg = (argb >> 8) & 0xFF, fb = argb & 0xFF;
+    uint32_t br = (dst  >> 16) & 0xFF, bg = (dst  >> 8) & 0xFF, bb = dst  & 0xFF;
+    uint32_t r = (fr * a + br * (255 - a)) / 255;
+    uint32_t g = (fg * a + bg * (255 - a)) / 255;
+    uint32_t b = (fb * a + bb * (255 - a)) / 255;
+    *p = 0xFF000000u | (r << 16) | (g << 8) | b;
+}
+
+void comp_fill_rect_alpha(int x, int y, int w, int h, uint32_t color, uint8_t a) {
+    uint32_t argb = ((uint32_t)a << 24) | (color & 0x00FFFFFF);
+    for (int dy = 0; dy < h; dy++)
+        for (int dx = 0; dx < w; dx++)
+            comp_blend_pixel(x + dx, y + dy, argb);
+}
+
 /* Быстрый блит буфера окна целыми строками.
  * В отличие от попиксельного comp_put_pixel (cross-TU вызов + 4 проверки
  * границ на КАЖДЫЙ пиксель), здесь все проверки вынесены за внутренний цикл,
