@@ -84,10 +84,10 @@ compositor_t *compositor_get(void) {
  * ---------------------------------------------------------------------- */
 
 void comp_put_pixel(int x, int y, uint32_t color) {
-    if (x < 0 || x >= BB_WIDTH || y < 0 || y >= BB_HEIGHT)
+    if (x < 0 || x >= (int)bb_width || y < 0 || y >= (int)bb_height)
         return;
     /* Рисуем в back buffer */
-    comp.back_buffer[y * BB_WIDTH + x] = color;
+    comp.back_buffer[y * bb_width + x] = color;
 }
 
 void comp_draw_line(int x0, int y0, int x1, int y1, uint32_t color) {
@@ -232,7 +232,7 @@ void comp_update_mouse(int dx, int dy, uint8_t buttons) {
  * ---------------------------------------------------------------------- */
 
 void comp_clear(uint32_t color) {
-    for (uint32_t i = 0; i < BB_WIDTH * BB_HEIGHT; i++) {
+    for (uint32_t i = 0; i < bb_width * bb_height; i++) {
         comp.back_buffer[i] = color;
     }
 }
@@ -243,12 +243,12 @@ void comp_refresh(void) {
 
 void comp_flip(void) {
     /* Копируем back buffer в front buffer только нужную часть */
-    uint32_t copy_w = comp.width < BB_WIDTH ? comp.width : BB_WIDTH;
-    uint32_t copy_h = comp.height < BB_HEIGHT ? comp.height : BB_HEIGHT;
+    uint32_t copy_w = comp.width < bb_width ? comp.width : bb_width;
+    uint32_t copy_h = comp.height < bb_height ? comp.height : bb_height;
     
     for (uint32_t y = 0; y < copy_h; y++) {
         for (uint32_t x = 0; x < copy_w; x++) {
-            comp.fb_addr[y * (comp.pitch / 4) + x] = comp.back_buffer[y * BB_WIDTH + x];
+            comp.fb_addr[y * (comp.pitch / 4) + x] = comp.back_buffer[y * bb_width + x];
         }
     }
 }
