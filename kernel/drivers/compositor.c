@@ -4,6 +4,7 @@
  * ============================================================================= */
 
 #include "compositor.h"
+#include "virtio_gpu.h"
 
 static compositor_t comp;
 
@@ -354,8 +355,31 @@ static void blit_region_to_front(int x, int y, int w, int h) {
 /* Выводит на экран только damage-прямоугольники (или весь экран, если стоит
  * флаг damage_full). После — список сбрасывается. */
 void comp_present(void) {
+    /* --- Путь virtio-gpu: настоящий аппаратный present без разрывов --------
+     * Здесь comp.fb_addr — это backing GPU-ресурса. Копируем damage из back
+     * buffer в backing, затем TRANSFER_TO_HOST_2D + RESOURCE_FLUSH на тот же
+     * прямоугольник. RESOURCE_FLUSH показывает кадр атомарно — vblank-busy-wait
+     * не нужен (его и убираем, чтобы не стопорить IRQ). */
+    if (virtio_gpu_active()) {
+        if (damage_full) {
+            comp_flip();
+            virtio_gpu_flush(0, 0, (int)comp.width, (int)comp.height);
+            comp_damage_reset();
+            return;
+        }
+        for (int i = 0; i < damage_count; i++) {
+            blit_region_to_front(damage_rects[i].x, damage_rects[i].y,
+                                 damage_rects[i].w, damage_rects[i].h);
+            virtio_gpu_flush(damage_rects[i].x, damage_rects[i].y,
+                             damage_rects[i].w, damage_rects[i].h);
+        }
+        comp_damage_reset();
+        return;
+    }
+
+    /* --- Путь Limine framebuffer (software vsync, как раньше) -------------- */
     /* Ждём vblank ОДИН раз перед любой записью в scanout-буфер — так копия
-     * (damage-прямоугольники или полный flip) ложится в гашение, без разрывов. */
+     * (damage-прямоугольники или весь flip) ложится в гашение, без разрывов. */
     vsync_wait();
     if (damage_full) {
         comp_flip();

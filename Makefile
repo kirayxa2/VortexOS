@@ -60,6 +60,7 @@ C_SRCS := \
     kernel/drivers/mouse.c             \
     kernel/drivers/pit.c               \
     kernel/drivers/pci.c               \
+    kernel/drivers/virtio_gpu.c        \
     kernel/drivers/ata.c               \
     kernel/drivers/compositor.c        \
     kernel/drivers/simple_wm.c         \
@@ -144,6 +145,23 @@ run: iso disk
 	    -serial stdio                \
 	    -display sdl                 \
 	    -machine pc                  \
+	    -boot order=d                \
+	    -drive file=build/disk.img,format=raw,if=ide,index=0 \
+	    -no-reboot                   \
+	    -no-shutdown
+
+## Запуск с virtio-gpu (аппаратный present без разрывов).
+## `-vga virtio` = virtio-vga: Limine всё ещё получает framebuffer для загрузки,
+## а наш virtio_gpu-драйвер перехватывает scanout. Если что-то не так — просто
+## запусти обычный `make run` (там virtio-gpu нет и драйвер сам отключается).
+run-gpu: iso disk
+	$(QEMU)                          \
+	    -cdrom build/vortex.iso      \
+	    -m 256M                      \
+	    -serial stdio                \
+	    -display sdl                 \
+	    -machine pc                  \
+	    -vga virtio                  \
 	    -boot order=d                \
 	    -drive file=build/disk.img,format=raw,if=ide,index=0 \
 	    -no-reboot                   \

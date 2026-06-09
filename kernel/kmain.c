@@ -16,6 +16,7 @@
 #include "pit.h"
 #include "sched.h"
 #include "pci.h"
+#include "virtio_gpu.h"
 #include "ata.h"
 #include "syscall.h"
 #include "vfs.h"
@@ -429,8 +430,8 @@ void kmain(void) {
     vmm_init(hhdm_off);
     fb_puts("[OK] VMM initialized\n");
 
-    heap_init(0xFFFFFFFF81000000ULL, 16 * 1024 * 1024);  // 16MB heap вместо 4MB
-    fb_puts("[OK] Heap initialized (16MB)\n");
+    heap_init(0xFFFFFFFF81000000ULL, 32 * 1024 * 1024);  // 32MB heap (нужен запас под virtio-gpu fb backing)
+    fb_puts("[OK] Heap initialized (32MB)\n");
 
     void *p1 = kmalloc(128);
     void *p2 = kmalloc(256);
@@ -446,6 +447,11 @@ void kmain(void) {
     fb_puts("[OK] Mouse initialized\n");
 
     pci_init();
+
+    /* virtio-gpu: аппаратный present без разрывов. Если устройства нет
+     * (обычный -vga std) или инициализация не удалась — тихо остаёмся на
+     * Limine framebuffer, загрузка не страдает. */
+    virtio_gpu_init();
 
     ata_init();
 

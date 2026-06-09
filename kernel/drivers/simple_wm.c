@@ -1,6 +1,7 @@
 #include "simple_wm.h"
 #include "heap.h"
 #include "compositor.h"
+#include "virtio_gpu.h"
 #include "pmm.h"
 #include "vmm.h"
 
@@ -224,8 +225,15 @@ static void ensure_compositor_init(void) {
     extern uint32_t *fb_addr;
     extern uint32_t fb_width, fb_height;
     extern uint64_t fb_pitch;
-    
-    compositor_init(fb_addr, fb_width, fb_height, fb_pitch);
+
+    /* Если поднялся virtio-gpu — рисуем в его backing (его и презентит GPU),
+     * а не в линейный Limine-scanout. Иначе fallback на Limine framebuffer. */
+    if (virtio_gpu_active()) {
+        compositor_init(virtio_gpu_framebuffer(), virtio_gpu_width(),
+                        virtio_gpu_height(), virtio_gpu_pitch());
+    } else {
+        compositor_init(fb_addr, fb_width, fb_height, fb_pitch);
+    }
     compositor_initialized = true;
 }
 
