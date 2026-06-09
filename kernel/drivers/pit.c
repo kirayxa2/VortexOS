@@ -43,6 +43,16 @@ static inline void pit_debug_char(char c) {
 static void pit_handler(interrupt_frame_t *frame) {
     (void)frame;
     tick_count++;
+
+    /* Render отвязан от ввода (fix #4): перерисовываем экран здесь, с
+     * троттлингом ~каждые 2 тика (=> ~50 FPS при 100 Hz), и только если
+     * что-то менялось. Сколько бы пакетов ни сыпала мышь, recomposite
+     * случится максимум 50 раз/сек, а не на каждый PS/2-пакет. */
+    if ((tick_count & 1) == 0) {
+        extern void wm_tick_render(void);
+        wm_tick_render();
+    }
+
     extern void sched_irq_tick(void);
     sched_irq_tick();
 }

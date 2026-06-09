@@ -42,6 +42,9 @@ compositor_t *compositor_get(void);
 
 /* Примитивы */
 void comp_put_pixel(int x, int y, uint32_t color);
+/* Быстрый блит готового буфера (целыми строками) в back buffer.
+ * dx,dy — позиция в экранных координатах; src — w*h пикселей ARGB. */
+void comp_blit_buffer(int dx, int dy, int w, int h, const uint32_t *src);
 void comp_draw_line(int x0, int y0, int x1, int y1, uint32_t color);
 void comp_draw_rect(int x, int y, int w, int h, uint32_t color);
 void comp_fill_rect(int x, int y, int w, int h, uint32_t color);

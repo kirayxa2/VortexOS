@@ -9,6 +9,15 @@ static uint32_t next_win_id = 1;
 static bool compositor_initialized = false;
 static uint64_t last_cursor_update = 0;
 
+/* --- Render отвязан от ввода (fix #4) ---
+ * IRQ мыши больше НЕ вызывает wm_render_all() напрямую — он только обновляет
+ * координаты/перетаскивание и ставит флаг g_needs_redraw. Реальная отрисовка
+ * идёт с троттлингом из таймера (PIT, wm_tick_render), максимум ~50 раз/сек,
+ * сколько бы пакетов мышь ни сыпала. g_rendering защищает от реентерабельности
+ * (таймерный IRQ vs. wm_flush из задачи). */
+static volatile int g_needs_redraw = 0;
+static volatile int g_rendering = 0;
+
 /* Состояние перетаскивания */
 static struct {
     bool dragging;
@@ -224,6 +233,12 @@ void wm_flush(uint64_t win_id) {
 }
 
 void wm_render_all(void) {
+    /* Защита от реентерабельности: если рендер уже идёт (например, таймерный IRQ
+     * прилетел посреди wm_flush из задачи) — не входим повторно, а лишь помечаем,
+     * что нужна свежая перерисовка. */
+    if (g_rendering) { g_needs_redraw = 1; return; }
+    g_rendering = 1;
+
     /* Используем compositor для отрисовки */
     comp_clear(0xFF1A1A2E);  // Dark background
     
@@ -238,12 +253,8 @@ void wm_render_all(void) {
         // Draw title text
         comp_draw_string(win->x + 5, win->y + 2, win->title, 0xFFE0E0E0, 0xFF3A3A5E);
         
-        // Draw window content from offscreen buffer
-        for (int32_t dy = 0; dy < win->h; dy++) {
-            for (int32_t dx = 0; dx < win->w; dx++) {
-                comp_put_pixel(win->x + dx, win->y + 20 + dy, win->pixels[dy * win->w + dx]);
-            }
-        }
+        // Draw window content from offscreen buffer (быстрый блит целыми строками)
+        comp_blit_buffer(win->x, win->y + 20, win->w, win->h, win->pixels);
     }
     
     /* Draw cursor */
@@ -251,6 +262,17 @@ void wm_render_all(void) {
     
     /* Flip back buffer to screen */
     comp_flip();
+
+    g_rendering = 0;
+}
+
+/* Вызывается из таймерного IRQ (PIT) с троттлингом. Рисует только если
+ * что-то изменилось и compositor уже инициализирован. */
+void wm_tick_render(void) {
+    if (!compositor_initialized) return;
+    if (!g_needs_redraw) return;
+    g_needs_redraw = 0;
+    wm_render_all();
 }
 
 int wm_get_event(uint64_t win_id, void *event_out) {
@@ -291,8 +313,8 @@ void wm_handle_mouse_move(int dx, int dy) {
         }
     }
     
-    /* Обновляем экран сразу для плавного курсора */
-    wm_render_all();
+    /* Render отвязан от ввода: в IRQ только ставим флаг, рисует таймер. */
+    g_needs_redraw = 1;
 }
 
 void wm_handle_mouse_button(uint8_t buttons) {
@@ -326,6 +348,6 @@ void wm_handle_mouse_button(uint8_t buttons) {
         drag_state.dragging = false;
     }
     
-    /* Обновляем при клике */
-    wm_render_all();
+    /* Render отвязан от ввода: в IRQ только ставим флаг, рисует таймер. */
+    g_needs_redraw = 1;
 }

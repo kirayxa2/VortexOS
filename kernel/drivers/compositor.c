@@ -90,6 +90,27 @@ void comp_put_pixel(int x, int y, uint32_t color) {
     comp.back_buffer[y * bb_width + x] = color;
 }
 
+/* Быстрый блит буфера окна целыми строками.
+ * В отличие от попиксельного comp_put_pixel (cross-TU вызов + 4 проверки
+ * границ на КАЖДЫЙ пиксель), здесь все проверки вынесены за внутренний цикл,
+ * а сам цикл копирования компилятор векторизует на -O2. */
+void comp_blit_buffer(int dx, int dy, int w, int h, const uint32_t *src) {
+    if (!comp.back_buffer || !src) return;
+    for (int row = 0; row < h; row++) {
+        int y = dy + row;
+        if (y < 0 || y >= (int)bb_height) continue;
+
+        int x0 = dx, sx0 = 0, ww = w;
+        if (x0 < 0) { sx0 = -x0; ww += x0; x0 = 0; }       /* клип слева */
+        if (x0 + ww > (int)bb_width) ww = (int)bb_width - x0; /* клип справа */
+        if (ww <= 0) continue;
+
+        uint32_t       *d = &comp.back_buffer[(uint32_t)y * bb_width + x0];
+        const uint32_t *s = &src[(uint32_t)row * w + sx0];
+        for (int i = 0; i < ww; i++) d[i] = s[i];
+    }
+}
+
 void comp_draw_line(int x0, int y0, int x1, int y1, uint32_t color) {
     /* Bresenham's line algorithm */
     int dx = x1 - x0;
@@ -242,13 +263,27 @@ void comp_refresh(void) {
 }
 
 void comp_flip(void) {
-    /* Копируем back buffer в front buffer только нужную часть */
+    /* Копируем back buffer в front buffer.
+     * Программный аналог page-flip: настоящего переключения указателя VRAM без
+     * GPU-драйвера нет, но копию делаем тугим 32-битным циклом (его -O2
+     * векторизует / превращает в memcpy), а не попиксельно с пересчётом индексов. */
     uint32_t copy_w = comp.width < bb_width ? comp.width : bb_width;
     uint32_t copy_h = comp.height < bb_height ? comp.height : bb_height;
-    
+    uint32_t fb_stride = comp.pitch / 4;
+
+    if (fb_stride == bb_width && copy_w == bb_width) {
+        /* Строки идут вплотную в обоих буферах — копируем одним проходом. */
+        uint32_t total = copy_h * bb_width;
+        uint32_t *d = comp.fb_addr;
+        const uint32_t *s = comp.back_buffer;
+        for (uint32_t i = 0; i < total; i++) d[i] = s[i];
+        return;
+    }
+
+    /* Общий случай (pitch != width*4): копируем построчно. */
     for (uint32_t y = 0; y < copy_h; y++) {
-        for (uint32_t x = 0; x < copy_w; x++) {
-            comp.fb_addr[y * (comp.pitch / 4) + x] = comp.back_buffer[y * bb_width + x];
-        }
+        uint32_t *d = &comp.fb_addr[y * fb_stride];
+        const uint32_t *s = &comp.back_buffer[y * bb_width];
+        for (uint32_t x = 0; x < copy_w; x++) d[x] = s[x];
     }
 }
