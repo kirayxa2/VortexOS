@@ -375,16 +375,26 @@ void userspace_hello_task(void) {
 void dock_launcher_task(void) {
     extern int wm_dock_consume_launch(void);
     for (;;) {
+        /* Проверка запроса и засыпание — под cli, чтобы клик по доку (mouse IRQ)
+         * не проскочил между проверкой и блокировкой (lost-wakeup). */
+        __asm__ volatile("cli");
         if (wm_dock_consume_launch()) {
+            __asm__ volatile("sti");
             vfs_node_t *vsh = vfs_open("/vsh", 0);
             if (vsh) {
                 vfs_close(vsh);
                 task_t *t = task_create("vsh", userspace_elf_loader_task, 10);
                 if (t) t->userdata = (void *)"/vsh";
             }
+            continue;
         }
-        /* Спим до следующего прерывания таймера (≈10 мс) и проверяем снова. */
-        __asm__ volatile("hlt");
+        /* Запросов нет — засыпаем (0% CPU). Раньше тут был hlt-цикл, который
+         * хоть и halt'ил CPU, но УДЕРЖИВАЛ свой квант планировщика (priority 3 =
+         * 3 тика) ничего не делая → рендер раз в цикл простаивал ~30 мс и
+         * картинка дёргалась. Теперь блокируемся; будит sched_wake из обработчика
+         * клика по доку (wm_handle_mouse_button). «Block, don't poll.» */
+        sched_block_current();
+        __asm__ volatile("sti\n\thlt");   /* неделимо; первый IRQ переключит */
     }
 }
 
@@ -598,7 +608,11 @@ void kmain(void) {
     fb_puts("[OK] Render task started\n");
 
     /* Dock launcher — запускает терминал по клику на иконку в доке. */
-    task_create("dock", dock_launcher_task, 3);
+    {
+        task_t *dock_task = task_create("dock", dock_launcher_task, 3);
+        extern void wm_set_dock_task(task_t *);
+        wm_set_dock_task(dock_task);   /* чтобы клик по доку мог разбудить задачу */
+    }
     fb_puts("[OK] Dock launcher started\n");
 
     fb_puts("[OK] All tasks created\n");

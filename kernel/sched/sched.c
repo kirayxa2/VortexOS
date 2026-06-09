@@ -17,6 +17,7 @@ static task_t   tasks[MAX_TASKS];
 static uint32_t task_count = 0;
 static task_t  *current    = 0;
 static task_t  *run_queue  = 0;
+static task_t  *idle_task  = 0;   /* истинный fallback: бежит ТОЛЬКО когда больше некому */
 static uint32_t next_pid   = 1;
 
 int vos_need_resched = 0;
@@ -43,7 +44,15 @@ static void queue_remove(task_t *t) {
 static task_t *pick_next(void) {
     if (!run_queue) return 0;
     task_t *start = current ? current->next : run_queue;
+    /* Проход 1: предпочитаем ЛЮБУЮ готовую задачу, кроме idle. idle — это
+     * настоящий fallback (бесконечный hlt), он НЕ должен воровать кванты у
+     * реальной работы (рендер/док). Раньше idle крутился в round-robin как
+     * обычная задача и забирал по тику каждый цикл → рендер терял кадры и
+     * картина дёргалась. */
     task_t *t = start;
+    do { if (t->state == TASK_READY && t != idle_task) return t; t = t->next; } while (t != start);
+    /* Проход 2: больше готовых нет — отдаём процессор idle, если он готов. */
+    t = start;
     do { if (t->state == TASK_READY) return t; t = t->next; } while (t != start);
     return 0;
 }
@@ -61,7 +70,8 @@ void sched_init(void) {
     idle->pml4       = (void *)vmm_kernel_pml4;  /* idle живёт в kernel-пространстве */
     queue_push(idle);
     idle->state = TASK_RUNNING;
-    current = idle;
+    current   = idle;
+    idle_task = idle;   /* запоминаем idle, чтобы pick_next держал его как fallback */
 }
 
 task_t *task_create(const char *name, void (*entry)(void), uint8_t priority) {

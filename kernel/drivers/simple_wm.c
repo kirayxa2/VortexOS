@@ -83,6 +83,11 @@ static void wm_render_region(int rx, int ry, int rw, int rh);
 #define DOCK_NITEMS   1           /* пока только терминал */
 
 static volatile int g_dock_launch_request = 0; /* mouse IRQ ставит, kmain-задача забирает */
+static task_t *g_dock_task = 0;                /* задача дока — её будим по клику */
+
+/* Регистрируется из kmain после task_create("dock", ...). Нужна, чтобы клик по
+ * иконке дока мог разбудить заснувшую (block, don't poll) задачу-лаунчер. */
+void wm_set_dock_task(task_t *t) { g_dock_task = t; }
 static int g_dock_hover   = -1;   /* индекс иконки под курсором, -1 если нет */
 static int g_dock_pressed = 0;    /* нажата ли иконка под курсором */
 static volatile int g_dock_dirty = 0; /* нужно перерисовать только область дока */
@@ -816,8 +821,13 @@ void wm_handle_mouse_button(uint8_t buttons) {
             g_dock_hover = dh;
             g_dock_pressed = 1;
             g_dock_dirty = 1;
-            if (dh == 0 && wm_active_window_count() < MAX_WINDOWS)
+            if (dh == 0 && wm_active_window_count() < MAX_WINDOWS) {
                 g_dock_launch_request = 1;
+                /* Будим заснувшую задачу-лаунчер дока (block, don't poll). Мы
+                 * уже в обработчике mouse IRQ (прерывания off) — флаг выставлен
+                 * до sched_wake, поэтому lost-wakeup невозможен. */
+                if (g_dock_task) sched_wake(g_dock_task);
+            }
             return;  /* не таскаем окно под доком */
         }
         if (dh == -2) {  /* клик по пилюле мимо иконки — просто гасим */
