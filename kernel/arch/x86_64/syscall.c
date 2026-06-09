@@ -81,6 +81,19 @@ static uint64_t sys_sleep(uint64_t ticks) {
     return 0;
 }
 
+/* Припарковать текущую задачу навсегда (0% CPU). Для приложений, которые
+ * нарисовали окно и больше ничего не делают (например, test_window): вместо
+ * busy-loop `for(;;) pause`, который жрёт весь квант, задача уходит в TASK_BLOCKED
+ * и её больше не ставят на процессор. Никто её не будит — она просто спит, не
+ * мешая рендеру и остальным. */
+static uint64_t sys_block(void) {
+    for (;;) {
+        sched_block_current();          /* state=BLOCKED, need_resched=1 */
+        __asm__ volatile("sti\n\thlt"); /* неделимо; первый IRQ переключит */
+    }
+    return 0; /* недостижимо */
+}
+
 /* Структура для возврата информации о framebuffer */
 typedef struct {
     uint64_t phys_addr;  /* Физический адрес framebuffer */
@@ -205,6 +218,10 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, u
             return 0;
         case 14: // SYS_WM_GET_EVENT
             return wm_get_event(a1, (void *)a2);
+        case 15: // SYS_WM_WAIT_EVENT — блокирующее ожидание (block, don't poll)
+            return wm_wait_event(a1, (void *)a2);
+        case 16: // SYS_BLOCK — припарковать задачу навсегда (0% CPU)
+            return sys_block();
         default: return (uint64_t)-1;
     }
 }

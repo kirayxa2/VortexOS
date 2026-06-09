@@ -15,6 +15,7 @@ typedef short int16_t;
 #define SYS_FB_INFO    4
 #define SYS_FB_MAP     5
 #define SYS_INPUT_POLL 6
+#define SYS_BLOCK      16
 
 /* Syscall wrapper */
 static inline uint64_t syscall3(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
@@ -108,16 +109,10 @@ void _start(void) {
     puts("VortexGraph: Test pattern drawn!\n");
     puts("VortexGraph: Entering main loop...\n");
     
-    /* Главный цикл — обрабатываем события */
-    for (;;) {
-        input_event_t event;
-        syscall1(SYS_INPUT_POLL, (uint64_t)&event);
-        
-        /* TODO: обработать события и перерисовать */
-        
-        /* Простая задержка */
-        __asm__ volatile("pause");
-    }
+    /* Картинка нарисована напрямую в framebuffer — делать больше нечего, поэтому
+     * паркуемся навсегда (0% CPU) вместо busy-loop, который жёг весь квант и
+     * тормозил рендер/курсор. «Block, don't poll.» */
+    syscall0(SYS_BLOCK);
     
     syscall1(SYS_EXIT, 0);
 }

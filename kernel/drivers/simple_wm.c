@@ -4,6 +4,7 @@
 #include "virtio_gpu.h"
 #include "pmm.h"
 #include "vmm.h"
+#include "sched.h"   /* sched_current/sched_block_current/sched_wake — block, don't poll */
 
 static wm_window_t windows[MAX_WINDOWS];
 static uint32_t next_win_id = 1;
@@ -280,6 +281,7 @@ uint64_t wm_create_window(const char *title, int32_t x, int32_t y, int32_t w, in
     win->dirty = 1;
     win->event_head = 0;
     win->event_tail = 0;
+    win->waiter     = 0;
 
     /* Новое окно получает фокус ввода с клавиатуры. */
     g_focused_win_id = win->id;
@@ -680,6 +682,14 @@ static void wm_enqueue_key(wm_window_t *win, char ascii) {
     b[16] = 1;                             /* key_pressed = 1 */
 
     win->event_tail = next;                /* публикуем событие последним */
+
+    /* Будим задачу, уснувшую в wm_wait_event на этом окне (если есть). Зовётся
+     * из IRQ клавиатуры (прерывания уже off) — поэтому проверка пустоты очереди
+     * и блокировка в wm_wait_event под cli не словят lost-wakeup. */
+    if (win->waiter) {
+        sched_wake((task_t *)win->waiter);
+        win->waiter = 0;
+    }
 }
 
 /* Зовётся из IRQ клавиатуры (keyboard.c). Кладёт символ в окно с фокусом.
@@ -709,6 +719,43 @@ int wm_get_event(uint64_t win_id, void *event_out) {
     
     win->event_head = (win->event_head + 1) % MAX_WM_EVENTS;
     return 1;
+}
+
+/* -------------------------------------------------------------------------
+ * Блокирующее ожидание события — «как у взрослых ОС».
+ *
+ * Вместо того чтобы userspace крутил busy-poll (wm_get_event в цикле + pause),
+ * сжигая весь свой квант, задача УСЫПЛЯЕТСЯ: сохраняем её как win->waiter,
+ * помечаем TASK_BLOCKED и отдаём процессор. Планировщик больше не ставит её на
+ * CPU, пока IRQ клавиатуры (wm_enqueue_key) не положит событие и не разбудит.
+ * Тогда задача рендера и остальные получают процессор беспрепятственно —
+ * курсор и перетаскивание окон идут плавно, а простаивающее приложение ест 0%
+ * CPU.
+ *
+ * Защита от lost-wakeup: проверка очереди, регистрация будильщика и блокировка
+ * делаются с ВЫКЛЮЧЕННЫМИ прерываниями (cli). `sti; hlt` неделим (sti вступает
+ * в силу только после следующей инструкции), поэтому прерывание не «проскочит»
+ * между разблокировкой и hlt. Первый же IRQ после hlt вызовет sched_pick,
+ * который (раз мы BLOCKED) переключится на другую задачу. Когда нас разбудят,
+ * планировщик вернёт нам процессор ровно сюда — за hlt, и мы перечитаем очередь.
+ * ------------------------------------------------------------------------- */
+int wm_wait_event(uint64_t win_id, void *event_out) {
+    wm_window_t *win = find_window(win_id);
+    if (!win) return 0;
+
+    for (;;) {
+        __asm__ volatile("cli");
+        if (win->event_head != win->event_tail) {
+            __asm__ volatile("sti");
+            return wm_get_event(win_id, event_out);
+        }
+        /* Очередь пуста — регистрируем себя и засыпаем. */
+        win->waiter = sched_current();
+        sched_block_current();              /* state=BLOCKED, need_resched=1 */
+        __asm__ volatile("sti\n\thlt");     /* неделимо; первый IRQ переключит */
+        /* Проснулись (нас разбудил sched_wake из IRQ клавиатуры) — на новый круг
+         * перечитываем очередь под cli. */
+    }
 }
 
 void wm_handle_mouse_move(int dx, int dy) {

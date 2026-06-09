@@ -21,6 +21,8 @@ typedef int int32_t;
 #define SYS_WM_DRAW_STRING    12
 #define SYS_WM_FLUSH          13
 #define SYS_WM_GET_EVENT      14
+#define SYS_WM_WAIT_EVENT     15
+#define SYS_BLOCK             16
 
 /* Syscall wrapper */
 static inline uint64_t syscall6(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
@@ -78,6 +80,18 @@ static inline void wm_flush(uint64_t win) {
 
 static inline int wm_get_event(uint64_t win, wm_event_t *event) {
     return (int)syscall3(SYS_WM_GET_EVENT, win, (uint64_t)event, 0);
+}
+
+/* Блокирующее ожидание события: задача СПИТ (0% CPU), пока не придёт событие,
+ * вместо busy-poll. «Как у взрослых ОС». */
+static inline int wm_wait_event(uint64_t win, wm_event_t *event) {
+    return (int)syscall3(SYS_WM_WAIT_EVENT, win, (uint64_t)event, 0);
+}
+
+/* Припарковать процесс навсегда (0% CPU). Для приложений, которым больше нечего
+ * делать после отрисовки окна. */
+static inline void block_forever(void) {
+    syscall0(SYS_BLOCK);
 }
 
 /* Helper functions */

@@ -259,15 +259,25 @@ void _start(void) {
     uint32_t evraw[8];
     wm_event_t *ev = (wm_event_t *)evraw;
     for (;;) {
+        /* «Block, don't poll»: засыпаем в ядре до прихода события, не сжигая
+         * квант busy-loop'ом. Пока мы спим, задача рендера получает процессор
+         * беспрепятственно — курсор и перетаскивание окон идут плавно. */
+        if (!wm_wait_event(g_win, ev)) break;   /* окно пропало — выходим */
+
         int got = 0;
-        /* выгребаем все накопленные события за проход */
-        while (wm_get_event(g_win, ev)) {
+        if (ev->type == 4 && ev->key_pressed) {
+            on_char((char)(ev->key_code & 0xFF));
             got = 1;
+        }
+        /* выгребаем все накопившиеся события за проход (без сна) */
+        while (wm_get_event(g_win, ev)) {
             if (ev->type == 4 && ev->key_pressed) {
                 on_char((char)(ev->key_code & 0xFF));
+                got = 1;
             }
         }
         if (got) term_render();
-        else { for (volatile int i = 0; i < 20000; i++) __asm__ volatile("pause"); }
     }
+
+    exit(0);
 }

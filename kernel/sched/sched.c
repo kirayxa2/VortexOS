@@ -145,17 +145,49 @@ void sched_yield(void) {
     vos_need_resched = 1;
 }
 
+/* "Block, don't poll." Помечает ТЕКУЩУЮ задачу как уснувшую (BLOCKED) и просит
+ * планировщик переключиться. Пока задача BLOCKED, pick_next её не выбирает —
+ * она вообще не получает процессор и не тратит квант впустую (в отличие от
+ * busy-poll цикла, который жрёт весь свой квант). Разбудить можно sched_wake().
+ * Вызывать ОБЯЗАТЕЛЬНО с выключенными прерываниями (cli) вместе с проверкой
+ * условия и регистрацией будильщика — иначе возможен lost-wakeup. */
+void sched_block_current(void) {
+    if (!current) return;
+    current->state   = TASK_BLOCKED;
+    vos_need_resched = 1;
+}
+
+/* Будит уснувшую задачу: BLOCKED -> READY и просит планировщик пересмотреть
+ * выбор. Зовётся из IRQ (например, клавиатура положила событие в окно). Если
+ * задача не спит — ничего не делаем. */
+void sched_wake(task_t *t) {
+    if (!t) return;
+    if (t->state == TASK_BLOCKED) {
+        t->state         = TASK_READY;
+        vos_need_resched = 1;
+    }
+}
+
 task_t *sched_current(void) { return current; }
 void    sched_clear_resched(void) { vos_need_resched = 0; }
 
 uint64_t sched_pick(uint64_t frame_rsp) {
     current->saved_rsp = frame_rsp;
-    current->state     = TASK_READY;
+    /* Только РАБОТАВШУЮ задачу возвращаем в очередь готовых. Если задача сама
+     * себя усыпила (TASK_BLOCKED) или завершилась (TASK_DEAD) — НЕ трогаем её
+     * состояние, иначе уснувшая задача мгновенно «проснулась» бы обратно и
+     * busy-poll вернулся бы. idle никогда не блокируется, поэтому pick_next
+     * всегда найдёт кого запустить — взаимной блокировки нет. */
+    if (current->state == TASK_RUNNING)
+        current->state = TASK_READY;
     vos_need_resched   = 0;
 
     task_t *next = pick_next();
     if (!next || next == current) {
-        current->state = TASK_RUNNING;
+        /* Других готовых задач нет. Вернуть процессор текущей можно ТОЛЬКО если
+         * она готова бежать (не уснула и не умерла). */
+        if (current->state == TASK_READY)
+            current->state = TASK_RUNNING;
         return current->saved_rsp;
     }
 

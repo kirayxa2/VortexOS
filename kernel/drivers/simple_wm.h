@@ -20,6 +20,11 @@ typedef struct {
     uint32_t events[MAX_WM_EVENTS * 8];  // Each event is 8 uint32_t
     uint32_t event_head;
     uint32_t event_tail;
+
+    /* Задача, уснувшая в ожидании события этого окна (wm_wait_event). IRQ
+     * клавиатуры будит её, положив событие. void* чтобы не тянуть sched.h в
+     * каждого пользователя заголовка; кастуем к task_t* в simple_wm.c. */
+    void *waiter;
 } wm_window_t;
 
 void wm_init(void);
@@ -29,6 +34,10 @@ void wm_draw_rect(uint64_t win_id, int32_t x, int32_t y, int32_t w, int32_t h, u
 void wm_draw_string(uint64_t win_id, int32_t x, int32_t y, const char *str, uint32_t color);
 void wm_flush(uint64_t win_id);
 int wm_get_event(uint64_t win_id, void *event_out);
+/* Блокирующее чтение события: если очередь пуста — задача УСЫПЛЯЕТСЯ (0% CPU)
+ * до прихода события (клавиатура), вместо busy-poll. Возвращает 1 и кладёт
+ * событие в event_out. Возвращает 0 только если окна нет. */
+int wm_wait_event(uint64_t win_id, void *event_out);
 void wm_render_all(void);
 /* Троттлированная перерисовка: рисует только если что-то менялось. */
 void wm_tick_render(void);

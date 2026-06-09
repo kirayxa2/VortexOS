@@ -35,10 +35,9 @@ void _start(void) {
     
     puts("Window rendered! Going to sleep...\n");
     
-    // Sleep forever
-    for (;;) {
-        __asm__ volatile("pause");
-    }
+    // Парк навсегда: 0% CPU (раньше busy-loop for(;;)pause жёг весь квант и
+    // тормозил рендер/курсор). «Block, don't poll.»
+    block_forever();
     
     exit(0);
 }
