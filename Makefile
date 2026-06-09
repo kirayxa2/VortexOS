@@ -21,6 +21,11 @@ CFLAGS := \
     -fno-pic              \
     -mno-red-zone         \
     -mcmodel=kernel       \
+    -mno-sse              \
+    -mno-sse2             \
+    -mno-mmx              \
+    -mno-80387            \
+    -mgeneral-regs-only   \
     -Wall                 \
     -Wextra               \
     -O2                   \

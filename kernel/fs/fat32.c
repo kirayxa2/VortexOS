@@ -544,13 +544,15 @@ int fat32_mkdir_vfs(void *node, const char *name) {
     for (int i = 0; i < 512; i++) buf[i] = 0;
     fat32_dirent_t *de = (fat32_dirent_t *)buf;
 
-    for (int i = 0; i < 11; i++) de[0].name[i] = ' ';
+    for (int i = 0; i < 8; i++) de[0].name[i] = ' ';
+    for (int i = 0; i < 3; i++) de[0].ext[i]  = ' ';
     de[0].name[0] = '.';
     de[0].attr = FAT32_ATTR_DIR;
     de[0].cluster_hi = (uint16_t)(newc >> 16);
     de[0].cluster_lo = (uint16_t)(newc & 0xFFFF);
 
-    for (int i = 0; i < 11; i++) de[1].name[i] = ' ';
+    for (int i = 0; i < 8; i++) de[1].name[i] = ' ';
+    for (int i = 0; i < 3; i++) de[1].ext[i]  = ' ';
     de[1].name[0] = '.'; de[1].name[1] = '.';
     de[1].attr = FAT32_ATTR_DIR;
     uint32_t parent = (dir_cluster == g_vol.root_cluster) ? 0 : dir_cluster;
