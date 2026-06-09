@@ -39,6 +39,11 @@ static mouse_state_t mouse_state = {0};
 static uint8_t  pkt[3];
 static uint8_t  pkt_idx = 0;
 
+/* Последнее ОТПРАВЛЕННОЕ в WM состояние кнопок. Нужно, чтобы дёргать
+ * wm_handle_mouse_button() только при РЕАЛЬНОМ изменении кнопок, а не на
+ * каждый PS/2-пакет (см. ниже — это убивало FPS). */
+static uint8_t  last_button_state = 0;
+
 static void mouse_handler(interrupt_frame_t *frame) {
     (void)frame;
     uint8_t byte = inb(PS2_DATA);
@@ -84,12 +89,24 @@ static void mouse_handler(interrupt_frame_t *frame) {
         wm_handle_mouse_move(dx, dy);
     }
     
-    /* Уведомляем о кнопках */
+    /* Уведомляем о кнопках ТОЛЬКО при изменении состояния.
+     *
+     * БАГ, из-за которого damage rectangles не давали эффекта и было ~5 FPS:
+     * раньше wm_handle_mouse_button() вызывался на КАЖДЫЙ PS/2-пакет (в т.ч. на
+     * чистое движение без нажатий), а он БЕЗУСЛОВНО ставит g_needs_redraw = 1.
+     * => каждый тик PIT шёл по тяжёлому пути wm_render_all() (полный comp_clear
+     * всего экрана + recomposite окон + полный comp_flip), а лёгкий damage-путь
+     * курсора (comp_cursor_refresh, два мелких прямоугольника) НЕ запускался
+     * НИКОГДА. Теперь при простом движении мыши кнопки не меняются → редроя
+     * сцены нет → работает быстрый save-under путь курсора. */
     uint8_t button_state = 0;
     if (mouse_state.left)   button_state |= 0x01;
     if (mouse_state.right)  button_state |= 0x02;
     if (mouse_state.middle) button_state |= 0x04;
-    wm_handle_mouse_button(button_state);
+    if (button_state != last_button_state) {
+        last_button_state = button_state;
+        wm_handle_mouse_button(button_state);
+    }
 }
 
 void mouse_init(void) {
