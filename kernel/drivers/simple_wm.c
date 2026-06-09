@@ -722,12 +722,13 @@ void wm_handle_mouse_button(uint8_t buttons) {
     if (buttons & 1) {
         if (dh >= 0) {
             /* Нажатие на иконку: визуальный отклик + запрос на запуск.
-             * Запускаем терминал только если сейчас НЕТ окон (один usermode-
-             * процесс за раз — единый kernel-стек для syscall). */
+             * Теперь у каждого процесса своё адресное пространство + свой
+             * kernel-стек (per-task CR3/syscall-стек), поэтому можно открывать
+             * несколько терминалов — вплоть до MAX_WINDOWS. */
             g_dock_hover = dh;
             g_dock_pressed = 1;
             g_dock_dirty = 1;
-            if (dh == 0 && wm_active_window_count() == 0)
+            if (dh == 0 && wm_active_window_count() < MAX_WINDOWS)
                 g_dock_launch_request = 1;
             return;  /* не таскаем окно под доком */
         }

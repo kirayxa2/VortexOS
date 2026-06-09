@@ -8,7 +8,7 @@
 #define TASK_BLOCKED  2
 #define TASK_DEAD     3
 
-#define MAX_TASKS       64
+#define MAX_TASKS       128
 #define TASK_STACK_SIZE (32 * 1024)
 
 typedef struct task {
@@ -21,6 +21,9 @@ typedef struct task {
     char            name[32];
     struct task    *next;
     void           *userdata;  /* Произвольные данные (например, путь к ELF) */
+    void           *pml4;      /* Адресное пространство задачи (pte_t*, vaddr).
+                                * Планировщик грузит его в CR3 при свитче, чтобы
+                                * у каждого usermode-процесса была своя память. */
 } task_t;
 
 void    sched_init(void);

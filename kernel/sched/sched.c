@@ -9,6 +9,10 @@
 #include "pmm.h"
 #include "gdt.h"
 
+/* syscall-стек (точка входа SYSCALL) — переключаем его по-задачно тут же, где и
+ * TSS.rsp0, иначе два usermode-процесса делят один kernel-стек на syscall. */
+extern void syscall_set_kernel_stack(uint64_t rsp0);
+
 static task_t   tasks[MAX_TASKS];
 static uint32_t task_count = 0;
 static task_t  *current    = 0;
@@ -54,6 +58,7 @@ void sched_init(void) {
     idle->saved_rsp  = 0;
     idle->name[0] = 'i'; idle->name[1] = 'd';
     idle->name[2] = 'l'; idle->name[3] = 'e'; idle->name[4] = 0;
+    idle->pml4       = (void *)vmm_kernel_pml4;  /* idle живёт в kernel-пространстве */
     queue_push(idle);
     idle->state = TASK_RUNNING;
     current = idle;
@@ -70,6 +75,9 @@ task_t *task_create(const char *name, void (*entry)(void), uint8_t priority) {
     t->priority = priority;
     t->ticks    = priority;
     t->next     = 0;
+    /* По умолчанию задача живёт в kernel-пространстве. usermode-задача
+     * перезапишет это своим user-pml4 (см. userspace_elf_loader_task). */
+    t->pml4     = (void *)vmm_kernel_pml4;
 
     int i = 0;
     while (name[i] && i < 31) { t->name[i] = name[i]; i++; }
@@ -154,9 +162,22 @@ uint64_t sched_pick(uint64_t frame_rsp) {
     current        = next;
     current->state = TASK_RUNNING;
 
-    /* TSS.RSP0 = вершина kernel stack следующей задачи */
+    /* Kernel-стек следующей задачи: и TSS.RSP0 (ловушки/IRQ из ring3), и
+     * syscall_kernel_stack (вход через инструкцию SYSCALL) указываем на ЕЁ
+     * собственный стек. Раньше syscall-стек был глобальным и выставлялся раз
+     * при старте процесса → два usermode-процесса делили его и портили друг
+     * друга. Теперь он переключается по-задачно — можно много процессов. */
     if (current->stack) {
-        gdt_set_kernel_stack((uint64_t)(current->stack + TASK_STACK_SIZE));
+        uint64_t ktop = (uint64_t)(current->stack + TASK_STACK_SIZE);
+        gdt_set_kernel_stack(ktop);
+        syscall_set_kernel_stack(ktop);
+    }
+
+    /* Адресное пространство (CR3) следующей задачи. У каждого usermode-процесса
+     * своя таблица страниц → своя память. Ядро замаплено в КАЖДЫЙ pml4 (верхняя
+     * половина), поэтому код/стек ядра остаются доступны после смены CR3. */
+    if (current->pml4) {
+        vmm_switch((pte_t *)current->pml4);
     }
 
     return current->saved_rsp;
