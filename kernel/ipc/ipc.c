@@ -20,6 +20,8 @@
 
 extern void fb_puts(const char *);
 
+static void shm_drop_ref(int id, uint32_t pid);   /* нужна в ipc_on_task_exit */
+
 /* -------------------------------------------------------------------------
  * Mailbox'ы
  * ---------------------------------------------------------------------- */
@@ -190,6 +192,11 @@ void ipc_on_task_exit(uint32_t pid) {
         input_grabber_pid = 0;
         input_grabber_mb  = 0;
     }
+    /* ФИКС УТЕЧКИ: отпускаем все shm-ссылки умершего процесса. Последний
+     * держатель освобождает страницы сегмента обратно в PMM — раньше каждое
+     * окно навсегда съедало слот (24 окна за сессию — и shm кончался). */
+    for (int i = 0; i < SHM_MAX_SEGS; i++)
+        shm_drop_ref(i, pid);
 }
 
 /* -------------------------------------------------------------------------
@@ -270,19 +277,77 @@ void ipc_input_push_mouse(int dx, int dy, uint8_t buttons, int btn_changed) {
  * маппим в kernel pml4 на фиксированный слот SHM_KERNEL_BASE + id*16MB.
  * Физический адрес каждой страницы потом восстанавливаем walk'ом kernel pml4 —
  * никаких массивов phys-страниц хранить не нужно.
+ *
+ * Жизненный цикл (ФИКС УТЕЧКИ — раньше сегменты жили вечно, ~24 окна на
+ * сессию и конец): на каждом сегменте refcount в виде списка pid'ов, которые
+ * его держат (создатель + все, кто сделал shm_map). Ссылку отпускают:
+ *   - смерть процесса (ipc_on_task_exit), или
+ *   - явный sys_shm_release — им vwm отдаёт поверхность закрытого окна.
+ * Когда pid'ов не осталось — страницы уходят обратно в PMM, слот свободен.
  * ---------------------------------------------------------------------- */
 typedef struct {
-    uint64_t size;      /* 0 = слот свободен */
+    uint64_t size;                  /* 0 = слот свободен */
+    uint32_t pids[SHM_REF_MAX];     /* кто держит сегмент (0 = пусто) */
 } shm_seg_t;
 
 static shm_seg_t shm_segs[SHM_MAX_SEGS];
 
+/* Вернуть PMM первые n_pages страниц слота и снять их маппинг из kernel pml4.
+ * Вызывать под cli. */
+static void shm_free_pages(int id, uint64_t n_pages) {
+    uint64_t kvaddr = SHM_KERNEL_BASE + (uint64_t)id * SHM_SLOT_SIZE;
+    for (uint64_t p = 0; p < n_pages; p++) {
+        uint64_t phys = vmm_virt_to_phys(vmm_kernel_pml4, kvaddr + p * 4096);
+        if (!phys) continue;
+        vmm_unmap(vmm_kernel_pml4, kvaddr + p * 4096);
+        pmm_free(phys);
+    }
+}
+
+/* pid отпускает ссылку на сегмент; последний гасит свет (страницы — в PMM).
+ * Вызывать под cli. */
+static void shm_drop_ref(int id, uint32_t pid) {
+    shm_seg_t *s = &shm_segs[id];
+    if (s->size == 0 || s->size == (uint64_t)-1) return;  /* свободен/строится */
+    int had = 0, left = 0;
+    for (int r = 0; r < SHM_REF_MAX; r++) {
+        if (s->pids[r] == pid) { s->pids[r] = 0; had = 1; }
+        if (s->pids[r]) left = 1;
+    }
+    if (had && !left) {
+        shm_free_pages(id, (s->size + 4095) / 4096);
+        s->size = 0;
+    }
+}
+
+/* Добавить pid в держатели сегмента (идемпотентно). Вызывать под cli.
+ * Возврат: 0 = ок, -1 = список полон (сегмент не дадим, иначе утечёт). */
+static int shm_add_ref(int id, uint32_t pid) {
+    shm_seg_t *s = &shm_segs[id];
+    int free_slot = -1;
+    for (int r = 0; r < SHM_REF_MAX; r++) {
+        if (s->pids[r] == pid) return 0;
+        if (s->pids[r] == 0 && free_slot < 0) free_slot = r;
+    }
+    if (free_slot < 0) return -1;
+    s->pids[free_slot] = pid;
+    return 0;
+}
+
 uint64_t ipc_sys_shm_create(uint64_t size) {
     if (size == 0 || size > SHM_SLOT_SIZE) return (uint64_t)-1;
+    task_t *self = sched_current();
+    if (!self) return (uint64_t)-1;
 
     int id = -1;
+    __asm__ volatile("cli");
     for (int i = 0; i < SHM_MAX_SEGS; i++)
         if (shm_segs[i].size == 0) { id = i; break; }
+    if (id >= 0) {
+        shm_segs[id].size = (uint64_t)-1;   /* бронь слота на время маппинга */
+        for (int r = 0; r < SHM_REF_MAX; r++) shm_segs[id].pids[r] = 0;
+    }
+    __asm__ volatile("sti");
     if (id < 0) return (uint64_t)-1;
 
     uint64_t pages = (size + 4095) / 4096;
@@ -292,7 +357,13 @@ uint64_t ipc_sys_shm_create(uint64_t size) {
         uint64_t phys = pmm_alloc();
         if (!phys) {
             fb_puts("[IPC] shm_create: out of memory\n");
-            return (uint64_t)-1;   /* уже замапленные страницы оставляем слоту */
+            /* ФИКС: уже выделенные страницы — обратно в PMM, слот — свободен
+             * (раньше они навсегда оставались висеть на слоте). */
+            __asm__ volatile("cli");
+            shm_free_pages(id, p);
+            shm_segs[id].size = 0;
+            __asm__ volatile("sti");
+            return (uint64_t)-1;
         }
         vmm_map(vmm_kernel_pml4, kvaddr + p * 4096, phys,
                 VMM_PRESENT | VMM_WRITABLE);
@@ -302,7 +373,10 @@ uint64_t ipc_sys_shm_create(uint64_t size) {
     uint64_t *z = (uint64_t *)kvaddr;
     for (uint64_t i = 0; i < pages * 4096 / 8; i++) z[i] = 0;
 
+    __asm__ volatile("cli");
     shm_segs[id].size = size;
+    shm_add_ref(id, self->pid);        /* создатель держит первую ссылку */
+    __asm__ volatile("sti");
     return (uint64_t)id;
 }
 
@@ -310,7 +384,18 @@ uint64_t ipc_sys_shm_create(uint64_t size) {
  * адрес SHM_USER_BASE + id*16MB (одинаковый во всех процессах). */
 uint64_t ipc_sys_shm_map(uint64_t shm_id) {
     extern uint64_t hhdm_offset;
-    if (shm_id >= SHM_MAX_SEGS || shm_segs[shm_id].size == 0) return 0;
+    if (shm_id >= SHM_MAX_SEGS) return 0;
+    if (shm_segs[shm_id].size == 0 ||
+        shm_segs[shm_id].size == (uint64_t)-1) return 0;  /* свободен/строится */
+    task_t *self = sched_current();
+    if (!self) return 0;
+
+    /* Берём ссылку ДО маппинга: если список держателей полон — отказ,
+     * иначе сегмент стал бы невозможно освободить. */
+    __asm__ volatile("cli");
+    int ref_ok = shm_add_ref((int)shm_id, self->pid);
+    __asm__ volatile("sti");
+    if (ref_ok < 0) return 0;
 
     uint64_t pages  = (shm_segs[shm_id].size + 4095) / 4096;
     uint64_t kvaddr = SHM_KERNEL_BASE + shm_id * SHM_SLOT_SIZE;
@@ -329,4 +414,33 @@ uint64_t ipc_sys_shm_map(uint64_t shm_id) {
                 VMM_PRESENT | VMM_WRITABLE | VMM_USER);
     }
     return uvaddr;
+}
+
+/* Явно отпустить сегмент: снять маппинг из СВОЕГО адресного пространства и
+ * отдать ссылку. Этим vwm освобождает поверхность закрытого окна — иначе его
+ * ссылка держала бы сегмент до конца жизни vwm, и слоты бы кончились так же,
+ * как раньше (просто медленнее). После release трогать буфер нельзя. */
+uint64_t ipc_sys_shm_release(uint64_t shm_id) {
+    extern uint64_t hhdm_offset;
+    if (shm_id >= SHM_MAX_SEGS) return (uint64_t)-1;
+    if (shm_segs[shm_id].size == 0 ||
+        shm_segs[shm_id].size == (uint64_t)-1) return (uint64_t)-1;
+    task_t *self = sched_current();
+    if (!self) return (uint64_t)-1;
+
+    uint64_t pages  = (shm_segs[shm_id].size + 4095) / 4096;
+    uint64_t uvaddr = SHM_USER_BASE + shm_id * SHM_SLOT_SIZE;
+
+    /* Снимаем user-маппинг (CR3 сейчас наш — invlpg попадает куда надо). */
+    uint64_t cr3_phys;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3_phys));
+    cr3_phys &= ~0xFFFULL;
+    pte_t *pml4 = (pte_t *)(cr3_phys + hhdm_offset);
+    for (uint64_t p = 0; p < pages; p++)
+        vmm_unmap(pml4, uvaddr + p * 4096);
+
+    __asm__ volatile("cli");
+    shm_drop_ref((int)shm_id, self->pid);
+    __asm__ volatile("sti");
+    return 0;
 }

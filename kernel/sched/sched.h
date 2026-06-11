@@ -10,6 +10,7 @@
 
 #define MAX_TASKS       128
 #define TASK_STACK_SIZE (32 * 1024)
+#define TASK_MAX_ALLOCS 8   /* ELF-сегменты + user-стек + путь spawn'а */
 
 typedef struct task {
     uint32_t        pid;
@@ -24,6 +25,11 @@ typedef struct task {
     void           *pml4;      /* Адресное пространство задачи (pte_t*, vaddr).
                                 * Планировщик грузит его в CR3 при свитче, чтобы
                                 * у каждого usermode-процесса была своя память. */
+    /* Сырые kmalloc-указатели, которые надо kfree при выходе задачи (ELF-
+     * сегменты, user-стек, скопированный путь spawn'а). Без этого каждый
+     * запуск приложения навсегда съедал сотни КБ kernel heap. */
+    void           *allocs[TASK_MAX_ALLOCS];
+    uint8_t         n_allocs;
 } task_t;
 
 void    sched_init(void);
@@ -34,6 +40,9 @@ void    sched_wake(task_t *t);
 void    sched_clear_resched(void);
 task_t *task_create(const char *name, void (*entry)(void), uint8_t priority);
 void    task_exit(void);
+/* Зарегистрировать kmalloc-указатель для kfree при выходе задачи.
+ * t == 0 — текущая задача. Возврат: 0 = ок, -1 = список полон. */
+int     task_track_alloc(task_t *t, void *raw);
 task_t *sched_current(void);
 int     sched_pid_alive(uint32_t pid);
 uint64_t sched_pick(uint64_t frame_rsp);

@@ -1023,15 +1023,29 @@ static void send_event(uint64_t pid, uint64_t type, uint64_t a, uint64_t b, uint
     vos_ipc_send(pid, &m);
 }
 
-static void close_window(vwin_t *win) {
-    uint64_t pid = win->owner_pid, id = win->id;
-    if (focused_id == id) focused_id = 0;
-    if (drag.active && drag.win_id == id) drag.active = 0;
-    if (rz.active && rz.win_id == id) rz.active = 0;
+/* Окно умерло (крестик или DESTROY от клиента): снять его из таблицы и
+ * ОТДАТЬ shm-поверхность (vos_shm_release). Без release наша ссылка держала
+ * бы сегмент до конца жизни vwm — слоты shm кончались бы после ~24 окон за
+ * сессию. Клиент свою ссылку отпускает сам при выходе (ядро, task_exit);
+ * страницы реально освобождаются, когда отпустят оба. После release пиксели
+ * трогать нельзя — маппинг снят. */
+static void win_drop(vwin_t *win) {
+    if (focused_id == win->id) focused_id = 0;
+    if (drag.active && drag.win_id == win->id) drag.active = 0;
+    if (rz.active && rz.win_id == win->id) rz.active = 0;
     win->id = 0;
     win->pixels = 0;
-    send_event(pid, VWM_EV_CLOSE, id, 0, 0);   /* клиент должен выйти */
+    /* Безусловно: у каждого окна есть поверхность, а shm_id == 0 — валидный
+     * id сегмента (нумерация с нуля). */
+    vos_shm_release(win->shm_id);
+    win->shm_id = 0;
     needs_redraw = 1;
+}
+
+static void close_window(vwin_t *win) {
+    uint64_t pid = win->owner_pid, id = win->id;
+    win_drop(win);
+    send_event(pid, VWM_EV_CLOSE, id, 0, 0);   /* клиент должен выйти */
 }
 
 /* ---------------------------------------------------------------------------
@@ -1360,14 +1374,8 @@ static void handle_msg(vos_msg_t *m) {
         break;
     case VWM_DESTROY: {
         vwin_t *win = find_window(m->w[1]);
-        if (win && win->owner_pid == m->w[7]) {
-            if (focused_id == win->id) focused_id = 0;
-            if (drag.active && drag.win_id == win->id) drag.active = 0;
-            if (rz.active && rz.win_id == win->id) rz.active = 0;
-            win->id = 0;
-            win->pixels = 0;
-            needs_redraw = 1;
-        }
+        if (win && win->owner_pid == m->w[7])
+            win_drop(win);   /* в т.ч. отдаёт shm-поверхность */
         break;
     }
     case VWM_COMMIT: {

@@ -2,6 +2,7 @@
 #include "vfs.h"
 #include "heap.h"
 #include "vmm.h"
+#include "sched.h"   /* task_track_alloc: память сегментов/стека — kfree при exit */
 #include <stddef.h>
 
 extern void* kmalloc(uint64_t size);
@@ -37,6 +38,10 @@ elf_load_result_t elf_load(const char *path) {
         serial_write("[ELF] Error: Cannot create user page table\n");
         return result;
     }
+    /* Отдаём pml4 в result СРАЗУ: на любом фейле ниже (entry_point останется 0)
+     * вызывающий обязан снести её vmm_destroy_user_pml4 — раньше частично
+     * построенная таблица текла при каждом неудачном запуске. */
+    result.user_pml4 = user_pml4;
 
     // Open file through VFS
     vfs_node_t *node = vfs_open(path, 0);
@@ -117,12 +122,18 @@ elf_load_result_t elf_load(const char *path) {
         
         // Allocate physical memory for segment, page-aligned
         // Add extra space for alignment offset
-        void *segment_phys = kmalloc_aligned(phdr.p_memsz + vaddr_offset + 4096, 4096);
+        /* ФИКС УТЕЧКИ: raw-указатель kmalloc регистрируем на текущей задаче —
+         * task_exit сделает kfree. Раньше сегменты жили вечно (сотни КБ на
+         * каждый запуск приложения). */
+        void *seg_raw = 0;
+        void *segment_phys = kmalloc_aligned2(phdr.p_memsz + vaddr_offset + 4096, 4096, &seg_raw);
         if (!segment_phys) {
             serial_write("[ELF] Error: Out of memory\n");
             vfs_close(node);
             return result;
         }
+        if (task_track_alloc(0, seg_raw) < 0)
+            serial_write("[ELF] WARN: alloc list full, segment will leak\n");
 
         // Zero out entire allocation (for BSS and alignment padding)
         mem_memset(segment_phys, 0, phdr.p_memsz + vaddr_offset);
@@ -287,15 +298,20 @@ elf_load_result_t elf_load(const char *path) {
     
     /* Map user stack (16KB) at 0x800000 */
     serial_write("[ELF] Allocating user stack...\n");
-    uint8_t *stack_buf = kmalloc_aligned(16384, 4096);
+    void *stack_raw = 0;
+    uint8_t *stack_buf = kmalloc_aligned2(16384, 4096, &stack_raw);
     if (!stack_buf) {
         serial_write("[ELF] Failed to allocate user stack\n");
+        result.entry_point = 0;   /* без стека процесс не жилец */
         return result;
     }
+    if (task_track_alloc(0, stack_raw) < 0)
+        serial_write("[ELF] WARN: alloc list full, stack will leak\n");
     
     uint64_t stack_phys = vmm_virt_to_phys(vmm_kernel_pml4, (uint64_t)stack_buf);
     if (!stack_phys) {
         serial_write("[ELF] Cannot get physical address of stack\n");
+        result.entry_point = 0;   /* нельзя пускать процесс без стека */
         return result;
     }
     

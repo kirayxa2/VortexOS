@@ -275,6 +275,11 @@ void userspace_elf_loader_task(void) {
     elf_load_result_t elf_result = elf_load(elf_path);
     if (!elf_result.entry_point || !elf_result.user_pml4) {
         fb_puts("[TASK] ELF load failed\n");
+        /* Частично построенную user page table сносим (elf_load теперь отдаёт
+         * её и при фейле). Heap-аллокации сегментов уже на task_track_alloc —
+         * их освободит task_exit. */
+        if (elf_result.user_pml4)
+            vmm_destroy_user_pml4((pte_t *)elf_result.user_pml4);
         task_exit();
         return;
     }

@@ -71,13 +71,22 @@ void *kmalloc(uint64_t size) {
     return 0; /* OOM */
 }
 
-void *kmalloc_aligned(uint64_t size, uint64_t align) {
-    /* Выделяем с запасом, потом выравниваем */
+/* Как kmalloc_aligned, но через *raw_out отдаёт СЫРОЙ указатель kmalloc —
+ * только его можно отдать в kfree (выровненный смещён и kfree его не примет).
+ * Это ключ к освобождению памяти процесса при exit: ELF-сегменты и user-стек
+ * выделяются выровненно, и раньше их raw-указатель терялся навсегда. */
+void *kmalloc_aligned2(uint64_t size, uint64_t align, void **raw_out) {
     uint8_t *raw = kmalloc(size + align);
+    if (raw_out) *raw_out = raw;
     if (!raw) return 0;
     uint64_t addr = (uint64_t)raw;
     uint64_t aligned = (addr + align - 1) & ~(align - 1);
     return (void *)aligned;
+}
+
+void *kmalloc_aligned(uint64_t size, uint64_t align) {
+    /* Выделяем с запасом, потом выравниваем */
+    return kmalloc_aligned2(size, align, 0);
 }
 
 void kfree(void *ptr) {

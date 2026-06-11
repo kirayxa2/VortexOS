@@ -8,6 +8,7 @@
 #include "shell.h"
 #include "vfs.h"
 #include "elf.h"
+#include "vmm.h"
 #include "fb.h"
 #include "keyboard.h"
 
@@ -301,6 +302,9 @@ void shell_run(void) {
                 fb_puts("exec: userspace execution not yet supported from shell\n");
                 // TODO: переключиться в usermode и выполнить
             }
+            /* exec пока не поддержан — не оставляем за собой page table */
+            if (result.user_pml4)
+                vmm_destroy_user_pml4((pte_t *)result.user_pml4);
 
         } else {
             fb_puts(argv[0]); fb_puts(": command not found\n");

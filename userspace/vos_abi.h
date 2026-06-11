@@ -34,6 +34,9 @@ typedef long int64_t;
 #define SYS_RTC           26   /* (uint32[3] h,m,s)       -> 0                 */
 #define SYS_VSYNC         27   /* ()  ждать vblank (no-op на virtio)           */
 #define SYS_FB_PRESENT    28   /* (x,y,w,h)  present для virtio (иначе no-op)  */
+#define SYS_SHM_RELEASE   29   /* (shm_id) отпустить ссылку + unmap -> 0 / -1.
+                                * Последний держатель освобождает страницы.
+                                * После release буфер трогать НЕЛЬЗЯ.          */
 
 #define VOS_SVC_WM        0    /* service id window manager'а */
 
@@ -77,6 +80,9 @@ static inline uint64_t vos_shm_create(uint64_t size) {
 }
 static inline void *vos_shm_map(uint64_t shm_id) {
     return (void *)syscall1(SYS_SHM_MAP, shm_id);
+}
+static inline uint64_t vos_shm_release(uint64_t shm_id) {
+    return syscall1(SYS_SHM_RELEASE, shm_id);
 }
 static inline uint64_t vos_input_grab(void) { return syscall0(SYS_INPUT_GRAB); }
 static inline uint64_t vos_svc_register(uint64_t svc) { return syscall1(SYS_SVC_REGISTER, svc); }

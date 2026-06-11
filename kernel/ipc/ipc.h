@@ -42,6 +42,7 @@
  *   - в userspace: SHM_USER_BASE   + id*SHM_SLOT_SIZE (одинаково во всех процессах)
  * 16MB хватает на back buffer 1920x1080x4 (~8MB) с запасом. */
 #define SHM_MAX_SEGS    24
+#define SHM_REF_MAX     8    /* держателей на сегмент (создатель + map'нувшие) */
 #define SHM_SLOT_SIZE   (16ULL * 1024 * 1024)
 #define SHM_KERNEL_BASE 0xFFFFFFFF94000000ULL
 #define SHM_USER_BASE   0xA0000000ULL
@@ -56,6 +57,7 @@ uint64_t ipc_sys_svc_lookup(uint64_t svc_id);
 uint64_t ipc_sys_input_grab(void);
 uint64_t ipc_sys_shm_create(uint64_t size);
 uint64_t ipc_sys_shm_map(uint64_t shm_id);
+uint64_t ipc_sys_shm_release(uint64_t shm_id);
 
 /* --- хуки для драйверов (зовутся ИЗ IRQ, прерывания уже выключены) --- */
 int  ipc_input_grabbed(void);                       /* 1 = ввод забрал userspace WM */

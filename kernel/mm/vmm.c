@@ -204,3 +204,33 @@ pte_t *vmm_create_user_pml4(void) {
 uint64_t vmm_kernel_virt_to_phys(uint64_t virt) {
     return virt_to_phys_hhdm(virt);
 }
+
+/* Уничтожить user page table умершего процесса: вернуть PMM ВСЕ страницы
+ * самих таблиц нижней половины (PDPT/PD/PT, их выделял get_or_create) и
+ * страницу PML4. ЛИСТОВЫЕ физические страницы здесь НЕ трогаем — у каждой
+ * свой владелец со своим освобождением:
+ *   - ELF-сегменты и user-стек — kernel heap (kfree по raw-указателям задачи);
+ *   - shm-поверхности — shm-подсистема (refcount, ipc_shm_on_task_exit);
+ *   - framebuffer — MMIO/backing virtio-gpu, живёт вечно.
+ * Верхняя половина (256..511) — общие kernel-таблицы, копии по значению из
+ * vmm_kernel_pml4: их освобождать НЕЛЬЗЯ.
+ * Звать ТОЛЬКО когда CR3 уже переключён с этого pml4 (см. task_exit). */
+void vmm_destroy_user_pml4(pte_t *pml4) {
+    if (!pml4 || pml4 == vmm_kernel_pml4) return;
+    for (int i4 = 0; i4 < 256; i4++) {
+        if (!(pml4[i4] & VMM_PRESENT)) continue;
+        pte_t *pdpt = (pte_t *)phys_to_virt(pml4[i4] & PHYS_MASK);
+        for (int i3 = 0; i3 < 512; i3++) {
+            if (!(pdpt[i3] & VMM_PRESENT)) continue;
+            pte_t *pd = (pte_t *)phys_to_virt(pdpt[i3] & PHYS_MASK);
+            for (int i2 = 0; i2 < 512; i2++) {
+                if (!(pd[i2] & VMM_PRESENT)) continue;
+                pmm_free(pd[i2] & PHYS_MASK);      /* страница PT */
+            }
+            pmm_free(pdpt[i3] & PHYS_MASK);        /* страница PD */
+        }
+        pmm_free(pml4[i4] & PHYS_MASK);            /* страница PDPT */
+        pml4[i4] = 0;
+    }
+    pmm_free(table_phys(pml4));                    /* сам PML4 */
+}

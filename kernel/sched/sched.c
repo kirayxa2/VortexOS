@@ -102,6 +102,8 @@ task_t *task_create(const char *name, void (*entry)(void), uint8_t priority) {
     t->ticks    = priority;
     t->next     = 0;
     t->userdata = 0;   /* в переиспользованном слоте мог остаться мусор */
+    t->n_allocs = 0;   /* список kfree-при-выходе: чистый для нового владельца */
+    for (int k = 0; k < TASK_MAX_ALLOCS; k++) t->allocs[k] = 0;
     /* По умолчанию задача живёт в kernel-пространстве. usermode-задача
      * перезапишет это своим user-pml4 (см. userspace_elf_loader_task). */
     t->pml4     = (void *)vmm_kernel_pml4;
@@ -163,10 +165,39 @@ int sched_pid_alive(uint32_t pid) {
     return 0;
 }
 
+int task_track_alloc(task_t *t, void *raw) {
+    if (!t) t = current;
+    if (!t || !raw) return -1;
+    if (t->n_allocs >= TASK_MAX_ALLOCS) return -1;
+    t->allocs[t->n_allocs++] = raw;
+    return 0;
+}
+
 void task_exit(void) {
     extern void ipc_on_task_exit(uint32_t pid);
     __asm__ volatile("cli");
-    ipc_on_task_exit(current->pid);   /* mailbox, сервисы, input grab */
+    ipc_on_task_exit(current->pid);   /* mailbox, сервисы, grab, shm-refs */
+
+    /* ФИКС УТЕЧКИ: возвращаем ВСЮ память процесса.
+     * 1. Уходим с его CR3 (нельзя освобождать таблицы, по которым бежим).
+     * 2. Сносим user page table (PML4 + все таблицы нижней половины — PMM).
+     * 3. kfree всех heap-аллокаций задачи (ELF-сегменты, user-стек, путь).
+     * Раньше всё это жило вечно: каждый запуск приложения навсегда съедал
+     * сотни КБ heap + десятки PMM-страниц таблиц. Kernel-стек задачи НЕ
+     * освобождаем — он переиспользуется вместе со слотом (см. task_create),
+     * и мы прямо сейчас на нём стоим. */
+    vmm_switch(vmm_kernel_pml4);
+    if (current->pml4 && current->pml4 != (void *)vmm_kernel_pml4) {
+        vmm_destroy_user_pml4((pte_t *)current->pml4);
+        current->pml4 = (void *)vmm_kernel_pml4;
+    }
+    for (uint8_t k = 0; k < current->n_allocs; k++) {
+        kfree(current->allocs[k]);
+        current->allocs[k] = 0;
+    }
+    current->n_allocs = 0;
+    current->userdata = 0;
+
     current->state = TASK_DEAD;
     queue_remove(current);
     vos_need_resched = 1;

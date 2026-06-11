@@ -212,6 +212,7 @@ static uint64_t sys_fb_map(void) {
 static uint64_t sys_spawn(uint64_t user_path) {
     extern void userspace_elf_loader_task(void);
     extern void *kmalloc(uint64_t);
+    extern void kfree(void *);
     if (!user_path) return (uint64_t)-1;
 
     const char *src = (const char *)user_path;
@@ -220,11 +221,12 @@ static uint64_t sys_spawn(uint64_t user_path) {
     int i = 0;
     while (src[i] && i < 63) { path[i] = src[i]; i++; }
     path[i] = 0;
-    if (i == 0) return (uint64_t)-1;
+    if (i == 0) { kfree(path); return (uint64_t)-1; }  /* был leak на пустом пути */
 
     task_t *t = task_create("app", userspace_elf_loader_task, 10);
-    if (!t) return (uint64_t)-1;
+    if (!t) { kfree(path); return (uint64_t)-1; }      /* был leak при отказе */
     t->userdata = path;
+    task_track_alloc(t, path);   /* kfree при выходе задачи — путь больше не течёт */
     return t->pid;
 }
 
@@ -347,6 +349,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, u
         case 26: return sys_rtc(a1);                   // SYS_RTC(buf: 3 x uint32 h,m,s)
         case 27: return sys_vsync();                   // SYS_VSYNC — ждать vblank
         case 28: return sys_fb_present(a1,a2,a3,a4);   // SYS_FB_PRESENT(x,y,w,h)
+        case 29: return ipc_sys_shm_release(a1);       // SYS_SHM_RELEASE(id)
         default: return (uint64_t)-1;
     }
 }

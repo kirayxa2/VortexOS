@@ -25,6 +25,7 @@ void vmm_unmap(pte_t *pml4, uint64_t virt);
 uint64_t vmm_virt_to_phys(pte_t *pml4, uint64_t virt);
 void vmm_switch(pte_t *pml4);
 pte_t *vmm_create_user_pml4(void);
+void   vmm_destroy_user_pml4(pte_t *pml4);
 uint64_t vmm_kernel_virt_to_phys(uint64_t virt);
 
 #endif /* VOS_VMM_H */
