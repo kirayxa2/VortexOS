@@ -1,0 +1,16 @@
+/* =============================================================================
+ * VortexOS libc — stddef.h
+ * ============================================================================= */
+#ifndef _VLIBC_STDDEF_H
+#define _VLIBC_STDDEF_H
+
+typedef unsigned long size_t;
+typedef long          ptrdiff_t;
+
+#ifndef NULL
+#define NULL ((void *)0)
+#endif
+
+#define offsetof(type, member) __builtin_offsetof(type, member)
+
+#endif /* _VLIBC_STDDEF_H */

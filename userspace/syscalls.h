@@ -94,7 +94,11 @@ static inline void block_forever(void) {
     syscall0(SYS_BLOCK);
 }
 
-/* Helper functions */
+/* Helper functions.
+ * __VLIBC__ определяют libc-приложения (см. userspace/libc/): настоящие
+ * puts()/exit() там предоставляет libc, а эти inline-версии выключаются,
+ * чтобы не конфликтовать. Старые приложения без libc работают как раньше. */
+#ifndef __VLIBC__
 static inline void puts(const char *s) {
     int len = 0;
     while (s[len]) len++;
@@ -104,5 +108,6 @@ static inline void puts(const char *s) {
 static inline void exit(int code) {
     syscall1(SYS_EXIT, code);
 }
+#endif /* !__VLIBC__ */
 
 #endif

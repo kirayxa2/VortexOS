@@ -195,6 +195,7 @@ disk-with-apps: disk userspace
 	python3 tools/add_file.py build/disk.img userspace/vterm bin/vterm
 	python3 tools/add_file.py build/disk.img userspace/vdemo bin/vdemo
 	python3 tools/add_file.py build/disk.img userspace/vfiles bin/vfiles
+	python3 tools/add_file.py build/disk.img userspace/vuidemo bin/vuidemo
 	@echo "=== Creating FS hierarchy (/etc, /home, /tmp) ==="
 	python3 tools/add_file.py build/disk.img "Welcome to VortexOS!" etc/motd
 	python3 tools/add_file.py build/disk.img --mkdir home
