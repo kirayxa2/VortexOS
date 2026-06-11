@@ -117,13 +117,13 @@ build_all() {
     fi
     ok "Userspace built"
 
-    step 5 $total "Creating disk image with apps..."
-    make disk-clean > /dev/null 2>&1
-    if ! make disk-with-apps 2>&1; then
+    step 5 $total "Creating VortexFS disk image with apps..."
+    make vortexfs-disk-clean > /dev/null 2>&1
+    if ! make vortexfs-with-apps 2>&1; then
         fail "Disk creation FAILED"
         return 1
     fi
-    ok "Disk image ready"
+    ok "VortexFS disk image ready"
 
     echo ""
     echo -e "  ${GREEN}${BOLD}Build successful!${NC}"
