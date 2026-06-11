@@ -87,7 +87,7 @@ C_OBJS   := $(patsubst %.c,   build/%.o, $(C_SRCS))
 ALL_OBJS := $(ASM_OBJS) $(C_OBJS)
 
 # --- Цели --------------------------------------------------------------------
-.PHONY: all clean run iso disk disk-clean vortexfs-disk vortexfs-disk-clean userspace disk-with-apps
+.PHONY: all clean run iso disk disk-clean vortexfs-disk vortexfs-disk-clean userspace disk-with-apps vortexfs-with-apps
 
 all: build/kernel.bin
 	@echo "=== Build OK: build/kernel.bin ==="
@@ -159,7 +159,9 @@ iso: build/kernel.bin
 	$(LIMINE)/limine.exe bios-install build/vortex.iso
 	@echo "=== ISO ready: build/vortex.iso ==="
 
-run: iso disk vortexfs-disk
+## VortexFS — основной диск (drive 0), FAT32 — вторичный (drive 1, опционально).
+## Ядро пробует VortexFS первым → FAT32 → ramfs.
+run: iso vortexfs-disk
 	$(QEMU)                          \
 	    -cdrom build/vortex.iso      \
 	    -m 256M                      \
@@ -167,16 +169,12 @@ run: iso disk vortexfs-disk
 	    -display sdl                 \
 	    -machine pc                  \
 	    -boot order=d                \
-	    -drive file=build/disk.img,format=raw,if=ide,index=0 \
-	    -drive file=build/vortexfs.img,format=raw,if=ide,index=1 \
+	    -drive file=build/vortexfs.img,format=raw,if=ide,index=0 \
 	    -no-reboot                   \
 	    -no-shutdown
 
 ## Запуск с virtio-gpu (аппаратный present без разрывов).
-## `-vga virtio` = virtio-vga: Limine всё ещё получает framebuffer для загрузки,
-## а наш virtio_gpu-драйвер перехватывает scanout. Если что-то не так — просто
-## запусти обычный `make run` (там virtio-gpu нет и драйвер сам отключается).
-run-gpu: iso disk vortexfs-disk
+run-gpu: iso vortexfs-disk
 	$(QEMU)                          \
 	    -cdrom build/vortex.iso      \
 	    -m 256M                      \
@@ -185,8 +183,21 @@ run-gpu: iso disk vortexfs-disk
 	    -machine pc                  \
 	    -vga virtio                  \
 	    -boot order=d                \
+	    -drive file=build/vortexfs.img,format=raw,if=ide,index=0 \
+	    -no-reboot                   \
+	    -no-shutdown
+
+## Legacy: запуск с FAT32 как root (старое поведение).
+## Если VortexFS не найден на drive 0, ядро откатится на FAT32.
+run-fat32: iso disk
+	$(QEMU)                          \
+	    -cdrom build/vortex.iso      \
+	    -m 256M                      \
+	    -serial stdio                \
+	    -display sdl                 \
+	    -machine pc                  \
+	    -boot order=d                \
 	    -drive file=build/disk.img,format=raw,if=ide,index=0 \
-	    -drive file=build/vortexfs.img,format=raw,if=ide,index=1 \
 	    -no-reboot                   \
 	    -no-shutdown
 
@@ -202,7 +213,7 @@ userspace:
 # и файлы уезжали в мусорные каталоги внутри образа. add_file.py сам считает
 # путь от корня FAT32.
 disk-with-apps: disk userspace
-	@echo "=== Adding userspace programs to /bin ==="
+	@echo "=== Adding userspace programs to FAT32 /bin ==="
 	python3 tools/add_file.py build/disk.img userspace/hello bin/hello
 	python3 tools/add_file.py build/disk.img userspace/vortexgraph bin/vgraph
 	python3 tools/add_file.py build/disk.img userspace/test_window bin/testwin
@@ -231,4 +242,39 @@ disk-with-apps: disk userspace
 	python3 tools/add_file.py build/disk.img "Welcome to VortexOS!" etc/motd
 	python3 tools/add_file.py build/disk.img --mkdir home
 	python3 tools/add_file.py build/disk.img --mkdir tmp
-	@echo "=== Disk with apps ready ==="
+	@echo "=== FAT32 disk with apps ready ==="
+
+# --- VortexFS disk с приложениями (заменяет FAT32 как корневую FS) ----------
+# Теперь VortexFS — основной образ диска (drive 0). FAT32 остаётся как
+# fallback, но `make vortexfs-with-apps` + `make run` = VortexFS root.
+vortexfs-with-apps: vortexfs-disk userspace
+	@echo "=== Adding userspace programs to VortexFS /bin ==="
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/hello bin/hello
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vortexgraph bin/vgraph
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/test_window bin/testwin
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vsh bin/vsh
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vwm bin/vwm
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vterm bin/vterm
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vdemo bin/vdemo
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vfiles bin/vfiles
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vuidemo bin/vuidemo
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vpanel bin/vpanel
+	@echo "=== Adding /bin utilities (ls, cat, rm, find, ...) ==="
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/ls bin/ls
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/cat bin/cat
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/rm bin/rm
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/find bin/find
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/mkdir bin/mkdir
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/touch bin/touch
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/cp bin/cp
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/mv bin/mv
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/echo bin/echo
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/pwd bin/pwd
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/stat bin/stat
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/head bin/head
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/wc bin/wc
+	@echo "=== Creating FS hierarchy (/etc, /home, /tmp) ==="
+	python3 tools/add_vortexfs_file.py build/vortexfs.img "Welcome to VortexOS!" etc/motd
+	python3 tools/add_vortexfs_file.py build/vortexfs.img --mkdir home
+	python3 tools/add_vortexfs_file.py build/vortexfs.img --mkdir tmp
+	@echo "=== VortexFS disk with apps ready ==="

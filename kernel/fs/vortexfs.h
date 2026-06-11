@@ -51,7 +51,8 @@ typedef struct __attribute__((packed)) {
     uint32_t blocks;                /* кол-во выделенных блоков      */
     uint32_t direct[VTXFS_MAX_DIRECT]; /* прямые указатели (0 = нет) */
     uint32_t indirect;              /* один уровень косвенности      */
-    uint32_t _pad[2];               /* выравнивание до 64 байт       */
+    uint32_t dbl_indirect;          /* двойная косвенность           */
+    uint32_t _pad;                  /* выравнивание до 64 байт       */
 } vtxfs_inode_t;
 
 /* === On-disk запись каталога (64 байта) =================================== */

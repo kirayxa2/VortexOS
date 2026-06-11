@@ -166,38 +166,86 @@ static int blk_write(uint32_t blk, const void *buf) {
 }
 
 /* Получить номер блока по логическому индексу внутри файла.
- * 0 = «не выделен» (sentinel). */
+ * 0 = «не выделен» (sentinel).
+ *
+ * Уровни:
+ *   [0 .. MAX_DIRECT-1]               — direct
+ *   [MAX_DIRECT .. MAX_DIRECT+127]    — indirect  (128 ptr)
+ *   [MAX_DIRECT+128 .. MAX_DIRECT+128+128*128-1] — double-indirect */
 static uint32_t inode_get_blk(vtxfs_inode_t *di, uint32_t idx) {
     if (idx < VTXFS_MAX_DIRECT)
         return di->direct[idx];
 
-    /* Indirect */
-    uint32_t ii = idx - VTXFS_MAX_DIRECT;
-    if (di->indirect == 0 || ii >= 128) return 0;
+    uint32_t off = idx - VTXFS_MAX_DIRECT;
 
-    uint32_t ibuf[128];  /* 512 / 4 = 128 указателей */
-    if (blk_read(di->indirect, ibuf) != 0) return 0;
-    return ibuf[ii];
+    /* Single indirect */
+    if (off < 128) {
+        if (di->indirect == 0) return 0;
+        uint32_t ibuf[128];
+        if (blk_read(di->indirect, ibuf) != 0) return 0;
+        return ibuf[off];
+    }
+
+    /* Double indirect */
+    off -= 128;
+    if (di->dbl_indirect == 0 || off >= 128 * 128) return 0;
+    uint32_t d1[128];
+    if (blk_read(di->dbl_indirect, d1) != 0) return 0;
+    uint32_t slot = off / 128;
+    if (d1[slot] == 0) return 0;
+    uint32_t d2[128];
+    if (blk_read(d1[slot], d2) != 0) return 0;
+    return d2[off % 128];
 }
 
-/* Установить блок по логическому индексу, при необходимости выделив indirect */
+/* Установить блок по логическому индексу, при необходимости выделяя
+ * indirect / double-indirect блоки. */
 static int inode_set_blk(vtxfs_inode_t *di, uint32_t idx, uint32_t blk) {
     if (idx < VTXFS_MAX_DIRECT) {
         di->direct[idx] = blk;
         return 0;
     }
-    uint32_t ii = idx - VTXFS_MAX_DIRECT;
-    if (ii >= 128) return -1;
 
-    if (di->indirect == 0) {
-        int ib = blk_alloc();
-        if (ib < 0) return -1;
-        di->indirect = (uint32_t)ib;
+    uint32_t off = idx - VTXFS_MAX_DIRECT;
+
+    /* Single indirect */
+    if (off < 128) {
+        if (di->indirect == 0) {
+            int ib = blk_alloc();
+            if (ib < 0) return -1;
+            di->indirect = (uint32_t)ib;
+        }
+        uint32_t ibuf[128];
+        if (blk_read(di->indirect, ibuf) != 0) return -1;
+        ibuf[off] = blk;
+        return blk_write(di->indirect, ibuf);
     }
-    uint32_t ibuf[128];
-    if (blk_read(di->indirect, ibuf) != 0) return -1;
-    ibuf[ii] = blk;
-    return blk_write(di->indirect, ibuf);
+
+    /* Double indirect */
+    off -= 128;
+    if (off >= 128 * 128) return -1;
+
+    /* Allocate top-level double-indirect block if needed */
+    if (di->dbl_indirect == 0) {
+        int db = blk_alloc();
+        if (db < 0) return -1;
+        di->dbl_indirect = (uint32_t)db;
+    }
+    uint32_t d1[128];
+    if (blk_read(di->dbl_indirect, d1) != 0) return -1;
+
+    uint32_t slot = off / 128;
+    /* Allocate second-level indirect block if needed */
+    if (d1[slot] == 0) {
+        int sb = blk_alloc();
+        if (sb < 0) return -1;
+        d1[slot] = (uint32_t)sb;
+        if (blk_write(di->dbl_indirect, d1) != 0) return -1;
+    }
+    uint32_t d2[128];
+    if (blk_read(d1[slot], d2) != 0) return -1;
+    d2[off % 128] = blk;
+    return blk_write(d1[slot], d2);
 }
 
 /* ========================================================================= *
@@ -530,18 +578,43 @@ static int vtxfs_create_cb(vfs_node_t *vn, const char *name) {
 
 /* --- unlink ------------------------------------------------------------- */
 static void free_all_blocks(vtxfs_inode_t *di) {
+    /* Direct blocks */
     for (uint32_t i = 0; i < di->blocks && i < VTXFS_MAX_DIRECT; i++)
         if (di->direct[i]) blk_free(di->direct[i]);
 
+    /* Single indirect */
     if (di->indirect) {
         uint32_t ibuf[128];
         if (blk_read(di->indirect, ibuf) == 0) {
-            uint32_t start = (di->blocks > VTXFS_MAX_DIRECT)
+            uint32_t cnt = (di->blocks > VTXFS_MAX_DIRECT)
                              ? di->blocks - VTXFS_MAX_DIRECT : 0;
-            for (uint32_t i = 0; i < start; i++)
+            if (cnt > 128) cnt = 128;
+            for (uint32_t i = 0; i < cnt; i++)
                 if (ibuf[i]) blk_free(ibuf[i]);
         }
         blk_free(di->indirect);
+    }
+
+    /* Double indirect */
+    if (di->dbl_indirect) {
+        uint32_t d1[128];
+        if (blk_read(di->dbl_indirect, d1) == 0) {
+            /* Remaining blocks after direct + single indirect */
+            uint32_t used = (di->blocks > VTXFS_MAX_DIRECT + 128)
+                             ? di->blocks - VTXFS_MAX_DIRECT - 128 : 0;
+            for (uint32_t s = 0; s < 128 && used > 0; s++) {
+                if (d1[s] == 0) break;
+                uint32_t d2[128];
+                if (blk_read(d1[s], d2) == 0) {
+                    uint32_t n = (used > 128) ? 128 : used;
+                    for (uint32_t j = 0; j < n; j++)
+                        if (d2[j]) blk_free(d2[j]);
+                    used -= n;
+                }
+                blk_free(d1[s]);
+            }
+        }
+        blk_free(di->dbl_indirect);
     }
 }
 
