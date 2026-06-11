@@ -76,6 +76,7 @@ C_SRCS := \
     kernel/fs/vfs.c                    \
     kernel/fs/ramfs.c                  \
     kernel/fs/fat32.c                  \
+    kernel/fs/vortexfs.c               \
     kernel/fs/elf.c                    \
     kernel/fs/shell.c                  \
     kernel/ipc/ipc.c                   \
@@ -86,7 +87,7 @@ C_OBJS   := $(patsubst %.c,   build/%.o, $(C_SRCS))
 ALL_OBJS := $(ASM_OBJS) $(C_OBJS)
 
 # --- Цели --------------------------------------------------------------------
-.PHONY: all clean run iso disk disk-clean userspace disk-with-apps
+.PHONY: all clean run iso disk disk-clean vortexfs-disk vortexfs-disk-clean userspace disk-with-apps
 
 all: build/kernel.bin
 	@echo "=== Build OK: build/kernel.bin ==="
@@ -106,6 +107,19 @@ build/disk.img:
 	@echo "=== Adding test file to disk ==="
 	python3 tools/add_file.py build/disk.img "Hello from FAT32!" test.txt
 	@echo "=== Disk image ready: build/disk.img ==="
+
+# --- VortexFS disk image (second ATA drive) --------------------------------
+vortexfs-disk: build/vortexfs.img
+
+vortexfs-disk-clean:
+	rm -f build/vortexfs.img
+	@echo "=== VortexFS image removed ==="
+
+build/vortexfs.img:
+	@mkdir -p build
+	@echo "=== Creating 16MB VortexFS disk image ==="
+	python3 tools/mkvortexfs.py build/vortexfs.img 16
+	@echo "=== VortexFS image ready: build/vortexfs.img ==="
 
 build/kernel.bin: $(ALL_OBJS)
 	@echo "[LD]  $@"
@@ -145,7 +159,7 @@ iso: build/kernel.bin
 	$(LIMINE)/limine.exe bios-install build/vortex.iso
 	@echo "=== ISO ready: build/vortex.iso ==="
 
-run: iso disk
+run: iso disk vortexfs-disk
 	$(QEMU)                          \
 	    -cdrom build/vortex.iso      \
 	    -m 256M                      \
@@ -154,6 +168,7 @@ run: iso disk
 	    -machine pc                  \
 	    -boot order=d                \
 	    -drive file=build/disk.img,format=raw,if=ide,index=0 \
+	    -drive file=build/vortexfs.img,format=raw,if=ide,index=1 \
 	    -no-reboot                   \
 	    -no-shutdown
 
@@ -161,7 +176,7 @@ run: iso disk
 ## `-vga virtio` = virtio-vga: Limine всё ещё получает framebuffer для загрузки,
 ## а наш virtio_gpu-драйвер перехватывает scanout. Если что-то не так — просто
 ## запусти обычный `make run` (там virtio-gpu нет и драйвер сам отключается).
-run-gpu: iso disk
+run-gpu: iso disk vortexfs-disk
 	$(QEMU)                          \
 	    -cdrom build/vortex.iso      \
 	    -m 256M                      \
@@ -171,6 +186,7 @@ run-gpu: iso disk
 	    -vga virtio                  \
 	    -boot order=d                \
 	    -drive file=build/disk.img,format=raw,if=ide,index=0 \
+	    -drive file=build/vortexfs.img,format=raw,if=ide,index=1 \
 	    -no-reboot                   \
 	    -no-shutdown
 

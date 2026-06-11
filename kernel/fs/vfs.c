@@ -29,9 +29,13 @@ void vfs_mount_root(vfs_node_t *root) {
 }
 
 int vfs_mount(const char *path, vfs_node_t *root) {
+    /* Находим ноду-точку монтирования и подключаем к ней */
+    vfs_node_t *mp = vfs_open(path, 0);
+    if (mp && mp->type == VFS_DIR)
+        mp->mount = root;
+
     for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
         if (!mounts[i].used) {
-            /* копируем строку вручную */
             int j = 0;
             while (path[j] && j < VFS_MAX_PATH - 1) {
                 mounts[i].path[j] = path[j]; j++;
@@ -71,6 +75,10 @@ vfs_node_t *vfs_open(const char *path, uint32_t flags) {
         if (!cur->ops || !cur->ops->finddir) return 0;
         vfs_node_t *next = cur->ops->finddir(cur, p);
         if (!next) return 0;
+
+        /* Если нода — точка монтирования, переходим в смонтированную FS */
+        if (next->mount)
+            next = next->mount;
 
         cur = next;
         p = more ? slash + 1 : 0;

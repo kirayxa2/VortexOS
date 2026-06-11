@@ -22,6 +22,7 @@
 #include "vfs.h"
 #include "ramfs.h"
 #include "fat32.h"
+#include "vortexfs.h"
 #include "shell.h"
 #include "elf.h"
 
@@ -544,6 +545,27 @@ void kmain(void) {
         vfs_close(hello_test);
     } else {
         fb_puts("[VFS] /bin/hello NOT FOUND!\n");
+    }
+
+    /* --- VortexFS на втором ATA диске (slave) ----------------------------- */
+    {
+        ata_drive_t *slave_drv = ata_get_drive(1);
+        if (slave_drv) {
+            fb_puts("[TEST] Found ATA slave, trying VortexFS...\n");
+            if (vortexfs_init(1, 0) != 0) {
+                fb_puts("[VortexFS] No FS found, formatting...\n");
+                vortexfs_mkfs(1, 0, slave_drv->sectors);
+                vortexfs_init(1, 0);
+            }
+            vfs_node_t *vtxfs_root = vortexfs_get_root();
+            if (vtxfs_root) {
+                vfs_mkdir("/mnt");
+                vfs_mount("/mnt", vtxfs_root);
+                fb_puts("[OK] VortexFS mounted at /mnt\n");
+            }
+        } else {
+            fb_puts("[INFO] No ATA slave — VortexFS skipped\n");
+        }
     }
 
     /* --- Планировщик + таймер ------------------------------------------- */
