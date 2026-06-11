@@ -322,6 +322,7 @@ static void dmg_merge(void) {
     }
 }
 static void blit_to_front(int x, int y, int w, int h) {
+    if (bb == fb) return;   /* virtio: компонуем прямо в backing, копия не нужна */
     for (int row = 0; row < h; row++) {
         int yy = y + row;
         if (yy < 0 || yy >= (int)fbh) continue;
@@ -1069,14 +1070,21 @@ static int win_intersects(const vwin_t *win, int rx, int ry, int rw, int rh) {
     return 1;
 }
 
-/* Пересобрать сцену (без курсора) внутри прямоугольника. */
-static void compose_rect(int rx, int ry, int rw, int rh) {
+/* Пересобрать сцену (без курсора) внутри прямоугольника.
+ * start_idx >= 0 — оптимизация (occlusion): известно, что НЕПРОЗРАЧНОЕ тело
+ * окна windows[start_idx] целиком накрывает rect => обои и окна ниже него
+ * в этом rect не видны, их можно не рисовать (главная экономия CPU при
+ * drag больших окон: вместо «обои + окно» рисуется только окно). */
+static void compose_rect_from(int rx, int ry, int rw, int rh, int start_idx) {
     clip_set(rx, ry, rw, rh);
     if (clip_empty()) { clip_reset(); return; }
 
-    fill_wall(rx, ry, rw, rh);
+    if (start_idx < 0) {
+        fill_wall(rx, ry, rw, rh);
+        start_idx = 0;
+    }
 
-    for (int i = 0; i < MAX_WINDOWS; i++) {
+    for (int i = start_idx; i < MAX_WINDOWS; i++) {
         vwin_t *win = &windows[i];
         if (!win->id || !win->pixels || win->minimized) continue;
         if (!win_intersects(win, rx, ry, rw, rh)) continue;
@@ -1097,6 +1105,59 @@ static void compose_rect(int rx, int ry, int rw, int rh) {
     clip_reset();
 }
 
+static void compose_rect(int rx, int ry, int rw, int rh) {
+    compose_rect_from(rx, ry, rw, rh, -1);
+}
+
+/* Непрозрачное тело окна: контент без титлбара (верхние скругления/блик) и
+ * без нижних WIN_CORNER строк (скруглённые AA-углы просвечивают фон). */
+static void win_opaque_body(const vwin_t *w, int *x, int *y, int *ww, int *hh) {
+    *x = w->x; *y = w->y + TITLEBAR_H;
+    *ww = w->w; *hh = w->h - WIN_CORNER;
+}
+
+/* Компоновка damage-прямоугольника с учётом перекрытия (occlusion).
+ * Если непрозрачное тело какого-то окна накрывает БОЛЬШУЮ часть rect
+ * (типичный случай: drag/resize/COMMIT большого окна), режем rect на
+ * центр (рисуем начиная с этого окна, без обоев и нижних окон) и до
+ * четырёх рамок по краям (полная компоновка). На эмулируемом CPU это
+ * сокращает работу кадра при drag примерно вдвое. */
+static void compose_damage(int rx, int ry, int rw, int rh) {
+    int best = -1, best_area = 0;
+    int ix0 = 0, iy0 = 0, ix1 = 0, iy1 = 0;
+
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        vwin_t *win = &windows[i];
+        if (!win->id || !win->pixels || win->minimized) continue;
+        int bx, by, bw, bh;
+        win_opaque_body(win, &bx, &by, &bw, &bh);
+        if (bw <= 0 || bh <= 0) continue;
+        int x0 = imax(rx, bx), y0 = imax(ry, by);
+        int x1 = imin(rx + rw, bx + bw), y1 = imin(ry + rh, by + bh);
+        if (x1 <= x0 || y1 <= y0) continue;
+        int area = (x1 - x0) * (y1 - y0);
+        /* >= : при равном покрытии берём окно ВЫШЕ по z — меньше перерисовки */
+        if (area >= best_area) {
+            best = i; best_area = area;
+            ix0 = x0; iy0 = y0; ix1 = x1; iy1 = y1;
+        }
+    }
+
+    /* нет доминирующего непрозрачного куска — обычный путь */
+    if (best < 0 || best_area * 2 < rw * rh) {
+        compose_rect(rx, ry, rw, rh);
+        return;
+    }
+
+    /* центр: тело окна best накрывает sub-rect целиком => старт с него */
+    compose_rect_from(ix0, iy0, ix1 - ix0, iy1 - iy0, best);
+    /* рамки вокруг центра — полная компоновка */
+    if (iy0 > ry)           compose_rect(rx, ry, rw, iy0 - ry);              /* верх  */
+    if (iy1 < ry + rh)      compose_rect(rx, iy1, rw, ry + rh - iy1);        /* низ   */
+    if (ix0 > rx)           compose_rect(rx, iy0, ix0 - rx, iy1 - iy0);      /* лево  */
+    if (ix1 < rx + rw)      compose_rect(ix1, iy0, rx + rw - ix1, iy1 - iy0);/* право */
+}
+
 /* Кадр: перекомпоновка damage-регионов + курсор + один present. */
 static void frame(void) {
     if (!scene_presented) { scene_presented = 1; dmg_all(); }
@@ -1112,7 +1173,7 @@ static void frame(void) {
     dmg_merge();
 
     for (int i = 0; i < damage_count; i++)
-        compose_rect(damage[i].x, damage[i].y, damage[i].w, damage[i].h);
+        compose_damage(damage[i].x, damage[i].y, damage[i].w, damage[i].h);
 
     /* курсор — верхний слой: дорисовать в каждый затронутый регион */
     {
@@ -1788,16 +1849,28 @@ void _start(void) {
     }
     fbw = info.w; fbh = info.h; fb_stride = info.pitch / 4;
 
-    /* 2. Back buffer в shm (PMM-страницы, не куча ядра) */
-    uint64_t bb_shm = vos_shm_create((uint64_t)fbw * fbh * 4);
-    if (bb_shm == (uint64_t)-1) {
-        puts("vwm: shm_create back buffer failed\n");
-        exit(1);
-    }
-    bb = (uint32_t *)vos_shm_map(bb_shm);
-    if (!bb) {
-        puts("vwm: shm_map back buffer failed\n");
-        exit(1);
+    /* 2. Back buffer. На virtio-gpu экран меняется ТОЛЬКО по SYS_FB_PRESENT —
+     * промежуточные состояния компоновки никогда не видны, поэтому рисуем
+     * СРАЗУ в backing (bb = fb): экономим целый проход bb→fb по площади
+     * damage на каждый кадр (на эмулируемом CPU это ~треть кадра при drag).
+     * Отдельный bb нужен только на Limine-пути (scanout читает память
+     * непрерывно — рисовать в него слоями нельзя) или при pitch != width. */
+    uint64_t fb_caps = vos_fb_caps();
+    if (fb_caps == (uint64_t)-1) fb_caps = 0;   /* старое ядро без SYS_FB_CAPS */
+    if ((fb_caps & VOS_FB_CAP_OFFSCREEN) && fb_stride == fbw) {
+        bb = fb;
+        puts("vwm: direct compose into virtio backing (no back buffer)\n");
+    } else {
+        uint64_t bb_shm = vos_shm_create((uint64_t)fbw * fbh * 4);
+        if (bb_shm == (uint64_t)-1) {
+            puts("vwm: shm_create back buffer failed\n");
+            exit(1);
+        }
+        bb = (uint32_t *)vos_shm_map(bb_shm);
+        if (!bb) {
+            puts("vwm: shm_map back buffer failed\n");
+            exit(1);
+        }
     }
 
     /* 2b. Обои: ещё один shm-сегмент, рендерим один раз. Не выделились —

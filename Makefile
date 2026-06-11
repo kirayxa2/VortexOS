@@ -176,12 +176,19 @@ run-std: iso vortexfs-disk
 	    -serial stdio                \
 	    -display sdl                 \
 	    -machine pc                  \
+	    -accel whpx,kernel-irqchip=off \
+	    -accel tcg                   \
 	    -boot order=d                \
 	    -drive file=build/vortexfs.img,format=raw,if=ide,index=0 \
 	    -no-reboot                   \
 	    -no-shutdown
 
 ## Запуск с virtio-gpu (аппаратный present без разрывов).
+## -accel whpx,...: аппаратная виртуализация Windows (Hyper-V Platform) вместо
+## полной эмуляции CPU (TCG). Без неё гость в 10-30 раз медленнее, и кадр
+## компоновки большого окна не влезает в 10 мс => дёрганый drag. Если WHPX
+## недоступен (не включена «Платформа гипервизора Windows»), QEMU сам
+## откатится на tcg (второй -accel) и напишет warning в консоль.
 run-gpu: iso vortexfs-disk
 	$(QEMU)                          \
 	    -cdrom build/vortex.iso      \
@@ -189,6 +196,8 @@ run-gpu: iso vortexfs-disk
 	    -serial stdio                \
 	    -display sdl                 \
 	    -machine pc                  \
+	    -accel whpx,kernel-irqchip=off \
+	    -accel tcg                   \
 	    -vga virtio                  \
 	    -boot order=d                \
 	    -drive file=build/vortexfs.img,format=raw,if=ide,index=0 \

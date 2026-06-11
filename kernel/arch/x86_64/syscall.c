@@ -671,6 +671,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, u
         case 37: return sys_getargs(a1, a2);           // SYS_GETARGS(buf, max)
         case 38: return sys_chdir(a1);                 // SYS_CHDIR(path)
         case 39: return sys_getcwd(a1, a2);            // SYS_GETCWD(buf, max)
+
+        /* SYS_FB_CAPS: бит 0 = offscreen present (virtio-gpu): экран
+         * обновляется ТОЛЬКО по SYS_FB_PRESENT, промежуточные записи в fb
+         * не видны => композитор может рисовать прямо в fb без back buffer. */
+        case 40: return virtio_gpu_active() ? 1 : 0;
         default: return (uint64_t)-1;
     }
 }

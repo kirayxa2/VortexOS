@@ -39,6 +39,10 @@ typedef long int64_t;
                                 * После release буфер трогать НЕЛЬЗЯ.          */
 #define SYS_FS_READDIR    30   /* (path*, index, vos_dirent_t*) -> 0 / -1.
                                 * Запись каталога №index (для /bin/vfiles).    */
+#define SYS_FB_CAPS       40   /* () -> битовая маска возможностей экрана      */
+#define VOS_FB_CAP_OFFSCREEN 1 /* present-модель (virtio): экран меняется
+                                * ТОЛЬКО по SYS_FB_PRESENT => можно безопасно
+                                * компоновать прямо в fb, без back buffer      */
 
 /* --- ФС + процессы для утилит /bin и шелла (пути ТОЛЬКО абсолютные) --- */
 #define SYS_FS_READ       31   /* (path*, off, buf*, len) -> прочитано / -1    */
@@ -150,6 +154,7 @@ static inline int64_t  vos_fs_readdir(const char *path, uint64_t index, vos_dire
 static inline uint64_t vos_uptime(void)               { return syscall0(SYS_UPTIME); }
 static inline void     vos_rtc(uint32_t hms[3])       { syscall1(SYS_RTC, (uint64_t)hms); }
 static inline void     vos_vsync(void)                { syscall0(SYS_VSYNC); }
+static inline uint64_t vos_fb_caps(void)              { return syscall0(SYS_FB_CAPS); }
 static inline void     vos_fb_present(int x, int y, int w, int h) {
     syscall6(SYS_FB_PRESENT, (uint64_t)(int64_t)x, (uint64_t)(int64_t)y,
              (uint64_t)(int64_t)w, (uint64_t)(int64_t)h, 0, 0);
