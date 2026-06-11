@@ -111,9 +111,23 @@ static uint64_t sys_getpid(void) {
 }
 
 static uint64_t sys_sleep(uint64_t ticks) {
+    /* ФИКС ПОЛНОГО ЗАВИСАНИЯ: вход в syscall маскирует IF (SFMASK, бит 9),
+     * а `hlt` с выключенными прерываниями не просыпается НИКОГДА — IRQ0 не
+     * приходит, pit_ticks() замирает, планировщик мёртв, виснет вся машина.
+     * Раньше не стреляло: на старте SYS_SLEEP никто не звал (vpanel запускался
+     * уже ПОСЛЕ регистрации WM-сервиса). С vinit сервисы стартуют параллельно,
+     * vpanel ждёт vwm через vwm_wait_for_wm() → SYS_SLEEP(10) → freeze.
+     * `sti; hlt` неделим (sti вступает в силу после СЛЕДУЮЩЕЙ инструкции),
+     * поэтому lost-wakeup невозможен — тот же паттерн, что в sys_block и
+     * sys_write. PIT IRQ при этом честно тикает и может снять нас с CPU по
+     * окончании кванта — другие задачи не страдают. */
+    task_t *self = sched_current();
     uint64_t end = pit_ticks() + ticks;
-    while (pit_ticks() < end)
-        __asm__ volatile("hlt");
+    while (pit_ticks() < end) {
+        if (self && self->pending_kill) break;  /* vctl stop спящего сервиса */
+        __asm__ volatile("sti\n\thlt");
+    }
+    __asm__ volatile("cli");   /* восстановить IF-состояние входа в syscall */
     return 0;
 }
 
