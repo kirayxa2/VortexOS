@@ -153,10 +153,36 @@ void comp_blend_pixel(int x, int y, uint32_t argb) {
 }
 
 void comp_fill_rect_alpha(int x, int y, int w, int h, uint32_t color, uint8_t a) {
-    uint32_t argb = ((uint32_t)a << 24) | (color & 0x00FFFFFF);
-    for (int dy = 0; dy < h; dy++)
-        for (int dx = 0; dx < w; dx++)
-            comp_blend_pixel(x + dx, y + dy, argb);
+    if (!comp.back_buffer || a == 0) return;
+    /* Клипуем один раз */
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (int)bb_width)  w = (int)bb_width  - x;
+    if (y + h > (int)bb_height) h = (int)bb_height - y;
+    if (w <= 0 || h <= 0) return;
+    uint32_t fr = (color >> 16) & 0xFF, fg = (color >> 8) & 0xFF, fb = color & 0xFF;
+    uint32_t inv_a = 255 - a;
+    if (a == 0xFF) {
+        /* Полностью непрозрачно — обычная заливка. */
+        uint32_t opaque = 0xFF000000u | (color & 0x00FFFFFF);
+        for (int row = 0; row < h; row++) {
+            uint32_t *dst = &comp.back_buffer[(uint32_t)(y + row) * bb_width + x];
+            for (int i = 0; i < w; i++) dst[i] = opaque;
+        }
+        return;
+    }
+    /* Полупрозрачная заливка — блендим inline. */
+    for (int row = 0; row < h; row++) {
+        uint32_t *dst = &comp.back_buffer[(uint32_t)(y + row) * bb_width + x];
+        for (int i = 0; i < w; i++) {
+            uint32_t bg = dst[i];
+            uint32_t br = (bg >> 16) & 0xFF, bgg = (bg >> 8) & 0xFF, bb = bg & 0xFF;
+            uint32_t r = (fr * a + br * inv_a) / 255;
+            uint32_t g = (fg * a + bgg * inv_a) / 255;
+            uint32_t b = (fb * a + bb * inv_a) / 255;
+            dst[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
 }
 
 /* Быстрый блит буфера окна целыми строками.
@@ -176,7 +202,7 @@ void comp_blit_buffer(int dx, int dy, int w, int h, const uint32_t *src) {
 
         uint32_t       *d = &comp.back_buffer[(uint32_t)y * bb_width + x0];
         const uint32_t *s = &src[(uint32_t)row * w + sx0];
-        for (int i = 0; i < ww; i++) d[i] = s[i];
+        __builtin_memcpy(d, s, (uint32_t)ww * 4);
     }
 }
 
@@ -208,10 +234,22 @@ void comp_draw_rect(int x, int y, int w, int h, uint32_t color) {
 }
 
 void comp_fill_rect(int x, int y, int w, int h, uint32_t color) {
-    for (int dy = 0; dy < h; dy++) {
-        for (int dx = 0; dx < w; dx++) {
-            comp_put_pixel(x + dx, y + dy, color);
-        }
+    if (!comp.back_buffer) return;
+    /* Клипуем один раз вместо проверки каждого пикселя через comp_put_pixel. */
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (int)bb_width)  w = (int)bb_width  - x;
+    if (y + h > (int)bb_height) h = (int)bb_height - y;
+    if (w <= 0 || h <= 0) return;
+
+    uint64_t twin = ((uint64_t)color << 32) | (uint64_t)color;
+    for (int row = 0; row < h; row++) {
+        uint32_t *dst = &comp.back_buffer[(uint32_t)(y + row) * bb_width + x];
+        /* Парные 64-bit записи */
+        int pairs = w / 2;
+        uint64_t *d64 = (uint64_t *)dst;
+        for (int i = 0; i < pairs; i++) d64[i] = twin;
+        if (w & 1) dst[w - 1] = color;
     }
 }
 
@@ -242,12 +280,25 @@ void comp_draw_circle(int cx, int cy, int radius, uint32_t color) {
 }
 
 void comp_fill_circle(int cx, int cy, int radius, uint32_t color) {
+    if (!comp.back_buffer || radius <= 0) return;
+    int r2 = radius * radius;
+    /* Scanline-подход: для каждой строки вычисляем ширину хорды,
+     * заливаем одну горизонтальную полосу — гораздо меньше проверок. */
     for (int dy = -radius; dy <= radius; dy++) {
-        for (int dx = -radius; dx <= radius; dx++) {
-            if (dx * dx + dy * dy <= radius * radius) {
-                comp_put_pixel(cx + dx, cy + dy, color);
-            }
-        }
+        int yy = cy + dy;
+        if (yy < 0 || yy >= (int)bb_height) continue;
+        /* Полухорда: dx_max = floor(sqrt(r²-dy²)) */
+        int dy2 = dy * dy;
+        int dx_max = 0;
+        while ((dx_max + 1) * (dx_max + 1) + dy2 <= r2) dx_max++;
+        int x0 = cx - dx_max;
+        int x1 = cx + dx_max;
+        if (x0 < 0) x0 = 0;
+        if (x1 >= (int)bb_width) x1 = (int)bb_width - 1;
+        if (x0 > x1) continue;
+        uint32_t *dst = &comp.back_buffer[(uint32_t)yy * bb_width + x0];
+        int cnt = x1 - x0 + 1;
+        for (int i = 0; i < cnt; i++) dst[i] = color;
     }
 }
 
@@ -258,13 +309,31 @@ void comp_fill_circle(int cx, int cy, int radius, uint32_t color) {
 void comp_draw_char(int x, int y, char c, uint32_t fg, uint32_t bg) {
     uint8_t idx = (uint8_t)c;
     if (idx >= 128) idx = '?';
-    
+    if (!comp.back_buffer) return;
+    /* Быстрый путь: если весь символ (8x16) целиком внутри экрана — пишем
+     * напрямую в back buffer без per-pixel bounds check. */
     const uint8_t *glyph = font[idx];
-    for (int row = 0; row < 16; row++) {
-        uint8_t bits = glyph[row];
-        for (int col = 0; col < 8; col++) {
-            uint32_t color = (bits & (0x80 >> col)) ? fg : bg;
-            comp_put_pixel(x + col, y + row, color);
+    if (x >= 0 && x + 8 <= (int)bb_width && y >= 0 && y + 16 <= (int)bb_height) {
+        for (int row = 0; row < 16; row++) {
+            uint32_t *dst = &comp.back_buffer[(uint32_t)(y + row) * bb_width + x];
+            uint8_t bits = glyph[row];
+            dst[0] = (bits & 0x80) ? fg : bg;
+            dst[1] = (bits & 0x40) ? fg : bg;
+            dst[2] = (bits & 0x20) ? fg : bg;
+            dst[3] = (bits & 0x10) ? fg : bg;
+            dst[4] = (bits & 0x08) ? fg : bg;
+            dst[5] = (bits & 0x04) ? fg : bg;
+            dst[6] = (bits & 0x02) ? fg : bg;
+            dst[7] = (bits & 0x01) ? fg : bg;
+        }
+    } else {
+        /* Fallback: символ частично за экраном — проверяем каждый пиксель. */
+        for (int row = 0; row < 16; row++) {
+            uint8_t bits = glyph[row];
+            for (int col = 0; col < 8; col++) {
+                uint32_t color = (bits & (0x80 >> col)) ? fg : bg;
+                comp_put_pixel(x + col, y + row, color);
+            }
         }
     }
 }
@@ -389,17 +458,22 @@ void comp_damage_add(int x, int y, int w, int h) {
 static void blit_region_to_front(int x, int y, int w, int h) {
     if (!comp.back_buffer || !comp.fb_addr) return;
     uint32_t fb_stride = comp.pitch / 4;
-    for (int row = 0; row < h; row++) {
-        int yy = y + row;
-        if (yy < 0 || yy >= (int)comp.height || yy >= (int)bb_height) continue;
-        int x0 = x, ww = w;
-        if (x0 < 0) { ww += x0; x0 = 0; }
-        if (x0 + ww > (int)comp.width) ww = (int)comp.width - x0;
-        if (x0 + ww > (int)bb_width)   ww = (int)bb_width   - x0;
-        if (ww <= 0) continue;
-        uint32_t       *d = &comp.fb_addr[(uint32_t)yy * fb_stride + x0];
-        const uint32_t *s = &comp.back_buffer[(uint32_t)yy * bb_width + x0];
-        for (int i = 0; i < ww; i++) d[i] = s[i];
+    /* Клипуем весь регион один раз — вместо per-row bounds check. */
+    int y0 = y, y1 = y + h;
+    int x0 = x, x1 = x + w;
+    if (y0 < 0) y0 = 0;
+    if (x0 < 0) x0 = 0;
+    if (y1 > (int)comp.height) y1 = (int)comp.height;
+    if (y1 > (int)bb_height)   y1 = (int)bb_height;
+    if (x1 > (int)comp.width)  x1 = (int)comp.width;
+    if (x1 > (int)bb_width)    x1 = (int)bb_width;
+    int ww = x1 - x0;
+    if (ww <= 0) return;
+    uint32_t row_bytes = (uint32_t)ww * 4;
+    for (int row = y0; row < y1; row++) {
+        __builtin_memcpy(&comp.fb_addr[(uint32_t)row * fb_stride + x0],
+                         &comp.back_buffer[(uint32_t)row * bb_width + x0],
+                         row_bytes);
     }
 }
 
@@ -549,9 +623,16 @@ void comp_cursor_refresh(void) {
  * ---------------------------------------------------------------------- */
 
 void comp_clear(uint32_t color) {
-    for (uint32_t i = 0; i < bb_width * bb_height; i++) {
-        comp.back_buffer[i] = color;
-    }
+    uint32_t total = bb_width * bb_height;
+    uint32_t *buf = comp.back_buffer;
+    if (!buf) return;
+    /* Пишем по 8 байт (2 пикселя) за раз — вдвое меньше store-инструкций.
+     * На -O2 GCC может развернуть/автовекторизовать этот цикл. */
+    uint64_t twin = ((uint64_t)color << 32) | (uint64_t)color;
+    uint64_t *p64 = (uint64_t *)buf;
+    uint32_t pairs = total / 2;
+    for (uint32_t i = 0; i < pairs; i++) p64[i] = twin;
+    if (total & 1) buf[total - 1] = color;  /* хвост */
 }
 
 void comp_refresh(void) {
@@ -569,17 +650,15 @@ void comp_flip(void) {
 
     if (fb_stride == bb_width && copy_w == bb_width) {
         /* Строки идут вплотную в обоих буферах — копируем одним проходом. */
-        uint32_t total = copy_h * bb_width;
-        uint32_t *d = comp.fb_addr;
-        const uint32_t *s = comp.back_buffer;
-        for (uint32_t i = 0; i < total; i++) d[i] = s[i];
+        __builtin_memcpy(comp.fb_addr, comp.back_buffer,
+                         (uint64_t)copy_h * bb_width * 4);
         return;
     }
 
     /* Общий случай (pitch != width*4): копируем построчно. */
+    uint32_t row_bytes = copy_w * 4;
     for (uint32_t y = 0; y < copy_h; y++) {
-        uint32_t *d = &comp.fb_addr[y * fb_stride];
-        const uint32_t *s = &comp.back_buffer[y * bb_width];
-        for (uint32_t x = 0; x < copy_w; x++) d[x] = s[x];
+        __builtin_memcpy(&comp.fb_addr[y * fb_stride],
+                         &comp.back_buffer[y * bb_width], row_bytes);
     }
 }

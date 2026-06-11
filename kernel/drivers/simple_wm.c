@@ -187,24 +187,34 @@ static void dock_put_blend(int x, int y, uint32_t color, int a) {
     comp_put_pixel(x, y, dock_blend(comp_get_pixel(x, y), color, a));
 }
 
-/* Заливка скруглённого прямоугольника с альфой (углы радиусом r). */
+/* Заливка скруглённого прямоугольника с альфой (углы радиусом r).
+ * Оптимизировано: corner-логика только в первых/последних r строках,
+ * средние строки и середина угловых строк — быстрые полосы. */
 static void dock_fill_round(int x, int y, int w, int h, int r, uint32_t color, int a) {
     if (r * 2 > w) r = w / 2;
     if (r * 2 > h) r = h / 2;
+    int r2 = r * r;
+    /* Быстрая полоса строки [i0..i1) с альфой. */
+    #define DFR_SPAN(j, i0, i1) do { \
+        if (a >= 255) comp_fill_rect(x + (i0), y + (j), (i1) - (i0), 1, color); \
+        else          comp_fill_rect_alpha(x + (i0), y + (j), (i1) - (i0), 1, color, (uint8_t)a); \
+    } while (0)
     for (int j = 0; j < h; j++) {
-        for (int i = 0; i < w; i++) {
-            int cx = -1, cy = -1;
-            if (i < r && j < r)              { cx = r;         cy = r;         }
-            else if (i >= w - r && j < r)    { cx = w - r - 1; cy = r;         }
-            else if (i < r && j >= h - r)    { cx = r;         cy = h - r - 1; }
-            else if (i >= w - r && j >= h - r){ cx = w - r - 1; cy = h - r - 1; }
-            if (cx >= 0) {
-                int ddx = i - cx, ddy = j - cy;
-                if (ddx * ddx + ddy * ddy > r * r) continue;  /* за пределами скругления */
-            }
-            dock_put_blend(x + i, y + j, color, a);
+        int top = (j < r), bot = (j >= h - r);
+        if (!top && !bot) { DFR_SPAN(j, 0, w); continue; }   /* средняя часть */
+        int cy = top ? r : (h - r - 1);
+        int dy = j - cy, dy2 = dy * dy;
+        /* Находим, сколько пикселей слева отрезано дугой в этой строке. */
+        int cut = 0;
+        while (cut < r) {
+            int dx = cut - r;             /* центр левой дуги: (r, cy) */
+            if (dx * dx + dy2 <= r2) break;
+            cut++;
         }
+        /* строка: [cut .. w-cut) — симметрично */
+        if (w - 2 * cut > 0) DFR_SPAN(j, cut, w - cut);
     }
+    #undef DFR_SPAN
 }
 
 /* Иконка терминала: тёмная скруглённая плитка, три «светофора» и зелёный
@@ -735,50 +745,75 @@ void wm_flush(uint64_t win_id) {
                      win->w + 2 * m, win->h + TITLEBAR_H + 2 * m);
 }
 
-/* Целочисленный квадратный корень (для плавного спада тени). */
+/* Целочисленный квадратный корень — Newton's method (O(log n) вместо O(√n)).
+ * Классическая сходящаяся форма: монотонно убывает до floor(sqrt(x)). */
 static int isqrt32(int v) {
     if (v <= 0) return 0;
-    int r = 0;
-    while ((r + 1) * (r + 1) <= v) r++;
-    return r;
+    uint32_t x = (uint32_t)v;
+    uint32_t r = x;
+    uint32_t y = (r + 1) / 2;
+    while (y < r) {
+        r = y;
+        y = (r + x / r) / 2;
+    }
+    return (int)r;
+}
+
+/* Предвычисленная LUT: shadow_alpha[d²] = alpha для расстояния d от окна.
+ * WIN_SHADOW=10, макс. d²=200 — 201 байт. Заполняется один раз. */
+#define SHADOW_MAX_D2 (WIN_SHADOW * WIN_SHADOW)
+static uint8_t shadow_alpha[SHADOW_MAX_D2 + 1];
+static int     shadow_lut_ready = 0;
+
+static void shadow_build_lut(void) {
+    if (shadow_lut_ready) return;
+    const int S = WIN_SHADOW;
+    for (int d2 = 0; d2 <= SHADOW_MAX_D2; d2++) {
+        int d = isqrt32(d2);
+        int a = 78 * (S - d) / S;
+        shadow_alpha[d2] = (uint8_t)(a > 0 ? a : 0);
+    }
+    shadow_lut_ready = 1;
 }
 
 /* Мягкая тень под окном: чёрный с альфой, спадающей к краям (per-pixel alpha).
- * (wx,wy,ww,wh) — полный прямоугольник окна вместе с заголовком. Пиксели под
- * самим окном пропускаем — они будут непрозрачными. */
+ * Оптимизирована: LUT по d² устраняет isqrt32 на каждый пиксель; горизонтальные
+ * полосы рисуются быстрым inline-блендом. */
 static void win_draw_shadow(int wx, int wy, int ww, int wh) {
+    shadow_build_lut();
     const int S = WIN_SHADOW, oy = WIN_SHADOW_OY;
     int x0 = wx - S, y0 = wy - S + oy;
     int x1 = wx + ww + S, y1 = wy + wh + S + oy;
     const int r = WIN_CORNER;
+    const int r2 = r * r;
     for (int y = y0; y < y1; y++) {
+        /* Вычисляем dy для всей строки */
+        int dy_s = 0;
+        if (y < wy)            dy_s = wy - y;
+        else if (y >= wy + wh) dy_s = y - (wy + wh) + 1;
+        int dy2 = dy_s * dy_s;
+        if (dy2 >= SHADOW_MAX_D2) continue;  /* вся строка за пределами тени */
+
         for (int x = x0; x < x1; x++) {
-            /* Пропускаем только пиксели, РЕАЛЬНО закрытые окном — с учётом
-             * скруглённых углов. Вырезы углов (внутри прямоугольника, но за
-             * дугой скругления) НЕ пропускаем: туда тоже должна падать тень.
-             * Иначе в углу за скруглением остаётся голый фон десктопа без
-             * тени — он светлее окна и читается как «лишний светлый квадрат». */
+            /* Пропускаем пиксели, РЕАЛЬНО закрытые окном */
             if (x >= wx && x < wx + ww && y >= wy && y < wy + wh) {
                 int lx = x - wx, ly = y - wy, cx = -1, cy = -1;
                 if      (lx < r      && ly < r)      { cx = r;      cy = r;      }
                 else if (lx >= ww - r && ly < r)     { cx = ww - r; cy = r;      }
                 else if (lx < r      && ly >= wh - r){ cx = r;      cy = wh - r; }
                 else if (lx >= ww - r && ly >= wh - r){ cx = ww - r; cy = wh - r; }
-                if (cx < 0) continue;  /* не в углу — закрыто окном */
+                if (cx < 0) continue;
                 int ddx = lx - cx, ddy = ly - cy;
-                if (ddx * ddx + ddy * ddy <= r * r) continue;  /* внутри дуги — закрыто */
-                /* иначе: вырез скруглённого угла — даём тени упасть сюда */
+                if (ddx * ddx + ddy * ddy <= r2) continue;
             }
-            int dx = 0, dy = 0;
-            if (x < wx)            dx = wx - x;
-            else if (x >= wx + ww) dx = x - (wx + ww) + 1;
-            if (y < wy)            dy = wy - y;
-            else if (y >= wy + wh) dy = y - (wy + wh) + 1;
-            int d2 = dx * dx + dy * dy;
-            if (d2 >= S * S) continue;
-            int a = 78 * (S - isqrt32(d2)) / S;   /* спад к краям */
-            if (a <= 0) continue;
-            comp_blend_pixel(x, y, (uint32_t)a << 24);  /* чёрная тень */
+            int dx_s = 0;
+            if (x < wx)            dx_s = wx - x;
+            else if (x >= wx + ww) dx_s = x - (wx + ww) + 1;
+            int d2 = dx_s * dx_s + dy2;
+            if (d2 > SHADOW_MAX_D2) continue;
+            uint8_t a = shadow_alpha[d2];
+            if (a == 0) continue;
+            comp_blend_pixel(x, y, (uint32_t)a << 24);
         }
     }
 }
@@ -807,19 +842,24 @@ static void fill_round_top(int x, int y, int w, int h, int r, uint32_t color) {
     if (r * 2 > w) r = w / 2;
     if (r > h) r = h;
     uint32_t rgb = color & 0x00FFFFFF;
-    for (int j = 0; j < h; j++) {
-        for (int i = 0; i < w; i++) {
-            if (j < r && (i < r || i >= w - r)) {
-                int cx  = (i < r) ? r : (w - r);   /* узел сетки центра дуги */
-                int cov = circ_cov(i, j, cx, r, r);
-                if (cov <= 0) continue;                 /* снаружи дуги */
-                if (cov >= 255) comp_put_pixel(x + i, y + j, color);
-                else comp_blend_pixel(x + i, y + j, ((uint32_t)cov << 24) | rgb);
-            } else {
-                comp_put_pixel(x + i, y + j, color);
-            }
+    /* Верхние r строк: дуги по углам (per-pixel AA) + быстрая полоса между ними. */
+    for (int j = 0; j < r && j < h; j++) {
+        for (int i = 0; i < r; i++) {              /* левый угол */
+            int cov = circ_cov(i, j, r, r, r);
+            if (cov <= 0) continue;
+            if (cov >= 255) comp_put_pixel(x + i, y + j, color);
+            else comp_blend_pixel(x + i, y + j, ((uint32_t)cov << 24) | rgb);
         }
+        for (int i = w - r; i < w; i++) {          /* правый угол */
+            int cov = circ_cov(i, j, w - r, r, r);
+            if (cov <= 0) continue;
+            if (cov >= 255) comp_put_pixel(x + i, y + j, color);
+            else comp_blend_pixel(x + i, y + j, ((uint32_t)cov << 24) | rgb);
+        }
+        comp_fill_rect(x + r, y + j, w - 2 * r, 1, color);  /* середина строки */
     }
+    /* Остальные строки — сплошной быстрый прямоугольник. */
+    if (h > r) comp_fill_rect(x, y + r, w, h - r, color);
 }
 
 /* Скругление НИЖНИХ углов окна со сглаживанием. Вызывается ПОСЛЕ блита
