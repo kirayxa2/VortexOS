@@ -107,10 +107,32 @@ static inline int imin(int a, int b) { return a < b ? a : b; }
 static inline int imax(int a, int b) { return a > b ? a : b; }
 
 /* ---------------------------------------------------------------------------
- * Примитивы на back buffer (порт kernel compositor.c)
+ * Глобальный clip rect — как в настоящих композиторах (Hyprland/KWin/pixman):
+ * при перекомпозиции damage-региона ВСЕ примитивы режутся по нему. Это
+ * убирает класс багов «нарисовали поверх несвежего» (двойной блендинг тени
+ * дока, затирание окон полосой панели и т.п.) и заодно ускоряет частичные
+ * кадры: chrome окна за пределами региона не рисуется вовсе.
+ * ------------------------------------------------------------------------- */
+static int clip_x0, clip_y0, clip_x1, clip_y1;   /* [x0,x1) x [y0,y1) */
+
+static inline void clip_reset(void) {
+    clip_x0 = 0; clip_y0 = 0; clip_x1 = (int)fbw; clip_y1 = (int)fbh;
+}
+static inline void clip_set(int x, int y, int w, int h) {
+    clip_x0 = imax(0, x);
+    clip_y0 = imax(0, y);
+    clip_x1 = imin((int)fbw, x + w);
+    clip_y1 = imin((int)fbh, y + h);
+}
+static inline int clip_empty(void) {
+    return clip_x0 >= clip_x1 || clip_y0 >= clip_y1;
+}
+
+/* ---------------------------------------------------------------------------
+ * Примитивы на back buffer (порт kernel compositor.c) — все с учётом клипа
  * ------------------------------------------------------------------------- */
 static inline void put_px(int x, int y, uint32_t c) {
-    if (x < 0 || x >= (int)fbw || y < 0 || y >= (int)fbh) return;
+    if (x < clip_x0 || x >= clip_x1 || y < clip_y0 || y >= clip_y1) return;
     bb[(uint32_t)y * fbw + x] = c;
 }
 static inline uint32_t get_px(int x, int y) {
@@ -118,7 +140,7 @@ static inline uint32_t get_px(int x, int y) {
     return bb[(uint32_t)y * fbw + x];
 }
 static void blend_px(int x, int y, uint32_t argb) {
-    if (x < 0 || x >= (int)fbw || y < 0 || y >= (int)fbh) return;
+    if (x < clip_x0 || x >= clip_x1 || y < clip_y0 || y >= clip_y1) return;
     uint32_t a = (argb >> 24) & 0xFF;
     if (a == 0) return;
     uint32_t *p = &bb[(uint32_t)y * fbw + x];
@@ -145,10 +167,10 @@ static inline void copy_px_row(uint32_t *d, const uint32_t *s, int n) {
  * границ на КАЖДЫЙ пиксель — заливка фона была заметной статьёй расходов
  * кадра при drag/resize. */
 static void fill_rect(int x, int y, int w, int h, uint32_t c) {
-    if (x < 0) { w += x; x = 0; }
-    if (y < 0) { h += y; y = 0; }
-    if (x + w > (int)fbw) w = (int)fbw - x;
-    if (y + h > (int)fbh) h = (int)fbh - y;
+    if (x < clip_x0) { w -= clip_x0 - x; x = clip_x0; }
+    if (y < clip_y0) { h -= clip_y0 - y; y = clip_y0; }
+    if (x + w > clip_x1) w = clip_x1 - x;
+    if (y + h > clip_y1) h = clip_y1 - y;
     if (w <= 0 || h <= 0) return;
     for (int j = 0; j < h; j++) {
         uint32_t *row = &bb[(uint32_t)(y + j) * fbw + x];
@@ -236,10 +258,10 @@ static void blit_buffer(int dx, int dy, int w, int h, const uint32_t *src) {
     if (!src) return;
     for (int row = 0; row < h; row++) {
         int y = dy + row;
-        if (y < 0 || y >= (int)fbh) continue;
+        if (y < clip_y0 || y >= clip_y1) continue;
         int x0 = dx, sx0 = 0, ww = w;
-        if (x0 < 0) { sx0 = -x0; ww += x0; x0 = 0; }
-        if (x0 + ww > (int)fbw) ww = (int)fbw - x0;
+        if (x0 < clip_x0) { sx0 = clip_x0 - x0; ww -= sx0; x0 = clip_x0; }
+        if (x0 + ww > clip_x1) ww = clip_x1 - x0;
         if (ww <= 0) continue;
         uint32_t       *d = &bb[(uint32_t)y * fbw + x0];
         const uint32_t *s = &src[(uint32_t)row * w + sx0];
@@ -283,23 +305,12 @@ static void blit_to_front(int x, int y, int w, int h) {
         copy_px_row(d, s, ww);
     }
 }
-static void present(void) {
-    vos_vsync();                     /* Limine-путь: ждём vblank (no-op на virtio) */
-    if (damage_full) {
-        blit_to_front(0, 0, (int)fbw, (int)fbh);
-        vos_fb_present(0, 0, (int)fbw, (int)fbh);
-        dmg_reset();
-        return;
-    }
-    for (int i = 0; i < damage_count; i++) {
-        blit_to_front(damage[i].x, damage[i].y, damage[i].w, damage[i].h);
-        vos_fb_present(damage[i].x, damage[i].y, damage[i].w, damage[i].h);
-    }
-    dmg_reset();
-}
-
 /* ---------------------------------------------------------------------------
- * Курсор (save-under, порт kernel compositor.c)
+ * Курсор — больше НЕ save-under. Как в настоящих композиторах: курсор — это
+ * просто верхний слой сцены, который рисуется заново в каждом кадре поверх
+ * перекомпонованных damage-регионов. Save-under ловил «призраков», когда его
+ * сохранённый кусок фона устаревал (сцена под курсором перерисована не через
+ * take_down) — целый класс багов уходит вместе с механизмом.
  * ------------------------------------------------------------------------- */
 #define CUR_MAX_W 19
 #define CUR_MAX_H 19
@@ -417,8 +428,9 @@ static const cur_shape_t cur_shapes[CUR_NSHAPES] = {
 };
 
 static int cur_shape = CUR_ARROW;             /* текущая форма (hover)      */
-static uint32_t cur_save[CUR_MAX_W * CUR_MAX_H];
-static int cur_x, cur_y, cur_w, cur_h, cur_in_back = 0;
+
+/* где курсор «запечён» в back buffer после последнего кадра */
+static int last_cx, last_cy, last_cw, last_ch, last_cur_valid = 0;
 
 static void cursor_sprite(const cur_shape_t *s, int x, int y) {
     for (int j = 0; j < s->h; j++) {
@@ -429,39 +441,18 @@ static void cursor_sprite(const cur_shape_t *s, int x, int y) {
         }
     }
 }
-static void cursor_blit(void) {
+static void cursor_rect(int *x, int *y, int *w, int *h) {
     const cur_shape_t *s = &cur_shapes[cur_shape];
-    int x = mouse_x - s->hx, y = mouse_y - s->hy;
-    for (int j = 0; j < s->h; j++)
-        for (int i = 0; i < s->w; i++)
-            cur_save[j * s->w + i] = get_px(x + i, y + j);
-    cursor_sprite(s, x, y);
-    cur_x = x; cur_y = y; cur_w = s->w; cur_h = s->h; cur_in_back = 1;
+    *x = mouse_x - s->hx; *y = mouse_y - s->hy;
+    *w = s->w; *h = s->h;
 }
-static void cursor_unblit(void) {
-    if (!cur_in_back) return;
-    for (int j = 0; j < cur_h; j++)
-        for (int i = 0; i < cur_w; i++)
-            put_px(cur_x + i, cur_y + j, cur_save[j * cur_w + i]);
-    cur_in_back = 0;
-}
-static void cursor_compose(void) {
-    cur_in_back = 0;
-    cursor_blit();
-    dmg_add(cur_x, cur_y, cur_w, cur_h);
-}
-static void cursor_take_down(void) {
-    if (!cur_in_back) return;
-    dmg_add(cur_x, cur_y, cur_w, cur_h);
-    cursor_unblit();
-}
-static void cursor_refresh(void) {
-    int ox = cur_x, oy = cur_y, ow = cur_w, oh = cur_h, had = cur_in_back;
-    cursor_unblit();
-    cursor_blit();
-    if (had) dmg_add(ox, oy, ow, oh);
-    dmg_add(cur_x, cur_y, cur_w, cur_h);
-    present();
+/* Курсор сдвинулся/сменил форму: повредить старое место (стереть запечённый
+ * спрайт) и новое (нарисовать там). Сам рендер сделает frame(). */
+static void dmg_cursor(void) {
+    if (last_cur_valid) dmg_add(last_cx, last_cy, last_cw, last_ch);
+    int x, y, w, h;
+    cursor_rect(&x, &y, &w, &h);
+    dmg_add(x, y, w, h);
 }
 
 /* ---------------------------------------------------------------------------
@@ -523,10 +514,10 @@ static void wall_render(void) {
 /* Заливка региона обоями (клип + построчное копирование). */
 static void fill_wall(int x, int y, int w, int h) {
     if (!wall) { fill_rect(x, y, w, h, DESK_BG); return; }
-    if (x < 0) { w += x; x = 0; }
-    if (y < 0) { h += y; y = 0; }
-    if (x + w > (int)fbw) w = (int)fbw - x;
-    if (y + h > (int)fbh) h = (int)fbh - y;
+    if (x < clip_x0) { w -= clip_x0 - x; x = clip_x0; }
+    if (y < clip_y0) { h -= clip_y0 - y; y = clip_y0; }
+    if (x + w > clip_x1) w = clip_x1 - x;
+    if (y + h > clip_y1) h = clip_y1 - y;
     if (w <= 0 || h <= 0) return;
     for (int j = 0; j < h; j++)
         copy_px_row(&bb[(uint32_t)(y + j) * fbw + x],
@@ -1030,25 +1021,16 @@ static void draw_window_chrome(vwin_t *win) {
 }
 
 /* ---------------------------------------------------------------------------
- * Рендер: полный кадр + частичный регион (порт wm_render_all/wm_render_region)
+ * Рендер «как у взрослых» (схема Hyprland/KWin в миниатюре):
+ *   1) события копят damage-прямоугольники (dmg_add / dmg_all / dmg_cursor);
+ *   2) frame() раз за тик ПЕРЕКОМПОНУЕТ сцену строго внутри каждого
+ *      damage-прямоугольника (clip rect режет все примитивы) в фиксированном
+ *      z-порядке: обои -> окна -> панель -> dock;
+ *   3) курсор рисуется ПОСЛЕДНИМ слоем поверх затронутых регионов;
+ *   4) один vsync + блит damage-регионов во front buffer.
+ * Никаких save-under и неклипованных перерисовок «соседей» — артефактам
+ * физически неоткуда взяться: каждый пиксель кадра собран с нуля.
  * ------------------------------------------------------------------------- */
-static void render_all(void) {
-    fill_wall(0, 0, (int)fbw, (int)fbh);
-    for (int i = 0; i < MAX_WINDOWS; i++)
-        if (windows[i].id && windows[i].pixels && !windows[i].minimized)
-            draw_window_chrome(&windows[i]);
-    draw_panel();
-    draw_dock();
-    cursor_compose();
-    dmg_all();
-    present();
-    scene_presented = 1;
-    cursor_moved = 0;
-    if (drag.active) {
-        vwin_t *dw = find_window(drag.win_id);
-        if (dw) { drag.rendered_x = dw->x; drag.rendered_y = dw->y; }
-    }
-}
 static int win_intersects(const vwin_t *win, int rx, int ry, int rw, int rh) {
     int m = WIN_MARGIN;
     int wx = win->x - m, wy = win->y - m;
@@ -1057,12 +1039,12 @@ static int win_intersects(const vwin_t *win, int rx, int ry, int rw, int rh) {
     if (wy >= ry + rh || wy + wh <= ry) return 0;
     return 1;
 }
-static void render_region(int rx, int ry, int rw, int rh) {
-    if (rw <= 0 || rh <= 0) return;
-    if (!scene_presented) { render_all(); return; }
 
-    dmg_reset();
-    cursor_take_down();
+/* Пересобрать сцену (без курсора) внутри прямоугольника. */
+static void compose_rect(int rx, int ry, int rw, int rh) {
+    clip_set(rx, ry, rw, rh);
+    if (clip_empty()) { clip_reset(); return; }
+
     fill_wall(rx, ry, rw, rh);
 
     for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -1071,28 +1053,75 @@ static void render_region(int rx, int ry, int rw, int rh) {
         if (!win_intersects(win, rx, ry, rw, rh)) continue;
         draw_window_chrome(win);
     }
-
-    {
-        int bx, by, bw, bh;
-        dock_bounds(&bx, &by, &bw, &bh);
-        if (!(rx >= bx + bw || rx + rw <= bx || ry >= by + bh || ry + rh <= by)) {
-            draw_dock();
-            dmg_add(bx, by, bw, bh);
-        }
-    }
     {
         int px, py, pw, ph;
         panel_bounds(&px, &py, &pw, &ph);
-        if (!(rx >= px + pw || rx + rw <= px || ry >= py + ph || ry + rh <= py)) {
+        if (!(rx >= px + pw || rx + rw <= px || ry >= py + ph || ry + rh <= py))
             draw_panel();
-            dmg_add(px, py, pw, ph);
-        }
+    }
+    {
+        int bx, by, bw, bh;
+        dock_bounds(&bx, &by, &bw, &bh);
+        if (!(rx >= bx + bw || rx + rw <= bx || ry >= by + bh || ry + rh <= by))
+            draw_dock();
+    }
+    clip_reset();
+}
+
+/* Кадр: перекомпоновка damage-регионов + курсор + один present. */
+static void frame(void) {
+    if (!scene_presented) { scene_presented = 1; dmg_all(); }
+    if (!damage_full && damage_count == 0) return;
+
+    if (damage_full) {
+        damage[0].x = 0; damage[0].y = 0;
+        damage[0].w = (int)fbw; damage[0].h = (int)fbh;
+        damage_count = 1;
+        damage_full = 0;
     }
 
-    cursor_compose();
+    for (int i = 0; i < damage_count; i++)
+        compose_rect(damage[i].x, damage[i].y, damage[i].w, damage[i].h);
+
+    /* курсор — верхний слой: дорисовать в каждый затронутый регион */
+    {
+        int cx, cy, cw, ch;
+        cursor_rect(&cx, &cy, &cw, &ch);
+        const cur_shape_t *s = &cur_shapes[cur_shape];
+        for (int i = 0; i < damage_count; i++) {
+            const rect_t *r = &damage[i];
+            if (cx >= r->x + r->w || cx + cw <= r->x ||
+                cy >= r->y + r->h || cy + ch <= r->y) continue;
+            clip_set(r->x, r->y, r->w, r->h);
+            cursor_sprite(s, cx, cy);
+            clip_reset();
+        }
+        last_cx = cx; last_cy = cy; last_cw = cw; last_ch = ch;
+        last_cur_valid = 1;
+    }
+
+    vos_vsync();                 /* Limine-путь: ждём vblank (no-op на virtio) */
+    for (int i = 0; i < damage_count; i++) {
+        blit_to_front(damage[i].x, damage[i].y, damage[i].w, damage[i].h);
+        vos_fb_present(damage[i].x, damage[i].y, damage[i].w, damage[i].h);
+    }
+    dmg_reset();
+}
+
+static void render_all(void) {
+    dmg_all();
+    frame();
     cursor_moved = 0;
+    if (drag.active) {
+        vwin_t *dw = find_window(drag.win_id);
+        if (dw) { drag.rendered_x = dw->x; drag.rendered_y = dw->y; }
+    }
+}
+static void render_region(int rx, int ry, int rw, int rh) {
+    if (rw <= 0 || rh <= 0) return;
     dmg_add(rx, ry, rw, rh);
-    present();
+    if (cursor_moved) { cursor_moved = 0; dmg_cursor(); }
+    frame();
 }
 
 /* Кадр по тику (порт wm_tick_render): выбирает самый дешёвый путь. */
@@ -1104,8 +1133,7 @@ static void tick_render(void) {
 
     if (needs_redraw) {
         needs_redraw = 0;
-        panel_dirty = 0;
-        dock_dirty = 0;
+        int handled = 0;
         if (rz.active) {
             vwin_t *win = find_window(rz.win_id);
             if (win) {
@@ -1116,14 +1144,13 @@ static void tick_render(void) {
                 int minx = imin(ox, nx), miny = imin(oy, ny);
                 int maxx = imax(ox + ow, nx + nw), maxy = imax(oy + oh, ny + nh);
                 int m = WIN_MARGIN;
-                render_region(minx - m, miny - m,
-                              (maxx - minx) + 2 * m, (maxy - miny) + 2 * m);
+                dmg_add(minx - m, miny - m,
+                        (maxx - minx) + 2 * m, (maxy - miny) + 2 * m);
                 rz.rendered_x = nx; rz.rendered_y = ny;
                 rz.rendered_w = win->w; rz.rendered_h = win->h;
-                return;
+                handled = 1;
             }
-        }
-        if (drag.active) {
+        } else if (drag.active) {
             vwin_t *win = find_window(drag.win_id);
             if (win) {
                 int ox = drag.rendered_x, oy = drag.rendered_y;
@@ -1133,27 +1160,35 @@ static void tick_render(void) {
                 int maxx = imax(ox + win->w, nx + win->w);
                 int maxy = imax(oy + fh,     ny + fh);
                 int m = WIN_MARGIN;
-                render_region(minx - m, miny - m,
-                              (maxx - minx) + 2 * m, (maxy - miny) + 2 * m);
+                dmg_add(minx - m, miny - m,
+                        (maxx - minx) + 2 * m, (maxy - miny) + 2 * m);
                 drag.rendered_x = nx; drag.rendered_y = ny;
-                return;
+                handled = 1;
             }
         }
-        render_all();
-    } else if (panel_dirty) {
+        if (!handled) {
+            dmg_all();
+            panel_dirty = 0;
+            dock_dirty = 0;
+        }
+    }
+    if (panel_dirty) {
         panel_dirty = 0;
         int px, py, pw, ph;
         panel_bounds(&px, &py, &pw, &ph);
-        render_region(px, py, pw, ph);
-    } else if (dock_dirty) {
+        dmg_add(px, py, pw, ph);
+    }
+    if (dock_dirty) {
         dock_dirty = 0;
         int bx, by, bw, bh;
         dock_bounds(&bx, &by, &bw, &bh);
-        render_region(bx, by, bw, bh);
-    } else if (cursor_moved) {
-        cursor_moved = 0;
-        cursor_refresh();
+        dmg_add(bx, by, bw, bh);
     }
+    if (cursor_moved) {
+        cursor_moved = 0;
+        dmg_cursor();
+    }
+    frame();
 }
 
 /* Перерисовать только область одного окна (после COMMIT клиента). */
@@ -1395,8 +1430,10 @@ static void on_mouse_move(int dx, int dy) {
 
     update_cursor_shape();
 
+    /* Курсор повреждаем ВСЕГДА (старое+новое место — копейки), а при
+     * drag/resize дополнительно перерисовываем геометрию окна. */
+    cursor_moved = 1;
     if (drag.active || rz.active) needs_redraw = 1;
-    else cursor_moved = 1;
 }
 
 static int active_window_count(void) {
