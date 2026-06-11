@@ -4,14 +4,17 @@
 # Быстрый цикл разработки: pull → build → run
 #
 # Использование:
-#   bash dev.sh              — pull + build + run (обычный дисплей)
-#   bash dev.sh --gpu        — pull + build + run-gpu (virtio-gpu)
+#   bash dev.sh              — pull + build + run (virtio-gpu, плавный present)
+#   bash dev.sh --std        — pull + build + run-std (старая VGA, фоллбэк)
 #   bash dev.sh build        — pull + build only (без запуска)
-#   bash dev.sh build --gpu  — то же
 #   bash dev.sh clean        — очистка build/
 #   bash dev.sh watch        — pull + авто-пересборка при изменении файлов
 #   bash dev.sh qemu         — только QEMU (без pull/build)
-#   bash dev.sh qemu --gpu   — только QEMU с virtio-gpu
+#   bash dev.sh qemu --std   — только QEMU со стандартной VGA
+#
+# virtio-gpu теперь ДЕФОЛТ: со std-VGA QEMU обновляет окно по таймеру ~30 мс
+# (=33 FPS на хосте), отсюда дёрганое перетаскивание. --gpu оставлен как
+# синоним дефолта для совместимости.
 # =============================================================================
 
 PROJECT_DIR="/d/VOS"
@@ -28,22 +31,23 @@ NC='\033[0m'
 
 # --- Разбор аргументов -------------------------------------------------------
 ACTION="run"
-GPU=false
+GPU=true
 
 for arg in "$@"; do
     case "$arg" in
         --gpu)  GPU=true ;;
+        --std)  GPU=false ;;
         build|run|watch|clean|qemu) ACTION="$arg" ;;
         -h|--help)
-            echo -e "${YELLOW}Usage: bash dev.sh [ACTION] [--gpu]${NC}"
+            echo -e "${YELLOW}Usage: bash dev.sh [ACTION] [--std]${NC}"
             echo ""
-            echo -e "  ${GRAY}run${NC}    [default] Pull + build + QEMU"
+            echo -e "  ${GRAY}run${NC}    [default] Pull + build + QEMU (virtio-gpu)"
             echo -e "  ${GRAY}build${NC}  Pull + build (без запуска)"
             echo -e "  ${GRAY}watch${NC}  Pull + авто-rebuild при изменении файлов"
             echo -e "  ${GRAY}clean${NC}  Удалить build/"
             echo -e "  ${GRAY}qemu${NC}   Запустить QEMU без пересборки"
             echo ""
-            echo -e "  ${GRAY}--gpu${NC}  Запуск с virtio-gpu (run-gpu)"
+            echo -e "  ${GRAY}--std${NC}  Старая VGA вместо virtio-gpu (фоллбэк)"
             exit 0
             ;;
         *)
@@ -135,7 +139,7 @@ run_qemu() {
     if $GPU; then
         header "Launching VortexOS in QEMU (virtio-gpu)"
     else
-        header "Launching VortexOS in QEMU"
+        header "Launching VortexOS in QEMU (std VGA fallback)"
     fi
     echo -e "  ${GRAY}Press Ctrl+C or close QEMU to stop${NC}"
     echo ""
@@ -143,7 +147,7 @@ run_qemu() {
     if $GPU; then
         make run-gpu
     else
-        make run
+        make run-std
     fi
 }
 

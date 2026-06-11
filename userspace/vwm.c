@@ -292,6 +292,35 @@ static void dmg_add(int x, int y, int w, int h) {
     damage[damage_count].w = w; damage[damage_count].h = h;
     damage_count++;
 }
+/* Слияние пересекающихся damage-прямоугольников (bounding box). Во время drag
+ * старая и новая позиции окна почти всегда пересекаются: без слияния зона
+ * пересечения компонуется И презентуется дважды (на virtio это два лишних
+ * TRANSFER+FLUSH). O(n^2) при n<=32 — копейки по сравнению с композицией. */
+static int rects_overlap(const rect_t *a, const rect_t *b) {
+    return a->x < b->x + b->w && b->x < a->x + a->w &&
+           a->y < b->y + b->h && b->y < a->y + a->h;
+}
+static void dmg_merge(void) {
+    int merged = 1;
+    while (merged) {
+        merged = 0;
+        for (int i = 0; i < damage_count; i++) {
+            for (int j = i + 1; j < damage_count; j++) {
+                if (!rects_overlap(&damage[i], &damage[j])) continue;
+                int x0 = damage[i].x < damage[j].x ? damage[i].x : damage[j].x;
+                int y0 = damage[i].y < damage[j].y ? damage[i].y : damage[j].y;
+                int xa = damage[i].x + damage[i].w, xb = damage[j].x + damage[j].w;
+                int ya = damage[i].y + damage[i].h, yb = damage[j].y + damage[j].h;
+                damage[i].x = x0; damage[i].y = y0;
+                damage[i].w = (xa > xb ? xa : xb) - x0;
+                damage[i].h = (ya > yb ? ya : yb) - y0;
+                damage[j] = damage[--damage_count];
+                merged = 1;
+                j--;
+            }
+        }
+    }
+}
 static void blit_to_front(int x, int y, int w, int h) {
     for (int row = 0; row < h; row++) {
         int yy = y + row;
@@ -1079,6 +1108,8 @@ static void frame(void) {
         damage_count = 1;
         damage_full = 0;
     }
+
+    dmg_merge();
 
     for (int i = 0; i < damage_count; i++)
         compose_rect(damage[i].x, damage[i].y, damage[i].w, damage[i].h);

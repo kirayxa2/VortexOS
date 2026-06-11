@@ -88,7 +88,7 @@ C_OBJS   := $(patsubst %.c,   build/%.o, $(C_SRCS))
 ALL_OBJS := $(ASM_OBJS) $(C_OBJS)
 
 # --- Цели --------------------------------------------------------------------
-.PHONY: all clean run iso disk disk-clean vortexfs-disk vortexfs-disk-clean userspace disk-with-apps vortexfs-with-apps
+.PHONY: all clean run run-std run-gpu iso disk disk-clean vortexfs-disk vortexfs-disk-clean userspace disk-with-apps vortexfs-with-apps
 
 all: build/kernel.bin
 	@echo "=== Build OK: build/kernel.bin ==="
@@ -162,7 +162,14 @@ iso: build/kernel.bin
 
 ## VortexFS — основной диск (drive 0), FAT32 — вторичный (drive 1, опционально).
 ## Ядро пробует VortexFS первым → FAT32 → ramfs.
-run: iso vortexfs-disk
+## ДЕФОЛТ = virtio-gpu. Причина: с -vga std QEMU сам сканирует framebuffer на
+## изменения по GUI-таймеру (~30 мс) => на хосте максимум ~33 FPS, перетаскивание
+## дёргается, сколько бы FPS ни выдавал vwm. С virtio-gpu каждый present
+## (TRANSFER+FLUSH) показывается хостом немедленно => плавность = FPS гостя.
+run: run-gpu
+
+## Старый путь со стандартной VGA (фоллбэк, если virtio вдруг сломается).
+run-std: iso vortexfs-disk
 	$(QEMU)                          \
 	    -cdrom build/vortex.iso      \
 	    -m 256M                      \
