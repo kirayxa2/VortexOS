@@ -70,6 +70,9 @@ typedef struct {
     int x, y, w, h;             /* геометрия содержимого (без заголовка) */
     uint32_t *pixels;           /* shm-поверхность клиента (stride = w)  */
     uint64_t shm_id;
+    int minimized;              /* 🟡 свёрнуто: не рисуем, чип в панели  */
+    int maximized;              /* 🟢 развёрнуто на весь рабочий стол    */
+    int rest_x, rest_y, rest_w, rest_h;  /* геометрия до maximize        */
     char title[32];
 } vwin_t;
 
@@ -626,6 +629,64 @@ static void raise_window(uint64_t id) {
 static void panel_bounds(int *x, int *y, int *w, int *h) {
     *x = 0; *y = 0; *w = (int)fbw; *h = PANEL_H;
 }
+
+/* ---- Чипы свёрнутых окон в панели (слева от часов) --------------------
+ * Раскладка считается заново и при отрисовке, и при hit-test — никакого
+ * состояния между кадрами (та же дисциплина, что и с win_id). */
+#define CHIP_H        18
+#define CHIP_TITLE_MAX 12
+typedef struct { int x, w; uint64_t id; const char *title; } chip_t;
+
+static int panel_chips(chip_t *out) {
+    int n = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        vwin_t *w = &windows[i];
+        if (!w->id || !w->minimized) continue;
+        int len = 0;
+        while (w->title[len] && len < CHIP_TITLE_MAX) len++;
+        if (len == 0) len = 1;
+        out[n].w = len * 8 + 14;
+        out[n].id = w->id;
+        out[n].title = w->title;
+        n++;
+    }
+    /* правый край пачки — перед часами; чипы идут слева направо
+     * в порядке слотов */
+    int x = (int)fbw - 8 * 8 - 24;
+    for (int k = n - 1; k >= 0; k--) { x -= out[k].w + 6; out[k].x = x; }
+    return n;
+}
+static int panel_chip_hit(int mx, int my, uint64_t *id_out) {
+    if (my >= PANEL_H) return 0;
+    chip_t chips[MAX_WINDOWS];
+    int n = panel_chips(chips);
+    int cy = (PANEL_H - CHIP_H) / 2;
+    for (int k = 0; k < n; k++)
+        if (mx >= chips[k].x && mx < chips[k].x + chips[k].w &&
+            my >= cy && my < cy + CHIP_H) {
+            *id_out = chips[k].id;
+            return 1;
+        }
+    return 0;
+}
+static void draw_panel_chips(void) {
+    chip_t chips[MAX_WINDOWS];
+    int n = panel_chips(chips);
+    int cy = (PANEL_H - CHIP_H) / 2;
+    int ty = (PANEL_H - 16) / 2;
+    for (int k = 0; k < n; k++) {
+        fill_round(chips[k].x, cy, chips[k].w, CHIP_H, 6, 0xFF2A2A3E, 255);
+        char buf[CHIP_TITLE_MAX + 1];
+        int i = 0;
+        while (chips[k].title[i] && i < CHIP_TITLE_MAX) {
+            buf[i] = chips[k].title[i];
+            i++;
+        }
+        buf[i] = 0;
+        draw_string(chips[k].x + 7, ty, buf, 0xFF9AB8D8, 0xFF2A2A3E);
+    }
+}
+
 static void draw_panel(void) {
     int W = (int)fbw;
     fill_rect(0, 0, W, PANEL_H, PANEL_BG);
@@ -642,6 +703,8 @@ static void draw_panel(void) {
         fill_rect(lx + 8, ty + 1, 1, 14, 0xFF44445A);
         draw_string(lx + 16, ty, fw->title, 0xFF9AB8D8, PANEL_BG);
     }
+
+    draw_panel_chips();
 
     uint32_t hms[3];
     vos_rtc(hms);
@@ -903,7 +966,7 @@ static void render_all(void) {
     for (uint32_t i = 0; i < fbw * fbh; i++) bb[i] = DESK_BG;
     draw_desktop_icons(0, 0, (int)fbw, (int)fbh);
     for (int i = 0; i < MAX_WINDOWS; i++)
-        if (windows[i].id && windows[i].pixels)
+        if (windows[i].id && windows[i].pixels && !windows[i].minimized)
             draw_window_chrome(&windows[i]);
     draw_panel();
     draw_dock();
@@ -936,7 +999,7 @@ static void render_region(int rx, int ry, int rw, int rh) {
 
     for (int i = 0; i < MAX_WINDOWS; i++) {
         vwin_t *win = &windows[i];
-        if (!win->id || !win->pixels) continue;
+        if (!win->id || !win->pixels || win->minimized) continue;
         if (!win_intersects(win, rx, ry, rw, rh)) continue;
         draw_window_chrome(win);
     }
@@ -1054,6 +1117,8 @@ static void win_drop(vwin_t *win) {
     if (rz.active && rz.win_id == win->id) rz.active = 0;
     win->id = 0;
     win->pixels = 0;
+    win->minimized = 0;   /* слот переиспользуется — флаги не наследуем */
+    win->maximized = 0;
     /* Безусловно: у каждого окна есть поверхность, а shm_id == 0 — валидный
      * id сегмента (нумерация с нуля). */
     vos_shm_release(win->shm_id);
@@ -1067,13 +1132,73 @@ static void close_window(vwin_t *win) {
     send_event(pid, VWM_EV_CLOSE, id, 0, 0);   /* клиент должен выйти */
 }
 
+/* Применить новую геометрию окна: при смене РАЗМЕРА чистим поверхность под
+ * новый stride и просим клиента перерисоваться (EV_RESIZE) — тот же контракт,
+ * что и у ресайза мышью. */
+static void win_apply_geometry(vwin_t *win, int nx, int ny, int nw, int nh) {
+    int resized = (nw != win->w || nh != win->h);
+    win->x = nx; win->y = ny; win->w = nw; win->h = nh;
+    if (resized) {
+        int total = nw * nh;
+        for (int j = 0; j < total; j++) win->pixels[j] = 0xFF2A2A3E;
+        send_event(win->owner_pid, VWM_EV_RESIZE, win->id,
+                   (uint64_t)nw, (uint64_t)nh);
+    }
+    needs_redraw = 1;
+}
+
+/* 🟡 Свернуть: окно исчезает со стола, появляется чипом в панели.
+ * Клиент НЕ трогаем — его поверхность жива, COMMIT'ы просто не рисуем. */
+static void minimize_window(vwin_t *win) {
+    win->minimized = 1;
+    if (drag.active && drag.win_id == win->id) drag.active = 0;
+    if (rz.active && rz.win_id == win->id) rz.active = 0;
+    if (focused_id == win->id) {
+        focused_id = 0;                 /* фокус — верхнему из оставшихся */
+        for (int i = MAX_WINDOWS - 1; i >= 0; i--)
+            if (windows[i].id && !windows[i].minimized) {
+                focused_id = windows[i].id;
+                break;
+            }
+    }
+    needs_redraw = 1;
+}
+
+/* Развернуть из панели: показать, дать фокус, поднять наверх. */
+static void restore_window(vwin_t *win) {
+    uint64_t id = win->id;
+    win->minimized = 0;
+    focused_id = id;
+    raise_window(id);                   /* win после этого невалиден */
+    needs_redraw = 1;
+}
+
+/* 🟢 Maximize — тоггл: на весь рабочий стол (под панелью) и обратно.
+ * Площадь поверхности ограничена VWM_MAX_PIXELS — если экран больше,
+ * подрезаем высоту (как делает ресайз мышью). */
+static void toggle_maximize(vwin_t *win) {
+    if (!win->maximized) {
+        win->rest_x = win->x; win->rest_y = win->y;
+        win->rest_w = win->w; win->rest_h = win->h;
+        int nw = (int)fbw;
+        int nh = (int)fbh - PANEL_H - TITLEBAR_H;
+        if (nw * nh > VWM_MAX_PIXELS) nh = VWM_MAX_PIXELS / nw;
+        win->maximized = 1;
+        win_apply_geometry(win, 0, PANEL_H, nw, nh);
+    } else {
+        win->maximized = 0;
+        win_apply_geometry(win, win->rest_x, win->rest_y,
+                           win->rest_w, win->rest_h);
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * Обработка ввода (порт wm_handle_mouse_move / wm_handle_mouse_button)
  * ------------------------------------------------------------------------- */
 static int point_over_window(int mx, int my) {
     for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
         vwin_t *win = &windows[i];
-        if (!win->id) continue;
+        if (!win->id || win->minimized) continue;
         if (mx >= win->x && mx < win->x + win->w &&
             my >= win->y && my < win->y + win->h + TITLEBAR_H) return 1;
     }
@@ -1090,7 +1215,7 @@ static void update_cursor_shape(void) {
         if (dock_hit(mouse_x, mouse_y) == -1) {    /* dock поверх окон — там стрелка */
             for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
                 vwin_t *win = &windows[i];
-                if (!win->id) continue;
+                if (!win->id || win->minimized) continue;
                 int owns = (mouse_x >= win->x - RESIZE_BORDER &&
                             mouse_x <= win->x + win->w + RESIZE_BORDER &&
                             mouse_y >= win->y - RESIZE_BORDER &&
@@ -1170,6 +1295,7 @@ static void on_mouse_move(int dx, int dy) {
     if (drag.active) {
         vwin_t *win = find_window(drag.win_id);
         if (win) {
+            int ox = win->x, oy = win->y;
             win->x = mouse_x - drag.off_x;
             win->y = mouse_y - drag.off_y;
             if (win->x < 0) win->x = 0;
@@ -1177,6 +1303,8 @@ static void on_mouse_move(int dx, int dy) {
             if (win->x + win->w > (int)fbw) win->x = (int)fbw - win->w;
             if (win->y + win->h + TITLEBAR_H > (int)fbh)
                 win->y = (int)fbh - win->h - TITLEBAR_H;
+            if (win->x != ox || win->y != oy)
+                win->maximized = 0;   /* реально перетащили — не maximized */
         }
     }
 
@@ -1222,6 +1350,18 @@ static void on_mouse_button(uint8_t buttons) {
         if (dock_pressed) { dock_pressed = 0; dock_dirty = 1; }
     }
 
+    /* --- Панель поверх окон: чипы свёрнутых окон --- */
+    if (buttons & 1) {
+        uint64_t cid;
+        if (panel_chip_hit(mx, my, &cid)) {
+            vwin_t *win = find_window(cid);
+            if (win) restore_window(win);
+            return;
+        }
+        /* пустая панель клик НЕ глотает: окно, затащенное под панель
+         * (y=0), иначе стало бы невозможно схватить за титлбар */
+    }
+
     /* --- Иконки рабочего стола (под окнами) --- */
     if (buttons & 1) {
         int di = desk_icon_hit(mx, my);
@@ -1247,13 +1387,19 @@ static void on_mouse_button(uint8_t buttons) {
     if (buttons & 1) {
         for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
             vwin_t *win = &windows[i];
-            if (!win->id) continue;
+            if (!win->id || win->minimized) continue;
             int inside = (mx >= win->x && mx < win->x + win->w &&
                           my >= win->y && my < win->y + win->h + TITLEBAR_H);
             if (!inside) continue;
             int b = win_button_hit(win, mx, my);
-            if (b == 0) { close_window(win); return; }     /* 🔴 закрыть */
-            if (b >= 0) { needs_redraw = 1; return; }      /* 🟡/🟢 пока зарезервировано */
+            if (b == 0) { close_window(win); return; }     /* 🔴 закрыть    */
+            if (b == 1) { minimize_window(win); return; }  /* 🟡 свернуть   */
+            if (b == 2) {                                  /* 🟢 развернуть */
+                focused_id = win->id;
+                toggle_maximize(win);
+                raise_window(win->id);   /* win после этого невалиден */
+                return;
+            }
             break;
         }
     }
@@ -1262,7 +1408,7 @@ static void on_mouse_button(uint8_t buttons) {
         /* фокус — окну под кликом + поднять наверх (raise-on-click) */
         for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
             vwin_t *win = &windows[i];
-            if (!win->id) continue;
+            if (!win->id || win->minimized) continue;
             if (mx >= win->x && mx < win->x + win->w &&
                 my >= win->y && my < win->y + win->h + TITLEBAR_H) {
                 focused_id = win->id;
@@ -1274,12 +1420,13 @@ static void on_mouse_button(uint8_t buttons) {
         if (!drag.active && !rz.active) {
             for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
                 vwin_t *win = &windows[i];
-                if (!win->id) continue;
+                if (!win->id || win->minimized) continue;
                 int edge = resize_edge_hit(win, mx, my);
                 int owns = (mx >= win->x - RESIZE_BORDER && mx <= win->x + win->w + RESIZE_BORDER &&
                             my >= win->y - RESIZE_BORDER && my <= win->y + win->h + TITLEBAR_H + RESIZE_BORDER);
                 if (!owns) continue;
                 if (edge) {
+                    win->maximized = 0;   /* ручной ресайз снимает maximize */
                     rz.active = 1;
                     rz.win_id = win->id;
                     rz.edge = edge;
@@ -1302,9 +1449,12 @@ static void on_mouse_button(uint8_t buttons) {
         if (!drag.active && !rz.active) {
             for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
                 vwin_t *win = &windows[i];
-                if (!win->id) continue;
+                if (!win->id || win->minimized) continue;
                 if (mx >= win->x && mx < win->x + win->w &&
                     my >= win->y && my < win->y + TITLEBAR_H) {
+                    /* maximized снимаем не здесь, а при реальном движении
+                     * в on_mouse_move — простой клик по титлбару не должен
+                     * сбрасывать состояние тоггла 🟢 */
                     drag.active = 1;
                     drag.win_id = win->id;
                     drag.off_x = mx - win->x;
@@ -1409,7 +1559,9 @@ static void handle_msg(vos_msg_t *m) {
         if (win && win->owner_pid == m->w[7]) {
             /* Пиксели уже в shm — просто перерисовываем область окна.
              * Если сцена и так грязная, кадр по тику всё перерисует. */
-            if (!needs_redraw && !drag.active && !rz.active)
+            if (win->minimized)
+                ;   /* свёрнуто: пиксели в shm обновились, рисовать нечего */
+            else if (!needs_redraw && !drag.active && !rz.active)
                 render_window_region(win);
             else
                 needs_redraw = 1;
