@@ -8,8 +8,9 @@
  *   - клиенты (/vterm, /vdemo) рисуют ТОЛЬКО содержимое окна в свою
  *     shm-поверхность и шлют COMMIT — пиксели НЕ копируются через ядро,
  *     vwm видит тот же буфер (shared memory);
- *   - декорации (заголовок, кнопки, тень, скругления), панель, dock, иконки
- *     рабочего стола, курсор, drag/resize, фокус — всё здесь, в ring3;
+ *   - декорации (заголовок, кнопки, тень, скругления), панель, dock с
+ *     ярлыками приложений, курсор, drag/resize, фокус — всё здесь, в ring3;
+ *     рабочий стол чистый (под будущие виджеты/ярлыки пользователя);
  *   - рендер — повзрослому: персистентный back buffer + damage rectangles
  *     (перерисовываем и копируем во front buffer только изменившееся),
  *     курсор — save-under, кадр ~50 FPS по тикам PIT, vsync через ядро.
@@ -539,7 +540,16 @@ static void fill_wall(int x, int y, int w, int h) {
 #define DOCK_PAD    12
 #define DOCK_GAP    12
 #define DOCK_BOTTOM 16
-#define DOCK_NITEMS 1
+
+/* Ярлыки приложений (бывшие иконки рабочего стола — стол оставляем чистым
+ * под будущие пользовательские виджеты/папки/ярлыки, как в macOS). */
+typedef struct { const char *path; const char *label; int kind; } dock_item_t;
+static const dock_item_t dock_items[] = {
+    { "/bin/vterm",  "Terminal", 0 },
+    { "/bin/vfiles", "Files",    1 },
+    { "/bin/vdemo",  "Window",   2 },
+};
+#define DOCK_NITEMS ((int)(sizeof(dock_items) / sizeof(dock_items[0])))
 
 static int dock_hover = -1;
 static int dock_pressed = 0;
@@ -595,21 +605,37 @@ static void fill_round(int x, int y, int w, int h, int r, uint32_t color, int a)
         }
     }
 }
-static void dock_draw_terminal(int x, int y, int s, int pressed) {
+static void dock_draw_tile(int kind, int x, int y, int s, int pressed) {
     if (pressed) { x += 1; y += 1; }
-    fill_round(x, y, s, s, 11, 0xFF16161F, 255);
-    for (int i = 3; i < s - 3; i++) dock_put_blend(x + i, y + 2, 0xFFFFFFFF, 16);
-    int cy = y + 9;
-    fill_circle(x + 11, cy, 3, 0xFFFF5F56);
-    fill_circle(x + 21, cy, 3, 0xFFFFBD2E);
-    fill_circle(x + 31, cy, 3, 0xFF27C93F);
-    uint32_t green = 0xFF3BE06F;
-    int px = x + 10, py = y + 23;
-    for (int t = 0; t < 2; t++) {
-        draw_line(px,     py + t,     px + 7, py + 6 + t,  green);
-        draw_line(px + 7, py + 6 + t, px,     py + 12 + t, green);
+    if (kind == 0) {                       /* Terminal */
+        fill_round(x, y, s, s, 11, 0xFF16161F, 255);
+        for (int i = 3; i < s - 3; i++) dock_put_blend(x + i, y + 2, 0xFFFFFFFF, 16);
+        int cy = y + 9;
+        fill_circle(x + 11, cy, 3, 0xFFFF5F56);
+        fill_circle(x + 21, cy, 3, 0xFFFFBD2E);
+        fill_circle(x + 31, cy, 3, 0xFF27C93F);
+        uint32_t green = 0xFF3BE06F;
+        int px = x + 10, py = y + 23;
+        for (int t = 0; t < 2; t++) {
+            draw_line(px,     py + t,     px + 7, py + 6 + t,  green);
+            draw_line(px + 7, py + 6 + t, px,     py + 12 + t, green);
+        }
+        fill_rect(x + 23, py + 9, 12, 4, green);
+    } else if (kind == 1) {                /* Files: папка */
+        fill_round(x, y, s, s, 11, 0xFF1E2433, 255);
+        for (int i = 3; i < s - 3; i++) dock_put_blend(x + i, y + 2, 0xFFFFFFFF, 16);
+        uint32_t fold = 0xFFE8B64C, foldhi = 0xFFF2CC74;
+        fill_rect(x + 8,  y + 14, 14, 5,  fold);    /* язычок */
+        fill_rect(x + 8,  y + 18, 32, 18, fold);    /* корпус */
+        fill_rect(x + 8,  y + 18, 32, 3,  foldhi);  /* блик   */
+    } else {                               /* Window: демо-окно */
+        fill_round(x, y, s, s, 11, 0xFFEAEAF0, 255);
+        fill_rect(x + 8,  y + 10, 32, 28, 0xFFFFFFFF);
+        fill_rect(x + 8,  y + 10, 32, 7,  0xFF3D6FB5);
+        fill_rect(x + 12, y + 22, 24, 2,  0xFFB8C2D0);
+        fill_rect(x + 12, y + 27, 24, 2,  0xFFB8C2D0);
+        fill_rect(x + 12, y + 32, 16, 2,  0xFFB8C2D0);
     }
-    fill_rect(x + 23, py + 9, 12, 4, green);
 }
 static void draw_dock(void) {
     int dx, dy, dw, dh;
@@ -625,95 +651,25 @@ static void draw_dock(void) {
         if (hovered)
             fill_round(ix - 4, iy - 4, DOCK_ICON + 8, DOCK_ICON + 8, 14,
                        0xFFFFFFFF, pressed ? 60 : 35);
-        dock_draw_terminal(ix, iy, DOCK_ICON, pressed);
+        dock_draw_tile(dock_items[k].kind, ix, iy, DOCK_ICON, pressed);
+    }
+    if (dock_hover >= 0 && dock_hover < DOCK_NITEMS) {   /* тултип-подпись */
+        const char *t = dock_items[dock_hover].label;
+        int len = 0; while (t[len]) len++;
+        int tw = len * 8 + 14, th = 22;
+        int ix, iy; dock_icon_rect(dock_hover, &ix, &iy);
+        (void)iy;
+        int tx = ix + DOCK_ICON / 2 - tw / 2;
+        int ty = dy - th - 8;
+        fill_round(tx, ty + 2, tw, th, th / 2, 0xFF000000, 60);
+        fill_round(tx, ty, tw, th, th / 2, 0xFF22222F, 230);
+        draw_string_t(tx + 7, ty + (th - 16) / 2, t, 0xFFF0F2F8);
     }
 }
 static void dock_bounds(int *x, int *y, int *w, int *h) {
     int dx, dy, dw, dh;
     dock_geometry(&dx, &dy, &dw, &dh);
-    *x = dx - 4; *y = dy - 4; *w = dw + 8; *h = dh + 12;
-}
-
-/* ---------------------------------------------------------------------------
- * Иконки рабочего стола (порт kernel simple_wm, пути под userspace-клиенты)
- * ------------------------------------------------------------------------- */
-#define DESK_ICONSZ 48
-#define DESK_CELL_W 80
-#define DESK_CELL_H 84
-#define DESK_X0     12
-#define DESK_Y0     36
-
-typedef struct { const char *path; const char *label; int kind; } desk_icon_t;
-static const desk_icon_t desk_icons[] = {
-    { "/bin/vterm",  "Terminal", 0 },
-    { "/bin/vfiles", "Files",    1 },
-    { "/bin/vdemo",  "Window",   2 },
-};
-#define DESK_NICONS ((int)(sizeof(desk_icons) / sizeof(desk_icons[0])))
-
-static int desk_selected = -1;
-static uint64_t desk_last_click_tick = 0;
-static int desk_last_click_idx = -1;
-
-static void desk_cell_rect(int idx, int *cx, int *cy) {
-    *cx = DESK_X0;
-    *cy = DESK_Y0 + idx * DESK_CELL_H;
-}
-static int desk_icon_hit(int mx, int my) {
-    for (int k = 0; k < DESK_NICONS; k++) {
-        int cx, cy; desk_cell_rect(k, &cx, &cy);
-        if (mx >= cx && mx < cx + DESK_CELL_W && my >= cy && my < cy + DESK_CELL_H)
-            return k;
-    }
-    return -1;
-}
-static void desk_draw_tile(int kind, int x, int y, int s) {
-    if (kind == 0) {
-        fill_round(x, y, s, s, 10, 0xFF16161F, 255);
-        uint32_t green = 0xFF3BE06F;
-        int px = x + 11, py = y + 16;
-        for (int t = 0; t < 2; t++) {
-            draw_line(px,     py + t,     px + 8, py + 8 + t,  green);
-            draw_line(px + 8, py + 8 + t, px,     py + 16 + t, green);
-        }
-        fill_rect(x + 24, py + 12, 12, 4, green);
-    } else if (kind == 1) {
-        /* папка: задник + язычок + корпус */
-        fill_round(x, y, s, s, 10, 0xFF1E2433, 255);
-        uint32_t fold = 0xFFE8B64C, foldhi = 0xFFF2CC74;
-        fill_rect(x + 8,  y + 14, 14, 5, fold);     /* язычок */
-        fill_rect(x + 8,  y + 18, 32, 18, fold);    /* корпус */
-        fill_rect(x + 8,  y + 18, 32, 3,  foldhi);  /* блик   */
-    } else {
-        fill_round(x, y, s, s, 10, 0xFFEAEAF0, 255);
-        fill_rect(x + 8,  y + 10, 32, 28, 0xFFFFFFFF);
-        fill_rect(x + 8,  y + 10, 32, 7,  0xFF3D6FB5);
-        fill_rect(x + 12, y + 22, 24, 2,  0xFFB8C2D0);
-        fill_rect(x + 12, y + 27, 24, 2,  0xFFB8C2D0);
-        fill_rect(x + 12, y + 32, 16, 2,  0xFFB8C2D0);
-    }
-}
-static void desk_draw_one(int idx) {
-    int cx, cy; desk_cell_rect(idx, &cx, &cy);
-    int selected = (desk_selected == idx);
-    if (selected)
-        fill_round(cx + 2, cy + 2, DESK_CELL_W - 4, DESK_CELL_H - 6, 8,
-                   ACCENT, 85);    /* полупрозрачное акцентное, как в Plasma */
-    int ix = cx + (DESK_CELL_W - DESK_ICONSZ) / 2;
-    int iy = cy + 8;
-    desk_draw_tile(desk_icons[idx].kind, ix, iy, DESK_ICONSZ);
-    const char *t = desk_icons[idx].label;
-    int len = 0; while (t[len]) len++;
-    draw_string_sh(cx + (DESK_CELL_W - len * 8) / 2, iy + DESK_ICONSZ + 6,
-                   t, 0xFFF0F2F8);
-}
-static void draw_desktop_icons(int rx, int ry, int rw, int rh) {
-    for (int k = 0; k < DESK_NICONS; k++) {
-        int cx, cy; desk_cell_rect(k, &cx, &cy);
-        if (rx >= cx + DESK_CELL_W || rx + rw <= cx ||
-            ry >= cy + DESK_CELL_H || ry + rh <= cy) continue;
-        desk_draw_one(k);
-    }
+    *x = dx - 4; *y = dy - 34; *w = dw + 8; *h = dh + 42;   /* + тултип сверху */
 }
 
 /* ---------------------------------------------------------------------------
@@ -1107,7 +1063,6 @@ static void draw_window_chrome(vwin_t *win) {
  * ------------------------------------------------------------------------- */
 static void render_all(void) {
     fill_wall(0, 0, (int)fbw, (int)fbh);
-    draw_desktop_icons(0, 0, (int)fbw, (int)fbh);
     for (int i = 0; i < MAX_WINDOWS; i++)
         if (windows[i].id && windows[i].pixels && !windows[i].minimized)
             draw_window_chrome(&windows[i]);
@@ -1138,7 +1093,6 @@ static void render_region(int rx, int ry, int rw, int rh) {
     dmg_reset();
     cursor_take_down();
     fill_wall(rx, ry, rw, rh);
-    draw_desktop_icons(rx, ry, rw, rh);
 
     for (int i = 0; i < MAX_WINDOWS; i++) {
         vwin_t *win = &windows[i];
@@ -1351,15 +1305,6 @@ static void toggle_maximize(vwin_t *win) {
 /* ---------------------------------------------------------------------------
  * Обработка ввода (порт wm_handle_mouse_move / wm_handle_mouse_button)
  * ------------------------------------------------------------------------- */
-static int point_over_window(int mx, int my) {
-    for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
-        vwin_t *win = &windows[i];
-        if (!win->id || win->minimized) continue;
-        if (mx >= win->x && mx < win->x + win->w &&
-            my >= win->y && my < win->y + win->h + TITLEBAR_H) return 1;
-    }
-    return 0;
-}
 
 /* Пересчитать форму курсора по тому, что под ним (hover):
  * над краем/углом верхнего окна — ресайзная стрелка, иначе обычная. */
@@ -1497,8 +1442,8 @@ static void on_mouse_button(uint8_t buttons) {
             dock_hover = dh;
             dock_pressed = 1;
             dock_dirty = 1;
-            if (dh == 0 && active_window_count() < MAX_WINDOWS)
-                vos_spawn("/bin/vterm");
+            if (active_window_count() < MAX_WINDOWS)
+                vos_spawn(dock_items[dh].path);
             return;
         }
         if (dh == -2) return;
@@ -1516,27 +1461,6 @@ static void on_mouse_button(uint8_t buttons) {
         }
         /* пустая панель клик НЕ глотает: окно, затащенное под панель
          * (y=0), иначе стало бы невозможно схватить за титлбар */
-    }
-
-    /* --- Иконки рабочего стола (под окнами) --- */
-    if (buttons & 1) {
-        int di = desk_icon_hit(mx, my);
-        if (!point_over_window(mx, my)) {
-            if (di >= 0) {
-                uint64_t now = vos_uptime();
-                int dbl = (di == desk_last_click_idx &&
-                           (now - desk_last_click_tick) <= 40);
-                desk_last_click_idx = di;
-                desk_last_click_tick = now;
-                if (desk_selected != di) { desk_selected = di; needs_redraw = 1; }
-                if (dbl && active_window_count() < MAX_WINDOWS) {
-                    vos_spawn(desk_icons[di].path);
-                    desk_last_click_idx = -1;
-                }
-                return;
-            }
-            if (desk_selected != -1) { desk_selected = -1; needs_redraw = 1; }
-        }
     }
 
     /* --- Кнопки заголовка --- */
