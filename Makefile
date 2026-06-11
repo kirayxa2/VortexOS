@@ -104,7 +104,7 @@ build/disk.img:
 	dd if=/dev/zero of=build/disk.img bs=1M count=16
 	python3 tools/mkfat32.py build/disk.img
 	@echo "=== Adding test file to disk ==="
-	python3 tools/add_file.py build/disk.img "Hello from FAT32!" /test.txt
+	python3 tools/add_file.py build/disk.img "Hello from FAT32!" test.txt
 	@echo "=== Disk image ready: build/disk.img ==="
 
 build/kernel.bin: $(ALL_OBJS)
@@ -181,17 +181,21 @@ userspace:
 	@echo "=== Building userspace programs ==="
 	$(MAKE) -C userspace
 
+# ВАЖНО: пути назначения БЕЗ ведущего слэша. MSYS2 на Windows молча
+# конвертирует аргументы вида "/bin/vwm" в Windows-пути ("C:/msys64/bin/vwm"),
+# и файлы уезжали в мусорные каталоги внутри образа. add_file.py сам считает
+# путь от корня FAT32.
 disk-with-apps: disk userspace
 	@echo "=== Adding userspace programs to /bin ==="
-	python3 tools/add_file.py build/disk.img userspace/hello /bin/hello
-	python3 tools/add_file.py build/disk.img userspace/vortexgraph /bin/vgraph
-	python3 tools/add_file.py build/disk.img userspace/test_window /bin/testwin
-	python3 tools/add_file.py build/disk.img userspace/vsh /bin/vsh
-	python3 tools/add_file.py build/disk.img userspace/vwm /bin/vwm
-	python3 tools/add_file.py build/disk.img userspace/vterm /bin/vterm
-	python3 tools/add_file.py build/disk.img userspace/vdemo /bin/vdemo
+	python3 tools/add_file.py build/disk.img userspace/hello bin/hello
+	python3 tools/add_file.py build/disk.img userspace/vortexgraph bin/vgraph
+	python3 tools/add_file.py build/disk.img userspace/test_window bin/testwin
+	python3 tools/add_file.py build/disk.img userspace/vsh bin/vsh
+	python3 tools/add_file.py build/disk.img userspace/vwm bin/vwm
+	python3 tools/add_file.py build/disk.img userspace/vterm bin/vterm
+	python3 tools/add_file.py build/disk.img userspace/vdemo bin/vdemo
 	@echo "=== Creating FS hierarchy (/etc, /home, /tmp) ==="
-	python3 tools/add_file.py build/disk.img "Welcome to VortexOS!" /etc/motd
-	python3 tools/add_file.py build/disk.img --mkdir /home
-	python3 tools/add_file.py build/disk.img --mkdir /tmp
+	python3 tools/add_file.py build/disk.img "Welcome to VortexOS!" etc/motd
+	python3 tools/add_file.py build/disk.img --mkdir home
+	python3 tools/add_file.py build/disk.img --mkdir tmp
 	@echo "=== Disk with apps ready ==="

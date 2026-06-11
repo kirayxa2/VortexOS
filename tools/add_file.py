@@ -240,6 +240,28 @@ def main():
         sys.exit(1)
 
     disk_path, source, dest = sys.argv[1], sys.argv[2], sys.argv[3]
+
+    # MSYS2 на Windows конвертирует аргументы с ведущим '/' в Windows-пути
+    # ("/bin/vwm" → "C:/msys64/bin/vwm"). Ловим это и чиним: путь назначения —
+    # всегда внутри образа, Windows-префикс там бессмысленен.
+    dest = dest.replace('\\', '/')
+    if len(dest) >= 2 and dest[1] == ':':
+        for marker in ('/usr/bin/', '/bin/', '/etc/', '/home/', '/tmp/'):
+            idx = dest.lower().find(marker)
+            if idx != -1:
+                fixed = dest[idx:]
+                if marker == '/usr/bin/':
+                    fixed = '/bin/' + dest[idx + len(marker):]
+                print(f"warning: MSYS2 path mangling detected ({dest!r}), "
+                      f"using {fixed!r}. Pass dest without leading slash "
+                      f"(e.g. 'bin/vwm') to avoid this.")
+                dest = fixed
+                break
+        else:
+            print(f"error: dest path {dest!r} looks like a mangled Windows "
+                  f"path (MSYS2). Pass it without leading slash, e.g. 'bin/vwm'.")
+            sys.exit(1)
+
     img = Fat32Image(disk_path)
     try:
         if source == '--mkdir':
