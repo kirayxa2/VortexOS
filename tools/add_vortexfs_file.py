@@ -149,12 +149,14 @@ class VortexFSImage:
         typ, size, blocks = struct.unpack_from('<III', raw, 0)
         direct = list(struct.unpack_from('<' + 'I' * MAX_DIRECT, raw, 12))
         indirect = struct.unpack_from('<I', raw, 12 + MAX_DIRECT * 4)[0]
+        dbl_indirect = struct.unpack_from('<I', raw, 12 + MAX_DIRECT * 4 + 4)[0]
         return {
             'type': typ,
             'size': size,
             'blocks': blocks,
             'direct': direct,
             'indirect': indirect,
+            'dbl_indirect': dbl_indirect,
         }
 
     @staticmethod
@@ -163,7 +165,8 @@ class VortexFSImage:
         raw = struct.pack('<III', ino_dict['type'], ino_dict['size'], ino_dict['blocks'])
         raw += struct.pack('<' + 'I' * MAX_DIRECT, *ino_dict['direct'])
         raw += struct.pack('<I', ino_dict['indirect'])
-        raw += struct.pack('<II', 0, 0)  # _pad[2]
+        raw += struct.pack('<I', ino_dict.get('dbl_indirect', 0))
+        raw += struct.pack('<I', 0)  # _pad
         assert len(raw) == INODE_SIZE
         return raw
 
@@ -187,27 +190,71 @@ class VortexFSImage:
     def _inode_get_blk(self, ino_dict, idx):
         if idx < MAX_DIRECT:
             return ino_dict['direct'][idx]
-        ii = idx - MAX_DIRECT
-        if ino_dict['indirect'] == 0 or ii >= 128:
+        off = idx - MAX_DIRECT
+
+        # Single indirect (128 pointers)
+        if off < 128:
+            if ino_dict['indirect'] == 0:
+                return 0
+            ibuf = self._blk_read(ino_dict['indirect'])
+            return struct.unpack_from('<I', ibuf, off * 4)[0]
+
+        # Double indirect (128 × 128 pointers)
+        off -= 128
+        dbl = ino_dict.get('dbl_indirect', 0)
+        if dbl == 0 or off >= 128 * 128:
             return 0
-        ibuf = self._blk_read(ino_dict['indirect'])
-        return struct.unpack_from('<I', ibuf, ii * 4)[0]
+        d1 = self._blk_read(dbl)
+        slot = off // 128
+        ptr = struct.unpack_from('<I', d1, slot * 4)[0]
+        if ptr == 0:
+            return 0
+        d2 = self._blk_read(ptr)
+        return struct.unpack_from('<I', d2, (off % 128) * 4)[0]
 
     def _inode_set_blk(self, ino_dict, idx, blk):
         if idx < MAX_DIRECT:
             ino_dict['direct'][idx] = blk
             return 0
-        ii = idx - MAX_DIRECT
-        if ii >= 128:
+        off = idx - MAX_DIRECT
+
+        # Single indirect
+        if off < 128:
+            if ino_dict['indirect'] == 0:
+                ib = self._blk_alloc()
+                if ib < 0:
+                    return -1
+                ino_dict['indirect'] = ib
+            ibuf = self._blk_read(ino_dict['indirect'])
+            struct.pack_into('<I', ibuf, off * 4, blk)
+            self._blk_write(ino_dict['indirect'], ibuf)
+            return 0
+
+        # Double indirect
+        off -= 128
+        if off >= 128 * 128:
             return -1
-        if ino_dict['indirect'] == 0:
-            ib = self._blk_alloc()
-            if ib < 0:
+
+        if ino_dict.get('dbl_indirect', 0) == 0:
+            db = self._blk_alloc()
+            if db < 0:
                 return -1
-            ino_dict['indirect'] = ib
-        ibuf = self._blk_read(ino_dict['indirect'])
-        struct.pack_into('<I', ibuf, ii * 4, blk)
-        self._blk_write(ino_dict['indirect'], ibuf)
+            ino_dict['dbl_indirect'] = db
+
+        d1 = self._blk_read(ino_dict['dbl_indirect'])
+        slot = off // 128
+        ptr = struct.unpack_from('<I', d1, slot * 4)[0]
+        if ptr == 0:
+            sb = self._blk_alloc()
+            if sb < 0:
+                return -1
+            struct.pack_into('<I', d1, slot * 4, sb)
+            self._blk_write(ino_dict['dbl_indirect'], d1)
+            ptr = sb
+
+        d2 = self._blk_read(ptr)
+        struct.pack_into('<I', d2, (off % 128) * 4, blk)
+        self._blk_write(ptr, d2)
         return 0
 
     # --- Directory operations ---------------------------------------------
@@ -299,6 +346,7 @@ class VortexFSImage:
             'blocks': 0,
             'direct': [0] * MAX_DIRECT,
             'indirect': 0,
+            'dbl_indirect': 0,
         }
         self._ino_write(ino, self._pack_inode(new_inode))
 
@@ -345,6 +393,7 @@ class VortexFSImage:
             'blocks': 0,
             'direct': [0] * MAX_DIRECT,
             'indirect': 0,
+            'dbl_indirect': 0,
         }
 
         # Write data blocks
