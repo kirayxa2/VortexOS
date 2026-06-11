@@ -88,7 +88,7 @@ C_OBJS   := $(patsubst %.c,   build/%.o, $(C_SRCS))
 ALL_OBJS := $(ASM_OBJS) $(C_OBJS)
 
 # --- Цели --------------------------------------------------------------------
-.PHONY: all clean run run-std run-gpu iso disk disk-clean vortexfs-disk vortexfs-disk-clean userspace disk-with-apps vortexfs-with-apps
+.PHONY: all clean run run-std run-gpu run-gpu-whpx iso disk disk-clean vortexfs-disk vortexfs-disk-clean userspace disk-with-apps vortexfs-with-apps
 
 all: build/kernel.bin
 	@echo "=== Build OK: build/kernel.bin ==="
@@ -176,20 +176,33 @@ run-std: iso vortexfs-disk
 	    -serial stdio                \
 	    -display sdl                 \
 	    -machine pc                  \
-	    -accel whpx,kernel-irqchip=off \
-	    -accel tcg                   \
 	    -boot order=d                \
 	    -drive file=build/vortexfs.img,format=raw,if=ide,index=0 \
 	    -no-reboot                   \
 	    -no-shutdown
 
 ## Запуск с virtio-gpu (аппаратный present без разрывов).
-## -accel whpx,...: аппаратная виртуализация Windows (Hyper-V Platform) вместо
-## полной эмуляции CPU (TCG). Без неё гость в 10-30 раз медленнее, и кадр
-## компоновки большого окна не влезает в 10 мс => дёрганый drag. Если WHPX
-## недоступен (не включена «Платформа гипервизора Windows»), QEMU сам
-## откатится на tcg (второй -accel) и напишет warning в консоль.
+## ВНИМАНИЕ: НЕ добавлять сюда -accel whpx! Проверено 2026-06-11: под WHPX
+## (kernel-irqchip=off) у гостя умирает доставка legacy-IRQ (PIT/PS2/ATA через
+## PIC) => мышь/часы/vpanel мертвы, хотя первый кадр vwm рисуется. Для
+## экспериментов есть отдельный target run-gpu-whpx.
 run-gpu: iso vortexfs-disk
+	$(QEMU)                          \
+	    -cdrom build/vortex.iso      \
+	    -m 256M                      \
+	    -serial stdio                \
+	    -display sdl                 \
+	    -machine pc                  \
+	    -vga virtio                  \
+	    -boot order=d                \
+	    -drive file=build/vortexfs.img,format=raw,if=ide,index=0 \
+	    -no-reboot                   \
+	    -no-shutdown
+
+## ЭКСПЕРИМЕНТ: virtio-gpu + аппаратная виртуализация WHPX. Быстрее в разы,
+## но 2026-06-11 на машине Джона под WHPX зависала доставка legacy-IRQ
+## (мышь/PIT/ATA). Не использовать как дефолт, пока не разберёмся.
+run-gpu-whpx: iso vortexfs-disk
 	$(QEMU)                          \
 	    -cdrom build/vortex.iso      \
 	    -m 256M                      \
