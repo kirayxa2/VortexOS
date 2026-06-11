@@ -126,10 +126,29 @@ static void blend_px(int x, int y, uint32_t argb) {
     uint32_t b = (fbl * a + bbl * (255 - a)) / 255;
     *p = 0xFF000000u | (r << 16) | (g << 8) | b;
 }
+/* 64-битный копировщик строк пикселей (без UB по strict aliasing). */
+typedef uint64_t __attribute__((may_alias)) u64a_t;
+static inline void copy_px_row(uint32_t *d, const uint32_t *s, int n) {
+    while (n >= 2) {
+        *(u64a_t *)d = *(const u64a_t *)s;
+        d += 2; s += 2; n -= 2;
+    }
+    if (n > 0) *d = *s;
+}
+
+/* ОПТИМИЗАЦИЯ: клип один раз и заливка строками вместо put_px с проверкой
+ * границ на КАЖДЫЙ пиксель — заливка фона была заметной статьёй расходов
+ * кадра при drag/resize. */
 static void fill_rect(int x, int y, int w, int h, uint32_t c) {
-    for (int j = 0; j < h; j++)
-        for (int i = 0; i < w; i++)
-            put_px(x + i, y + j, c);
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (int)fbw) w = (int)fbw - x;
+    if (y + h > (int)fbh) h = (int)fbh - y;
+    if (w <= 0 || h <= 0) return;
+    for (int j = 0; j < h; j++) {
+        uint32_t *row = &bb[(uint32_t)(y + j) * fbw + x];
+        for (int i = 0; i < w; i++) row[i] = c;
+    }
 }
 static void fill_circle(int cx, int cy, int r, uint32_t c) {
     for (int dy = -r; dy <= r; dy++)
@@ -179,7 +198,7 @@ static void blit_buffer(int dx, int dy, int w, int h, const uint32_t *src) {
         if (ww <= 0) continue;
         uint32_t       *d = &bb[(uint32_t)y * fbw + x0];
         const uint32_t *s = &src[(uint32_t)row * w + sx0];
-        for (int i = 0; i < ww; i++) d[i] = s[i];
+        copy_px_row(d, s, ww);
     }
 }
 
@@ -216,7 +235,7 @@ static void blit_to_front(int x, int y, int w, int h) {
         if (ww <= 0) continue;
         uint32_t       *d = &fb[(uint32_t)yy * fb_stride + x0];
         const uint32_t *s = &bb[(uint32_t)yy * fbw + x0];
-        for (int i = 0; i < ww; i++) d[i] = s[i];
+        copy_px_row(d, s, ww);
     }
 }
 static void present(void) {
@@ -623,34 +642,73 @@ static int isqrt32(int v) {
     while ((r + 1) * (r + 1) <= v) r++;
     return r;
 }
+/* ОПТИМИЗАЦИЯ (FPS при drag): тень считается ТОЛЬКО по внешним полосам и
+ * 4 угловым выемкам, альфа — из таблицы по d2 (вместо isqrt на пиксель).
+ * Раньше цикл шёл по всей площади окна+тени (для окна 720x432 это ~380k
+ * итераций на КАЖДЫЙ кадр перетаскивания); теперь трогаем только ~25k
+ * пикселей собственно тени. Визуально результат идентичен. */
+static uint8_t shadow_alut[WIN_SHADOW * WIN_SHADOW];   /* d2 -> alpha */
+static void shadow_lut_init(void) {
+    for (int d2 = 0; d2 < WIN_SHADOW * WIN_SHADOW; d2++) {
+        int a = 78 * (WIN_SHADOW - isqrt32(d2)) / WIN_SHADOW;
+        shadow_alut[d2] = (uint8_t)(a > 0 ? a : 0);
+    }
+}
 static void win_draw_shadow(int wx, int wy, int ww, int wh) {
     const int S = WIN_SHADOW, oy = WIN_SHADOW_OY;
     int x0 = wx - S, y0 = wy - S + oy;
     int x1 = wx + ww + S, y1 = wy + wh + S + oy;
     const int r = WIN_CORNER;
+
+    /* 1) внешние полосы: верх/низ — во всю ширину, бока — между ними */
     for (int y = y0; y < y1; y++) {
-        for (int x = x0; x < x1; x++) {
-            if (x >= wx && x < wx + ww && y >= wy && y < wy + wh) {
-                int lx = x - wx, ly = y - wy, cx = -1, cy = -1;
-                if      (lx < r       && ly < r)       { cx = r;      cy = r;      }
-                else if (lx >= ww - r && ly < r)       { cx = ww - r; cy = r;      }
-                else if (lx < r       && ly >= wh - r) { cx = r;      cy = wh - r; }
-                else if (lx >= ww - r && ly >= wh - r) { cx = ww - r; cy = wh - r; }
-                if (cx < 0) continue;
-                int ddx = lx - cx, ddy = ly - cy;
-                if (ddx * ddx + ddy * ddy <= r * r) continue;
+        int dy = 0;
+        if (y < wy)            dy = wy - y;
+        else if (y >= wy + wh) dy = y - (wy + wh) + 1;
+
+        if (dy == 0) {
+            /* строка на уровне окна: тень только слева и справа */
+            for (int x = x0; x < wx; x++) {
+                int dx = wx - x;
+                if (dx * dx >= S * S) continue;
+                int a = shadow_alut[dx * dx];
+                if (a) blend_px(x, y, (uint32_t)a << 24);
             }
-            int dx = 0, dy = 0;
+            for (int x = wx + ww; x < x1; x++) {
+                int dx = x - (wx + ww) + 1;
+                if (dx * dx >= S * S) continue;
+                int a = shadow_alut[dx * dx];
+                if (a) blend_px(x, y, (uint32_t)a << 24);
+            }
+            continue;
+        }
+        if (dy * dy >= S * S) continue;
+        for (int x = x0; x < x1; x++) {
+            int dx = 0;
             if (x < wx)            dx = wx - x;
             else if (x >= wx + ww) dx = x - (wx + ww) + 1;
-            if (y < wy)            dy = wy - y;
-            else if (y >= wy + wh) dy = y - (wy + wh) + 1;
             int d2 = dx * dx + dy * dy;
             if (d2 >= S * S) continue;
-            int a = 78 * (S - isqrt32(d2)) / S;
-            if (a <= 0) continue;
-            blend_px(x, y, (uint32_t)a << 24);
+            int a = shadow_alut[d2];
+            if (a) blend_px(x, y, (uint32_t)a << 24);
         }
+    }
+
+    /* 2) угловые выемки ВНУТРИ окна (за скруглением) — ровная тень a=78;
+     * поверх неё потом ложится AA-скругление титлбара/низа */
+    const uint32_t ca = (uint32_t)shadow_alut[0] << 24;
+    for (int k = 0; k < 4; k++) {
+        int bx = (k & 1) ? ww - r : 0;
+        int by = (k & 2) ? wh - r : 0;
+        int cx = (k & 1) ? ww - r : r;
+        int cy = (k & 2) ? wh - r : r;
+        for (int j = 0; j < r; j++)
+            for (int i = 0; i < r; i++) {
+                int lx = bx + i, ly = by + j;
+                int ddx = lx - cx, ddy = ly - cy;
+                if (ddx * ddx + ddy * ddy <= r * r) continue;
+                blend_px(wx + lx, wy + ly, ca);
+            }
     }
 }
 static int circ_cov(int px, int py, int cx, int cy, int r) {
@@ -1056,13 +1114,20 @@ static void on_mouse_move(int dx, int dy) {
                     nh = VWM_MAX_PIXELS / nw;
             }
             if (nw != win->w || nh != win->h || nx != win->x || ny != win->y) {
+                /* ОПТИМИЗАЦИЯ: чистка поверхности + EV_RESIZE только если
+                 * реально изменился РАЗМЕР. Раньше любое движение мыши при
+                 * ресайзе (даже чисто по позиции) заливало весь буфер окна
+                 * и дёргало клиента. */
+                int resized = (nw != win->w || nh != win->h);
                 win->x = nx; win->y = ny; win->w = nw; win->h = nh;
-                /* чистим поверхность под новый stride и просим клиента
-                 * перерисоваться (EV_RESIZE) */
-                int total = nw * nh;
-                for (int j = 0; j < total; j++) win->pixels[j] = 0xFF2A2A3E;
-                send_event(win->owner_pid, VWM_EV_RESIZE, win->id,
-                           (uint64_t)nw, (uint64_t)nh);
+                if (resized) {
+                    /* чистим поверхность под новый stride и просим клиента
+                     * перерисоваться (EV_RESIZE) */
+                    int total = nw * nh;
+                    for (int j = 0; j < total; j++) win->pixels[j] = 0xFF2A2A3E;
+                    send_event(win->owner_pid, VWM_EV_RESIZE, win->id,
+                               (uint64_t)nw, (uint64_t)nh);
+                }
                 needs_redraw = 1;
             }
         }
@@ -1349,6 +1414,7 @@ void _start(void) {
     }
 
     /* 3. Становимся WM: сервис + весь ввод наш */
+    shadow_lut_init();
     vos_svc_register(VOS_SVC_WM);
     vos_input_grab();
 
@@ -1371,8 +1437,12 @@ void _start(void) {
             handle_msg(&m);
             got = (int)vos_ipc_recv(&m, VOS_IPC_NOWAIT);  /* выгребаем всё */
         }
+        /* Во время drag/resize рисуем каждый тик (до ~100 FPS): кадр после
+         * оптимизаций дешёвый, а плавность перетаскивания решает. В покое —
+         * раз в 2 тика, как раньше. */
         uint64_t now = vos_uptime();
-        if (now - last_frame >= 2) {
+        uint64_t interval = (drag.active || rz.active) ? 1 : 2;
+        if (now - last_frame >= interval) {
             tick_render();
             last_frame = now;
         }

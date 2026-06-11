@@ -43,7 +43,12 @@ static void queue_remove(task_t *t) {
 
 static task_t *pick_next(void) {
     if (!run_queue) return 0;
-    task_t *start = current ? current->next : run_queue;
+    /* БАГФИКС (зависание при закрытии окна): task_exit() снимает текущую
+     * задачу с очереди, и queue_remove обнуляет её ->next. Старт обхода с
+     * current->next тогда разыменовывал NULL прямо в IRQ → page fault ядра →
+     * вся машина висла намертво при первом же exit процесса. Если текущая
+     * задача больше не в кольце — начинаем обход с головы очереди. */
+    task_t *start = (current && current->next) ? current->next : run_queue;
     /* Проход 1: предпочитаем ЛЮБУЮ готовую задачу, кроме idle. idle — это
      * настоящий fallback (бесконечный hlt), он НЕ должен воровать кванты у
      * реальной работы (рендер/док). Раньше idle крутился в round-robin как
@@ -75,16 +80,28 @@ void sched_init(void) {
 }
 
 task_t *task_create(const char *name, void (*entry)(void), uint8_t priority) {
-    if (task_count >= MAX_TASKS) return 0;
     if (priority < 1)  priority = 1;
     if (priority > 10) priority = 10;
 
-    task_t *t = &tasks[task_count++];
+    /* Сначала пробуем ПЕРЕИСПОЛЬЗОВАТЬ слот мёртвой задачи (она снята с
+     * очереди и никогда больше не получит CPU — слот и её kernel-стек
+     * свободны). Иначе после ~сотни запусков/закрытий приложений tasks[]
+     * кончался и spawn молча отказывал. kfree для стека не годится:
+     * kmalloc_aligned возвращает смещённый указатель — стек просто
+     * переиспользуем вместе со слотом. */
+    task_t *t = 0;
+    for (uint32_t i = 0; i < task_count; i++)
+        if (tasks[i].state == TASK_DEAD) { t = &tasks[i]; break; }
+    if (!t) {
+        if (task_count >= MAX_TASKS) return 0;
+        t = &tasks[task_count++];
+    }
     t->pid      = next_pid++;
     t->state    = TASK_READY;
     t->priority = priority;
     t->ticks    = priority;
     t->next     = 0;
+    t->userdata = 0;   /* в переиспользованном слоте мог остаться мусор */
     /* По умолчанию задача живёт в kernel-пространстве. usermode-задача
      * перезапишет это своим user-pml4 (см. userspace_elf_loader_task). */
     t->pml4     = (void *)vmm_kernel_pml4;
@@ -93,9 +110,11 @@ task_t *task_create(const char *name, void (*entry)(void), uint8_t priority) {
     while (name[i] && i < 31) { t->name[i] = name[i]; i++; }
     t->name[i] = 0;
 
-    /* Kernel stack — выровнен на 32768 как в VortexOS */
-    t->stack = (uint8_t *)kmalloc_aligned(TASK_STACK_SIZE, TASK_STACK_SIZE);
-    if (!t->stack) return 0;
+    /* Kernel stack — выровнен на 32768 как в VortexOS. У переиспользованного
+     * слота стек уже есть — берём его же (владелец мёртв и снят с CPU). */
+    if (!t->stack)
+        t->stack = (uint8_t *)kmalloc_aligned(TASK_STACK_SIZE, TASK_STACK_SIZE);
+    if (!t->stack) { t->state = TASK_DEAD; return 0; }
 
     /*
      * Строим фрейм точно как VortexOS kernel thread в process_create():
@@ -136,8 +155,18 @@ task_t *task_create(const char *name, void (*entry)(void), uint8_t priority) {
     return t;
 }
 
+/* Жива ли задача с таким pid (для IPC: не создавать mailbox мертвецам). */
+int sched_pid_alive(uint32_t pid) {
+    if (!pid) return 0;
+    for (uint32_t i = 0; i < task_count; i++)
+        if (tasks[i].pid == pid && tasks[i].state != TASK_DEAD) return 1;
+    return 0;
+}
+
 void task_exit(void) {
+    extern void ipc_on_task_exit(uint32_t pid);
     __asm__ volatile("cli");
+    ipc_on_task_exit(current->pid);   /* mailbox, сервисы, input grab */
     current->state = TASK_DEAD;
     queue_remove(current);
     vos_need_resched = 1;

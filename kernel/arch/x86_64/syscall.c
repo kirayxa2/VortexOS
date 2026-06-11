@@ -259,11 +259,12 @@ static int user_vsync_enabled = 1;
 static uint64_t sys_vsync(void) {
     if (virtio_gpu_active() || !user_vsync_enabled) return 0;
     uint8_t v; uint32_t guard;
-    guard = 1000000;
-    do {
-        __asm__ volatile("inb $0x3DA, %0" : "=a"(v));
-    } while ((v & 0x08) && --guard);
-    if (!guard) { user_vsync_enabled = 0; return 0; }
+    /* ОПТИМИЗАЦИЯ (FPS при drag): если мы УЖЕ в vblank — рисуем сразу.
+     * Раньше ждали конец текущего vblank и потом начало следующего — это
+     * до целого кадра (~16 мс) простоя на КАЖДЫЙ present. При перетаскивании
+     * окна это резало частоту кадров примерно вдвое. */
+    __asm__ volatile("inb $0x3DA, %0" : "=a"(v));
+    if (v & 0x08) return 0;
     guard = 1000000;
     do {
         __asm__ volatile("inb $0x3DA, %0" : "=a"(v));

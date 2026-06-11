@@ -35,6 +35,7 @@ void    sched_clear_resched(void);
 task_t *task_create(const char *name, void (*entry)(void), uint8_t priority);
 void    task_exit(void);
 task_t *sched_current(void);
+int     sched_pid_alive(uint32_t pid);
 uint64_t sched_pick(uint64_t frame_rsp);
 
 extern int vos_need_resched;

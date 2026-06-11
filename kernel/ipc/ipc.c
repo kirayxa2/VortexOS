@@ -91,6 +91,9 @@ static uint64_t *mailbox_push(ipc_mailbox_t *mb, const uint64_t *msg, uint32_t s
  * ---------------------------------------------------------------------- */
 uint64_t ipc_sys_send(uint64_t dst_pid, uint64_t user_msg) {
     if (!user_msg) return (uint64_t)-1;
+    /* Мёртвым/несуществующим pid mailbox не создаём: иначе каждое сообщение
+     * умершему клиенту (close, события) навсегда занимало слот mailbox'а. */
+    if (!sched_pid_alive((uint32_t)dst_pid)) return (uint64_t)-1;
     task_t *self = sched_current();
     uint32_t sender = self ? self->pid : 0;
 
@@ -164,6 +167,28 @@ void ipc_tick(void) {
             mb->waiter = 0;
             mb->wait_deadline = 0;
         }
+    }
+}
+
+/* Задача умерла (task_exit, прерывания уже выключены): освобождаем её
+ * mailbox, сервисы и input grab. Без этого каждый запуск/закрытие приложения
+ * навсегда съедал слот mailbox'а (32 циклов открыл-закрыл терминал — и IPC
+ * мёртв), а сервис/grab продолжали указывать на труп. */
+void ipc_on_task_exit(uint32_t pid) {
+    if (!pid) return;
+    for (int i = 0; i < MAX_MAILBOXES; i++) {
+        if (mailboxes[i].owner_pid == pid) {
+            mailboxes[i].owner_pid = 0;
+            mailboxes[i].head = mailboxes[i].tail = 0;
+            mailboxes[i].waiter = 0;
+            mailboxes[i].wait_deadline = 0;
+        }
+    }
+    for (int i = 0; i < IPC_SVC_MAX; i++)
+        if (svc_table[i] == pid) svc_table[i] = 0;
+    if (input_grabber_pid == pid) {
+        input_grabber_pid = 0;
+        input_grabber_mb  = 0;
     }
 }
 
