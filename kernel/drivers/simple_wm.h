@@ -56,4 +56,9 @@ int wm_active_window_count(void);
  * один раз на каждый клик; зовётся из kmain dock_launcher_task. */
 int wm_dock_consume_launch(void);
 
+/* Забрать путь ELF для запуска (dock ИЛИ двойной клик по иконке рабочего
+ * стола). Возвращает путь один раз на запрос, иначе 0. Зовётся из kmain
+ * dock_launcher_task. Путь имеет статическое время жизни. */
+const char *wm_consume_launch_path(void);
+
 #endif

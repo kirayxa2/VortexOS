@@ -373,18 +373,19 @@ void userspace_hello_task(void) {
  * kmalloc/планировщик безопасны. wm_handle_mouse_button лишь ставит флаг,
  * который мы здесь забираем через wm_dock_consume_launch(). */
 void dock_launcher_task(void) {
-    extern int wm_dock_consume_launch(void);
+    extern const char *wm_consume_launch_path(void);
     for (;;) {
         /* Проверка запроса и засыпание — под cli, чтобы клик по доку (mouse IRQ)
          * не проскочил между проверкой и блокировкой (lost-wakeup). */
         __asm__ volatile("cli");
-        if (wm_dock_consume_launch()) {
+        const char *path = wm_consume_launch_path();
+        if (path) {
             __asm__ volatile("sti");
-            vfs_node_t *vsh = vfs_open("/vsh", 0);
-            if (vsh) {
-                vfs_close(vsh);
-                task_t *t = task_create("vsh", userspace_elf_loader_task, 10);
-                if (t) t->userdata = (void *)"/vsh";
+            vfs_node_t *app = vfs_open(path, 0);
+            if (app) {
+                vfs_close(app);
+                task_t *t = task_create("app", userspace_elf_loader_task, 10);
+                if (t) t->userdata = (void *)path;  /* литерал — живёт вечно */
             }
             continue;
         }

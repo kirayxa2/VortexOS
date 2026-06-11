@@ -116,11 +116,22 @@ static void wm_render_region(int rx, int ry, int rw, int rh);
 #define DOCK_NITEMS   1           /* пока только терминал */
 
 static volatile int g_dock_launch_request = 0; /* mouse IRQ ставит, kmain-задача забирает */
+static const char *g_launch_path = 0;          /* какой ELF запустить по запросу */
 static task_t *g_dock_task = 0;                /* задача дока — её будим по клику */
 
 /* Регистрируется из kmain после task_create("dock", ...). Нужна, чтобы клик по
  * иконке дока мог разбудить заснувшую (block, don't poll) задачу-лаунчер. */
 void wm_set_dock_task(task_t *t) { g_dock_task = t; }
+
+/* Запрос на запуск ELF по пути path (вызывается из обработчика клика — IRQ
+ * мыши). Сам запуск делает задача-лаунчер в kmain (где kmalloc/планировщик
+ * безопасны). path должен указывать на строку со статическим временем жизни
+ * (строковые литералы из g_desk_icons / "/vsh"). */
+static void wm_request_launch(const char *path) {
+    g_launch_path = path;
+    g_dock_launch_request = 1;
+    if (g_dock_task) sched_wake(g_dock_task);  /* block, don't poll */
+}
 static int g_dock_hover   = -1;   /* индекс иконки под курсором, -1 если нет */
 static int g_dock_pressed = 0;    /* нажата ли иконка под курсором */
 static volatile int g_dock_dirty = 0; /* нужно перерисовать только область дока */
@@ -244,6 +255,128 @@ static void wm_draw_dock(void) {
 }
 
 /* =========================================================================
+ * Иконки рабочего стола (desktop icons, в стиле Windows)
+ *  Колонка иконок в левом-верхнем углу прямо на обоях. Рисуются ПОД окнами
+ *  (после фона, до окон). Одиночный клик — выделение, двойной — запуск
+ *  соответствующего приложения (тот же механизм запроса, что и у dock).
+ * ======================================================================= */
+#define DESK_ICON      48           /* размер плитки иконки (px) */
+#define DESK_CELL_W    80           /* ширина ячейки (иконка + подпись) */
+#define DESK_CELL_H    84           /* высота ячейки */
+#define DESK_X0        12           /* левый отступ колонки */
+#define DESK_Y0        36           /* верх первой ячейки (под панелью 24 + 12) */
+#define DESK_BG        0xFF1A1A2Eu  /* цвет обоев (см. comp_clear) */
+#define DESK_SEL_BG    0xFF273458u  /* фон выделенной ячейки (предсмешан с синим) */
+
+typedef struct { const char *path; const char *label; int kind; } desk_icon_t;
+
+/* Таблица иконок. path — ELF в FAT32 (см. Makefile disk-with-apps),
+ * kind — какой рисунок (0=терминал, 1=графика, 2=окно). Здесь только
+ * приложения, создающие окно через WM (чисто компонуются). /vgraph рисует
+ * fullscreen прямо в framebuffer (мимо компоновщика) — поэтому пока не в доке. */
+static const desk_icon_t g_desk_icons[] = {
+    { "/vsh",     "Terminal", 0 },
+    { "/testwin", "Window",   2 },
+};
+#define DESK_NICONS ((int)(sizeof(g_desk_icons) / sizeof(g_desk_icons[0])))
+
+static int g_desk_selected = -1;             /* индекс выделенной иконки, -1 нет */
+static uint64_t g_desk_last_click_tick = 0;  /* для детекта двойного клика */
+static int g_desk_last_click_idx = -1;
+
+/* Геометрия ячейки idx: левый-верхний угол. */
+static void desk_cell_rect(int idx, int *cx, int *cy) {
+    *cx = DESK_X0;
+    *cy = DESK_Y0 + idx * DESK_CELL_H;
+}
+
+/* В какую иконку (ячейку) попадает точка? -1 если мимо. */
+static int desk_icon_hit(int mx, int my) {
+    for (int k = 0; k < DESK_NICONS; k++) {
+        int cx, cy; desk_cell_rect(k, &cx, &cy);
+        if (mx >= cx && mx < cx + DESK_CELL_W && my >= cy && my < cy + DESK_CELL_H)
+            return k;
+    }
+    return -1;
+}
+
+/* Рисунок плитки по kind в back buffer. */
+static void desk_draw_tile(int kind, int x, int y, int s) {
+    if (kind == 0) {
+        /* Терминал: тёмная плитка + зелёный промпт «>» + курсор-блок. */
+        dock_fill_round(x, y, s, s, 10, 0xFF16161F, 255);
+        uint32_t green = 0xFF3BE06F;
+        int px = x + 11, py = y + 16;
+        for (int t = 0; t < 2; t++) {
+            comp_draw_line(px,     py + t,     px + 8, py + 8 + t,  green);
+            comp_draw_line(px + 8, py + 8 + t, px,     py + 16 + t, green);
+        }
+        comp_fill_rect(x + 24, py + 12, 12, 4, green);
+    } else if (kind == 1) {
+        /* Графика: «картинка» — небо, солнце, две горы. */
+        dock_fill_round(x, y, s, s, 10, 0xFF1E5FA8, 255);
+        comp_fill_circle(x + 34, y + 15, 6, 0xFFFFE066);     /* солнце */
+        for (int r = 0; r < 16; r++)                          /* большая гора */
+            comp_fill_rect(x + 16 - r, y + 40 - r, r * 2 + 1, 1, 0xFF3FA34D);
+        for (int r = 0; r < 11; r++)                          /* малая гора */
+            comp_fill_rect(x + 32 - r, y + 40 - r, r * 2 + 1, 1, 0xFF2E8B57);
+    } else {
+        /* Окно: светлая плитка + миниатюра окна с синим title bar. */
+        dock_fill_round(x, y, s, s, 10, 0xFFEAEAF0, 255);
+        comp_fill_rect(x + 8,  y + 10, 32, 28, 0xFFFFFFFF);   /* тело окна */
+        comp_fill_rect(x + 8,  y + 10, 32, 7,  0xFF3D6FB5);   /* title bar */
+        comp_fill_rect(x + 12, y + 22, 24, 2,  0xFFB8C2D0);   /* строки контента */
+        comp_fill_rect(x + 12, y + 27, 24, 2,  0xFFB8C2D0);
+        comp_fill_rect(x + 12, y + 32, 16, 2,  0xFFB8C2D0);
+    }
+}
+
+/* Рисует одну иконку (плитка + подпись + выделение). */
+static void desk_draw_one(int idx) {
+    int cx, cy; desk_cell_rect(idx, &cx, &cy);
+    int selected = (g_desk_selected == idx);
+    uint32_t lbl_bg = DESK_BG;
+    if (selected) {
+        dock_fill_round(cx + 2, cy + 2, DESK_CELL_W - 4, DESK_CELL_H - 6, 8,
+                        DESK_SEL_BG, 255);
+        lbl_bg = DESK_SEL_BG;
+    }
+    int ix = cx + (DESK_CELL_W - DESK_ICON) / 2;
+    int iy = cy + 8;
+    desk_draw_tile(g_desk_icons[idx].kind, ix, iy, DESK_ICON);
+
+    /* Подпись по центру под плиткой (шрифт 8x16). */
+    const char *t = g_desk_icons[idx].label;
+    int len = 0; while (t[len]) len++;
+    int tx = cx + (DESK_CELL_W - len * 8) / 2;
+    int ty = iy + DESK_ICON + 6;
+    comp_draw_string(tx, ty, t, 0xFFE8E8F0, lbl_bg);
+}
+
+/* Рисует иконки рабочего стола, пересекающие прямоугольник (rx,ry,rw,rh).
+ * Для полного кадра передаётся весь экран. Примитивы сами клипуют к экрану. */
+static void wm_draw_desktop_icons(int rx, int ry, int rw, int rh) {
+    for (int k = 0; k < DESK_NICONS; k++) {
+        int cx, cy; desk_cell_rect(k, &cx, &cy);
+        if (rx >= cx + DESK_CELL_W || rx + rw <= cx ||
+            ry >= cy + DESK_CELL_H || ry + rh <= cy) continue;
+        desk_draw_one(k);
+    }
+}
+
+/* Есть ли видимое окно под точкой (чтобы клик по окну имел приоритет над
+ * иконкой рабочего стола, которая лежит под окнами). */
+static int point_over_window(int mx, int my) {
+    for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
+        wm_window_t *win = &windows[i];
+        if (win->id == 0 || !win->visible) continue;
+        if (mx >= win->x && mx < win->x + win->w &&
+            my >= win->y && my < win->y + win->h + TITLEBAR_H) return 1;
+    }
+    return 0;
+}
+
+/* =========================================================================
  * Верхняя панель (Hyprland-style top bar)
  *  Полоса вверху экрана: слева — логотип + заголовок активного окна,
  *  справа — часы HH:MM:SS. Рисуется в back buffer поверх сцены и окон.
@@ -354,6 +487,16 @@ int wm_active_window_count(void) {
 /* Забрать запрос на запуск терминала (зовётся из kmain dock_launcher_task). */
 int wm_dock_consume_launch(void) {
     if (g_dock_launch_request) { g_dock_launch_request = 0; return 1; }
+    return 0;
+}
+
+/* Забрать путь ELF для запуска (или 0, если запросов нет). Зовётся из kmain
+ * dock_launcher_task. Один запрос на каждый клик по dock/иконке рабочего стола. */
+const char *wm_consume_launch_path(void) {
+    if (g_dock_launch_request) {
+        g_dock_launch_request = 0;
+        return g_launch_path ? g_launch_path : "/vsh";
+    }
     return 0;
 }
 
@@ -848,7 +991,13 @@ void wm_render_all(void) {
 
     /* Используем compositor для отрисовки */
     comp_clear(0xFF1A1A2E);  // Dark background
-    
+
+    /* Иконки рабочего стола на обоях — ПОД окнами (фон уже залит). */
+    {
+        extern uint32_t fb_width, fb_height;
+        wm_draw_desktop_icons(0, 0, (int)fb_width, (int)fb_height);
+    }
+
     // Render all visible windows
     for (int i = 0; i < MAX_WINDOWS; i++) {
         wm_window_t *win = &windows[i];
@@ -936,6 +1085,9 @@ static void wm_render_region(int rx, int ry, int rw, int rh) {
 
     /* Фон только в регионе. */
     comp_fill_rect(rx, ry, rw, rh, 0xFF1A1A2E);
+
+    /* Иконки рабочего стола, задетые регионом — ПОД окнами (после фона). */
+    wm_draw_desktop_icons(rx, ry, rw, rh);
 
     /* Перерисовываем окна, задевающие регион (рисуем целиком — примитивы сами
      * клипуют к экрану; пиксели вне региона в back buffer и так корректны). */
@@ -1310,11 +1462,10 @@ void wm_handle_mouse_button(uint8_t buttons) {
             g_dock_pressed = 1;
             g_dock_dirty = 1;
             if (dh == 0 && wm_active_window_count() < MAX_WINDOWS) {
-                g_dock_launch_request = 1;
-                /* Будим заснувшую задачу-лаунчер дока (block, don't poll). Мы
-                 * уже в обработчике mouse IRQ (прерывания off) — флаг выставлен
+                /* Запрос на запуск терминала; задача-лаунчер заберёт путь.
+                 * Мы в обработчике mouse IRQ (прерывания off) — флаг выставлен
                  * до sched_wake, поэтому lost-wakeup невозможен. */
-                if (g_dock_task) sched_wake(g_dock_task);
+                wm_request_launch("/vsh");
             }
             return;  /* не таскаем окно под доком */
         }
@@ -1323,6 +1474,31 @@ void wm_handle_mouse_button(uint8_t buttons) {
         }
     } else {
         if (g_dock_pressed) { g_dock_pressed = 0; g_dock_dirty = 1; }
+    }
+
+    /* --- Иконки рабочего стола (лежат под окнами): обрабатываем клик только
+     * если под курсором НЕТ окна. Одиночный клик — выделение, двойной (тот же
+     * значок в пределах ~0.4 c) — запуск приложения. --- */
+    if (buttons & 1) {
+        int di = desk_icon_hit(mouse_x, mouse_y);
+        if (!point_over_window(mouse_x, mouse_y)) {
+            if (di >= 0) {
+                extern uint64_t pit_ticks(void);
+                uint64_t now = pit_ticks();   /* PIT = 100 Hz */
+                int dbl = (di == g_desk_last_click_idx &&
+                           (now - g_desk_last_click_tick) <= 40);
+                g_desk_last_click_idx  = di;
+                g_desk_last_click_tick = now;
+                if (g_desk_selected != di) { g_desk_selected = di; g_needs_redraw = 1; }
+                if (dbl && wm_active_window_count() < MAX_WINDOWS) {
+                    wm_request_launch(g_desk_icons[di].path);
+                    g_desk_last_click_idx = -1;  /* не запускать второй раз тройным кликом */
+                }
+                return;  /* клик по иконке — не таскаем/не фокусируем окна */
+            }
+            /* Клик по пустому рабочему столу — снимаем выделение. */
+            if (g_desk_selected != -1) { g_desk_selected = -1; g_needs_redraw = 1; }
+        }
     }
 
     /* --- Кнопки заголовка (закрыть/свернуть/развернуть) имеют приоритет над
