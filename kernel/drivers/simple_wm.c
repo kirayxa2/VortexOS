@@ -22,6 +22,15 @@ static uint32_t next_win_id = 1;
 #define BTN_R        5           /* радиус кнопки-светофора */
 #define BTN_GAP      16          /* шаг между кнопками */
 #define BTN_X0       14          /* центр первой кнопки от левого края окна */
+
+/* --- Изменение размера окна (resize как в Windows) --- */
+#define RESIZE_BORDER 6          /* ширина зоны захвата у края окна (px) */
+#define MIN_WIN_W    140         /* минимальная ширина содержимого окна */
+#define MIN_WIN_H    80          /* минимальная высота содержимого окна */
+#define RZ_LEFT      1
+#define RZ_RIGHT     2
+#define RZ_TOP       4
+#define RZ_BOTTOM    8
 static bool compositor_initialized = false;
 static uint64_t last_cursor_update = 0;
 
@@ -69,6 +78,16 @@ static struct {
     int32_t rendered_x; // Позиция окна, которая сейчас на экране (последний вывод)
     int32_t rendered_y;
 } drag_state = {0};
+
+/* Состояние изменения размера (тянем за край/угол окна, как в Windows). */
+static struct {
+    bool active;
+    uint64_t win_id;
+    int edge;            // битовая маска RZ_LEFT|RZ_RIGHT|RZ_TOP|RZ_BOTTOM
+    int32_t start_mx, start_my;          // позиция мыши в начале
+    int32_t start_x, start_y, start_w, start_h; // геометрия окна в начале
+    int32_t rendered_x, rendered_y, rendered_w, rendered_h; // что сейчас на экране
+} resize_state = {0};
 
 /* НЕ используем статические буферы - выделим через PMM при создании окна */
 static uint32_t *window_buffers[MAX_WINDOWS] = {0};
@@ -349,6 +368,8 @@ void wm_init(void) {
     last_cursor_update = 0;
     drag_state.dragging = false;
     drag_state.win_id = 0;
+    resize_state.active = false;
+    resize_state.win_id = 0;
 }
 
 static void ensure_compositor_init(void) {
@@ -418,8 +439,12 @@ uint64_t wm_create_window(const char *title, int32_t x, int32_t y, int32_t w, in
     // Найти индекс окна
     int win_index = win - windows;
     
-    // Вычислить размер в байтах и количество страниц
-    uint64_t buffer_size = (uint64_t)w * h * 4;  // 4 bytes per pixel (ARGB)
+    // Вычислить размер в байтах и количество страниц.
+    // ВАЖНО: маппим сразу под МАКСИМАЛЬНЫЙ размер окна (MAX_WINDOW_PIXELS), а не
+    // под начальный w*h. Иначе resize окна больше начального размера полез бы в
+    // НЕзамапленные страницы → #PF. Память резервируется в IRQ-безопасный момент
+    // (syscall создания окна), поэтому в обработчике мыши при resize аллокации нет.
+    uint64_t buffer_size = (uint64_t)MAX_WINDOW_PIXELS * 4;  // 4 bytes per pixel (ARGB)
     uint64_t num_pages = (buffer_size + PAGE_SIZE - 1) / PAGE_SIZE;
     
     // Вычислить виртуальный адрес для этого окна
@@ -467,9 +492,11 @@ void wm_destroy_window(uint64_t win_id) {
         if (windows[i].id == win_id) {
             wm_window_t *win = &windows[i];
             
-            // Освободить PMM страницы
+            // Освободить PMM страницы. Маппили под MAX_WINDOW_PIXELS (см.
+            // wm_create_window), поэтому и освобождаем под максимум, иначе при
+            // resized-окне (w*h < max) часть страниц утекла бы.
             if (window_buffers[i] != 0) {
-                uint64_t buffer_size = (uint64_t)win->w * win->h * 4;
+                uint64_t buffer_size = (uint64_t)MAX_WINDOW_PIXELS * 4;
                 uint64_t num_pages = (buffer_size + PAGE_SIZE - 1) / PAGE_SIZE;
                 uint64_t vaddr = (uint64_t)window_buffers[i];
                 
@@ -685,6 +712,43 @@ static int win_button_hit(const wm_window_t *win, int mx, int my) {
         if (dx * dx + dy * dy <= (BTN_R + 2) * (BTN_R + 2)) return k;
     }
     return -1;
+}
+
+/* Возвращает маску краёв (RZ_*), за которые можно тянуть resize, если курсор
+ * в зоне захвата у границы окна (учитывая title bar). 0 — не у края.
+ * Внешний прямоугольник окна: (x, y, w, h + TITLEBAR_H). Зона захвата шириной
+ * RESIZE_BORDER расположена симметрично по обе стороны границы. */
+static int resize_edge_hit(const wm_window_t *win, int mx, int my) {
+    int ox = win->x, oy = win->y;
+    int ow = win->w, oh = win->h + TITLEBAR_H;
+    int rb = RESIZE_BORDER;
+    /* Курсор должен быть в пределах окна, расширенного на зону захвата. */
+    if (mx < ox - rb || mx > ox + ow + rb) return 0;
+    if (my < oy - rb || my > oy + oh + rb) return 0;
+    int edge = 0;
+    if (mx >= ox - rb && mx <= ox + rb)            edge |= RZ_LEFT;
+    if (mx >= ox + ow - rb && mx <= ox + ow + rb)  edge |= RZ_RIGHT;
+    if (my >= oy - rb && my <= oy + rb)            edge |= RZ_TOP;
+    if (my >= oy + oh - rb && my <= oy + oh + rb)  edge |= RZ_BOTTOM;
+    return edge;
+}
+
+/* Кладёт в очередь окна событие изменения размера, чтобы resize-aware
+ * приложение перерисовало содержимое под новый размер.
+ * Формат (как wm_event_t, 8 x uint32):
+ *   слово[0] = type (5 = resize)
+ *   слово[1] = новая ширина содержимого
+ *   слово[2] = новая высота содержимого */
+static void wm_enqueue_resize(wm_window_t *win) {
+    uint32_t next = (win->event_tail + 1) % MAX_WM_EVENTS;
+    if (next == win->event_head) return;   /* очередь полна — пропускаем */
+    uint32_t *slot = &win->events[win->event_tail * 8];
+    for (int i = 0; i < 8; i++) slot[i] = 0;
+    slot[0] = 5;                  /* type = resize */
+    slot[1] = (uint32_t)win->w;
+    slot[2] = (uint32_t)win->h;
+    win->event_tail = next;
+    if (win->waiter) { sched_wake((task_t *)win->waiter); win->waiter = 0; }
 }
 
 /* AA-рамка со скруглёнными углами: прямые стороны + 4 дуги-обводки по той же
@@ -961,6 +1025,29 @@ void wm_tick_render(void) {
         g_needs_redraw = 0;
         g_panel_dirty = 0; /* полный рендер всё равно перерисует панель */
         g_dock_dirty = 0;  /* полный/drag-рендер всё равно перерисует dock */
+        /* Изменение размера — частичная перерисовка объединения старого и
+         * нового прямоугольника окна (позиция И размер могли поменяться). */
+        if (resize_state.active) {
+            wm_window_t *win = find_window(resize_state.win_id);
+            if (win) {
+                int ox = resize_state.rendered_x, oy = resize_state.rendered_y;
+                int ow = resize_state.rendered_w, oh = resize_state.rendered_h + TITLEBAR_H;
+                int nx = win->x, ny = win->y;
+                int nw = win->w, nh = win->h + TITLEBAR_H;
+                int minx = imin(ox, nx);
+                int miny = imin(oy, ny);
+                int maxx = imax(ox + ow, nx + nw);
+                int maxy = imax(oy + oh, ny + nh);
+                int m = WIN_MARGIN;
+                wm_render_region(minx - m, miny - m,
+                                 (maxx - minx) + 2 * m, (maxy - miny) + 2 * m);
+                resize_state.rendered_x = nx;
+                resize_state.rendered_y = ny;
+                resize_state.rendered_w = win->w;
+                resize_state.rendered_h = win->h;
+                return;
+            }
+        }
         /* Перетаскивание окна — частичная перерисовка только объединения
          * старого и нового положения окна (как делают настоящие композиторы),
          * вместо полного clear+flip всего экрана. */
@@ -1113,7 +1200,60 @@ int wm_wait_event(uint64_t win_id, void *event_out) {
 
 void wm_handle_mouse_move(int dx, int dy) {
     comp_update_mouse(dx, -dy, compositor_get()->mouse_buttons);
-    
+
+    // Если меняем размер окна — пересчитываем геометрию по краю/углу.
+    if (resize_state.active) {
+        wm_window_t *win = find_window(resize_state.win_id);
+        if (win) {
+            compositor_t *comp = compositor_get();
+            int mdx = comp->mouse_x - resize_state.start_mx;
+            int mdy = comp->mouse_y - resize_state.start_my;
+            int nx = resize_state.start_x, ny = resize_state.start_y;
+            int nw = resize_state.start_w, nh = resize_state.start_h;
+
+            if (resize_state.edge & RZ_RIGHT)  nw = resize_state.start_w + mdx;
+            if (resize_state.edge & RZ_BOTTOM) nh = resize_state.start_h + mdy;
+            if (resize_state.edge & RZ_LEFT) { nx = resize_state.start_x + mdx; nw = resize_state.start_w - mdx; }
+            if (resize_state.edge & RZ_TOP)  { ny = resize_state.start_y + mdy; nh = resize_state.start_h - mdy; }
+
+            /* Минимальный размер: при тяге за левый/верхний край держим
+             * противоположную сторону на месте. */
+            if (nw < MIN_WIN_W) {
+                if (resize_state.edge & RZ_LEFT) nx = resize_state.start_x + resize_state.start_w - MIN_WIN_W;
+                nw = MIN_WIN_W;
+            }
+            if (nh < MIN_WIN_H) {
+                if (resize_state.edge & RZ_TOP) ny = resize_state.start_y + resize_state.start_h - MIN_WIN_H;
+                nh = MIN_WIN_H;
+            }
+            /* Не выходим за экран. */
+            if (nx < 0) { if (resize_state.edge & RZ_LEFT) nw += nx; nx = 0; }
+            if (ny < 0) { if (resize_state.edge & RZ_TOP)  nh += ny; ny = 0; }
+            if (nx + nw > (int)comp->width)  nw = (int)comp->width - nx;
+            if (ny + nh + TITLEBAR_H > (int)comp->height) nh = (int)comp->height - ny - TITLEBAR_H;
+            if (nw < MIN_WIN_W) nw = MIN_WIN_W;
+            if (nh < MIN_WIN_H) nh = MIN_WIN_H;
+            /* Буфер содержимого фиксирован (MAX_WINDOW_PIXELS) — не превышаем. */
+            if (nw * nh > MAX_WINDOW_PIXELS) {
+                if ((resize_state.edge & (RZ_LEFT | RZ_RIGHT)) && nw > MIN_WIN_W)
+                    nw = MAX_WINDOW_PIXELS / nh;
+                else if (nh > MIN_WIN_H)
+                    nh = MAX_WINDOW_PIXELS / nw;
+            }
+
+            if (nw != win->w || nh != win->h || nx != win->x || ny != win->y) {
+                win->x = nx; win->y = ny; win->w = nw; win->h = nh;
+                /* Чистим содержимое под новый stride (win->w), чтобы не было
+                 * «разъезда» старых пикселей, и просим приложение перерисоваться. */
+                int total = nw * nh;
+                for (int j = 0; j < total; j++) win->pixels[j] = 0xFF2A2A3E;
+                wm_enqueue_resize(win);
+                g_needs_redraw = 1;
+            }
+        }
+        return;  /* во время resize dock-hover/курсор-путь не трогаем */
+    }
+
     // Если перетаскиваем окно - обновляем его позицию
     if (drag_state.dragging) {
         wm_window_t *win = find_window(drag_state.win_id);
@@ -1200,6 +1340,8 @@ void wm_handle_mouse_button(uint8_t buttons) {
                 if (g_focused_win_id == id) g_focused_win_id = 0;
                 if (drag_state.dragging && drag_state.win_id == id)
                     drag_state.dragging = false;
+                if (resize_state.active && resize_state.win_id == id)
+                    resize_state.active = false;
                 wm_destroy_window(id);
                 g_needs_redraw = 1;
                 return;
@@ -1225,7 +1367,42 @@ void wm_handle_mouse_button(uint8_t buttons) {
                 break;
             }
         }
-        if (!drag_state.dragging) {
+        /* --- Resize имеет приоритет над перетаскиванием: тянем за край/угол
+         * (как в Windows). Идём сверху вниз; берём верхнее окно, которое
+         * «владеет» точкой (курсор в пределах окна + зоны захвата). --- */
+        if (!drag_state.dragging && !resize_state.active) {
+            for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
+                wm_window_t *win = &windows[i];
+                if (win->id == 0 || !win->visible) continue;
+                int edge = resize_edge_hit(win, mouse_x, mouse_y);
+                /* Точка внутри окна (или его зоны захвата)? Если да — это «наше»
+                 * верхнее окно: либо ресайзим (edge!=0), либо отдаём клик дальше. */
+                int owns = (mouse_x >= win->x - RESIZE_BORDER && mouse_x <= win->x + win->w + RESIZE_BORDER &&
+                            mouse_y >= win->y - RESIZE_BORDER && mouse_y <= win->y + win->h + TITLEBAR_H + RESIZE_BORDER);
+                if (!owns) continue;
+                if (edge) {
+                    resize_state.active = true;
+                    resize_state.win_id = win->id;
+                    resize_state.edge = edge;
+                    resize_state.start_mx = mouse_x;
+                    resize_state.start_my = mouse_y;
+                    resize_state.start_x = win->x;
+                    resize_state.start_y = win->y;
+                    resize_state.start_w = win->w;
+                    resize_state.start_h = win->h;
+                    resize_state.rendered_x = win->x;
+                    resize_state.rendered_y = win->y;
+                    resize_state.rendered_w = win->w;
+                    resize_state.rendered_h = win->h;
+                    g_focused_win_id = win->id;
+                    g_needs_redraw = 1;
+                    return;
+                }
+                break;  /* верхнее окно владеет точкой, но не у края → обычная обработка */
+            }
+        }
+
+        if (!drag_state.dragging && !resize_state.active) {
             // Начинаем перетаскивание
             for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
                 wm_window_t *win = &windows[i];
@@ -1247,8 +1424,9 @@ void wm_handle_mouse_button(uint8_t buttons) {
             }
         }
     } else {
-        // Кнопка отпущена - заканчиваем перетаскивание
+        // Кнопка отпущена - заканчиваем перетаскивание и resize
         drag_state.dragging = false;
+        resize_state.active = false;
     }
     
     /* Render отвязан от ввода: в IRQ только ставим флаг, рисует таймер. */
