@@ -12,6 +12,9 @@
 #define TASK_STACK_SIZE (32 * 1024)
 #define TASK_MAX_ALLOCS 8   /* ELF-сегменты + user-стек + путь spawn'а */
 
+#define TASK_CMDLINE_MAX 128  /* полная командная строка spawn_ex ("ls -l /bin") */
+#define TASK_CWD_MAX     64   /* текущий каталог процесса (наследуется при spawn) */
+
 typedef struct task {
     uint32_t        pid;
     uint8_t         state;
@@ -30,6 +33,13 @@ typedef struct task {
      * запуск приложения навсегда съедал сотни КБ kernel heap. */
     void           *allocs[TASK_MAX_ALLOCS];
     uint8_t         n_allocs;
+
+    /* --- процессная обвязка для шелла (vsh: утилиты в /bin) --- */
+    uint32_t        stdout_pid; /* куда зеркалить SYS_WRITE IPC-сообщениями
+                                 * (VOS_MSG_STDOUT); 0 = только консоль ядра */
+    uint64_t        exit_code;  /* код выхода (sys_exit) для VOS_MSG_CHILD_EXIT */
+    char            cmdline[TASK_CMDLINE_MAX]; /* argv процесса (SYS_GETARGS) */
+    char            cwd[TASK_CWD_MAX];         /* текущий каталог (SYS_GETCWD) */
 } task_t;
 
 void    sched_init(void);

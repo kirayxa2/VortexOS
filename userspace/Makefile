@@ -10,7 +10,11 @@ LIBC_CFLAGS := $(CFLAGS) -D__VLIBC__ -Ilibc/include -I. -Ilibvui
 LIBC_OBJS   := libc/crt0.o libc/string.o libc/malloc.o libc/stdio.o libc/stdlib.o
 LIBC_HDRS   := $(wildcard libc/include/*.h) syscalls.h vos_abi.h
 
-all: hello vortexgraph test_window vsh vwm vterm vdemo vfiles vuidemo
+# --- утилиты /bin (libc-приложения: crt0 разбирает argv из SYS_GETARGS) ------
+UTILS := ls cat rm find mkdir touch cp mv echo pwd stat head wc
+UTIL_BINS := $(addprefix bin/,$(UTILS))
+
+all: hello vortexgraph test_window vsh vwm vterm vdemo vfiles vuidemo vpanel $(UTIL_BINS)
 
 libc/%.o: libc/src/%.c $(LIBC_HDRS)
 	$(CC) $(LIBC_CFLAGS) -c $< -o $@
@@ -45,8 +49,15 @@ vdemo: vdemo.c vos_abi.h syscalls.h font8x16.h linker.ld
 vfiles: vfiles.c vos_abi.h syscalls.h font8x16.h linker.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) vfiles.c -o vfiles
 
+vpanel: vpanel.c vos_abi.h syscalls.h font8x16.h linker.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) vpanel.c -o vpanel
+
+bin/%: bin/%.c bin/vutil.h $(LIBC_OBJS) linker.ld
+	$(CC) $(LIBC_CFLAGS) $(LDFLAGS) $< $(LIBC_OBJS) -o $@
+
 clean:
-	rm -f hello vortexgraph test_window vsh vwm vterm vdemo vfiles vuidemo
+	rm -f hello vortexgraph test_window vsh vwm vterm vdemo vfiles vuidemo vpanel
+	rm -f $(UTIL_BINS)
 	rm -f libc/*.o libvui/*.o
 
 .PHONY: all clean

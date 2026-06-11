@@ -196,6 +196,21 @@ disk-with-apps: disk userspace
 	python3 tools/add_file.py build/disk.img userspace/vdemo bin/vdemo
 	python3 tools/add_file.py build/disk.img userspace/vfiles bin/vfiles
 	python3 tools/add_file.py build/disk.img userspace/vuidemo bin/vuidemo
+	python3 tools/add_file.py build/disk.img userspace/vpanel bin/vpanel
+	@echo "=== Adding /bin utilities (ls, cat, rm, find, ...) ==="
+	python3 tools/add_file.py build/disk.img userspace/bin/ls bin/ls
+	python3 tools/add_file.py build/disk.img userspace/bin/cat bin/cat
+	python3 tools/add_file.py build/disk.img userspace/bin/rm bin/rm
+	python3 tools/add_file.py build/disk.img userspace/bin/find bin/find
+	python3 tools/add_file.py build/disk.img userspace/bin/mkdir bin/mkdir
+	python3 tools/add_file.py build/disk.img userspace/bin/touch bin/touch
+	python3 tools/add_file.py build/disk.img userspace/bin/cp bin/cp
+	python3 tools/add_file.py build/disk.img userspace/bin/mv bin/mv
+	python3 tools/add_file.py build/disk.img userspace/bin/echo bin/echo
+	python3 tools/add_file.py build/disk.img userspace/bin/pwd bin/pwd
+	python3 tools/add_file.py build/disk.img userspace/bin/stat bin/stat
+	python3 tools/add_file.py build/disk.img userspace/bin/head bin/head
+	python3 tools/add_file.py build/disk.img userspace/bin/wc bin/wc
 	@echo "=== Creating FS hierarchy (/etc, /home, /tmp) ==="
 	python3 tools/add_file.py build/disk.img "Welcome to VortexOS!" etc/motd
 	python3 tools/add_file.py build/disk.img --mkdir home

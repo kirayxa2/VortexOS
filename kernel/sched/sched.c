@@ -103,6 +103,10 @@ task_t *task_create(const char *name, void (*entry)(void), uint8_t priority) {
     t->next     = 0;
     t->userdata = 0;   /* в переиспользованном слоте мог остаться мусор */
     t->n_allocs = 0;   /* список kfree-при-выходе: чистый для нового владельца */
+    t->stdout_pid = 0;          /* по умолчанию вывод — в консоль ядра */
+    t->exit_code  = 0;
+    t->cmdline[0] = 0;
+    t->cwd[0] = '/'; t->cwd[1] = 0;   /* стартовый каталог — корень */
     for (int k = 0; k < TASK_MAX_ALLOCS; k++) t->allocs[k] = 0;
     /* По умолчанию задача живёт в kernel-пространстве. usermode-задача
      * перезапишет это своим user-pml4 (см. userspace_elf_loader_task). */
@@ -175,6 +179,20 @@ int task_track_alloc(task_t *t, void *raw) {
 
 void task_exit(void) {
     extern void ipc_on_task_exit(uint32_t pid);
+    extern uint64_t ipc_kernel_send(uint32_t dst_pid, const uint64_t *msg8,
+                                    uint32_t sender_pid);
+
+    /* Шеллу-родителю (vsh/vterm) — «процесс завершился» (VOS_MSG_CHILD_EXIT).
+     * Шлём ДО cli и до сноса mailbox'ов: ipc_kernel_send сам выключает
+     * прерывания на время push. Покрывает и sys_exit, и аварийные выходы
+     * загрузчика ELF (файл не прочитался и т.п.) — терминал не зависнет. */
+    if (current->stdout_pid) {
+        uint64_t m[8] = {0};
+        m[0] = 201;                  /* VOS_MSG_CHILD_EXIT */
+        m[1] = current->exit_code;
+        ipc_kernel_send(current->stdout_pid, m, current->pid);
+        current->stdout_pid = 0;
+    }
     __asm__ volatile("cli");
     ipc_on_task_exit(current->pid);   /* mailbox, сервисы, grab, shm-refs */
 

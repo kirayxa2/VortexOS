@@ -59,6 +59,15 @@ uint64_t ipc_sys_shm_create(uint64_t size);
 uint64_t ipc_sys_shm_map(uint64_t shm_id);
 uint64_t ipc_sys_shm_release(uint64_t shm_id);
 
+/* Отправка из ядра от имени sender_pid (stdout-пайп шелла, child-exit).
+ * Сообщение в kernel-памяти; IF сохраняется. 0 = доставлено. */
+uint64_t ipc_kernel_send(uint32_t dst_pid, const uint64_t *msg8, uint32_t sender_pid);
+
+/* Типы сообщений ядро -> шелл (vsh/vterm): stdout-пайп и завершение child'а.
+ * Должны совпадать с VOS_MSG_* в userspace/vos_abi.h. */
+#define IPC_MSG_STDOUT      200  /* w1=len(<=40), байты в w2..w6 */
+#define IPC_MSG_CHILD_EXIT  201  /* w1=exit_code */
+
 /* --- хуки для драйверов (зовутся ИЗ IRQ, прерывания уже выключены) --- */
 int  ipc_input_grabbed(void);                       /* 1 = ввод забрал userspace WM */
 void ipc_input_push_key(char ascii, int pressed);

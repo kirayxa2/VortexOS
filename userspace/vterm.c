@@ -39,6 +39,23 @@ static int  sb_start = 0;
 static char input[INPUT_MAX + 1];
 static int  inlen = 0;
 
+/* ---- Шелл: cwd + запущенная утилита (/bin/ls и т.п. через SYS_SPAWN_EX) ---- */
+static char cwd[64] = "/";
+static char prompt[72] = "/> ";
+static int  prompt_len = 3;
+static uint64_t child_pid = 0;     /* 0 = никто не работает, промпт активен */
+static char outbuf[MAXCOLS + 1];   /* недопечатанная строка stdout child'а */
+static int  outlen = 0;
+
+static void prompt_rebuild(void) {
+    int n = 0;
+    while (cwd[n] && n < 64) { prompt[n] = cwd[n]; n++; }
+    prompt[n++] = '>';
+    prompt[n++] = ' ';
+    prompt[n] = 0;
+    prompt_len = n;
+}
+
 /* --------------------- мини-libc --------------------- */
 static int s_eq(const char *a, const char *b) {
     while (*a && *b) { if (*a != *b) return 0; a++; b++; }
@@ -135,16 +152,24 @@ static void term_render(void) {
     }
 
     int iy = row * CH_H;
-    draw_text(0, iy, "vortex> ", COL_PROMPT);
-    int px = 8 * CH_W;
-    int maxin = cols - 8 - 1;
-    int off = (inlen > maxin) ? inlen - maxin : 0;
-    char ib[INPUT_MAX + 1];
-    int k = 0;
-    for (int i = off; i < inlen; i++) ib[k++] = input[i];
-    ib[k] = 0;
-    draw_text(px, iy, ib, COL_FG);
-    draw_rect(px + k * CH_W, iy, CH_W, CH_H, COL_CURSOR);
+    if (child_pid) {
+        /* Утилита работает: вместо промпта — её недопечатанная строка. */
+        outbuf[outlen] = 0;
+        draw_text(0, iy, outbuf, COL_FG);
+        draw_rect(outlen * CH_W, iy, CH_W, CH_H, COL_CURSOR);
+    } else {
+        draw_text(0, iy, prompt, COL_PROMPT);
+        int px = prompt_len * CH_W;
+        int maxin = cols - prompt_len - 1;
+        if (maxin < 1) maxin = 1;
+        int off = (inlen > maxin) ? inlen - maxin : 0;
+        char ib[INPUT_MAX + 1];
+        int k = 0;
+        for (int i = off; i < inlen; i++) ib[k++] = input[i];
+        ib[k] = 0;
+        draw_text(px, iy, ib, COL_FG);
+        draw_rect(px + k * CH_W, iy, CH_W, CH_H, COL_CURSOR);
+    }
 
     vwm_commit(wm_pid, win_id, 0, 0, win_w, win_h);
 }
@@ -154,7 +179,7 @@ static void cmd_help(void) {
     term_print("vterm - userspace WM terminal. Commands:");
     term_print("  help            this list");
     term_print("  clear           clear screen");
-    term_print("  echo <text>     print text");
+    term_print("  cd <dir>, pwd   change / show current directory");
     term_print("  ver             VortexOS version");
     term_print("  about           about this terminal");
     term_print("  pid             terminal PID");
@@ -163,6 +188,9 @@ static void cmd_help(void) {
     term_print("  cols            terminal grid size");
     term_print("  run <name>      spawn ELF from /bin (e.g. run vdemo)");
     term_print("  uptime          PIT ticks since boot");
+    term_print("Everything else runs from /bin with args:");
+    term_print("  ls -l /bin | cat /etc/motd | echo hi | mkdir -p /tmp/a");
+    term_print("  cat cp mv rm find mkdir touch echo pwd stat head wc");
 }
 
 static void print_kv(const char *key, uint64_t v) {
@@ -173,6 +201,28 @@ static void print_kv(const char *key, uint64_t v) {
     while (*p) out[n++] = *p++;
     out[n] = 0;
     term_print(out);
+}
+
+/* ---- stdout запущенной утилиты: поток байт из ядра (VOS_MSG_STDOUT) ---- */
+static void stream_putc(char c) {
+    if (c == '\n') { outbuf[outlen] = 0; sb_push_raw(outbuf); outlen = 0; return; }
+    if (c == '\t') {
+        int adv = 4 - (outlen & 3);
+        while (adv-- && outlen < cols - 1 && outlen < MAXCOLS) outbuf[outlen++] = ' ';
+    } else if (c >= 32 && c < 127) {
+        outbuf[outlen++] = c;
+    }
+    if (outlen >= cols || outlen >= MAXCOLS) {
+        outbuf[outlen] = 0;
+        sb_push_raw(outbuf);
+        outlen = 0;
+    }
+}
+
+static void child_exited(uint64_t code) {
+    if (outlen) { outbuf[outlen] = 0; sb_push_raw(outbuf); outlen = 0; }
+    if (code) print_kv("exit code: ", code);
+    child_pid = 0;
 }
 
 static void run_command(const char *line) {
@@ -228,20 +278,41 @@ static void run_command(const char *line) {
         else print_kv("spawned pid: ", pid);
         return;
     }
-    if (s_starts(line, "echo ")) { term_print(line + 5); return; }
-    if (s_eq(line, "echo")) { term_print(""); return; }
+    if (s_eq(line, "pwd")) { term_print(cwd); return; }
+    if (s_eq(line, "cd") || s_starts(line, "cd ")) {
+        const char *arg = (line[2] == ' ') ? line + 3 : "";
+        while (*arg == ' ') arg++;
+        if (!*arg) arg = "/";
+        char abs[256];
+        vos_abspath(cwd, arg, abs, sizeof(abs));
+        if (vos_chdir(abs) != 0) { term_print("cd: no such directory"); return; }
+        vos_getcwd(cwd, sizeof(cwd));
+        prompt_rebuild();
+        return;
+    }
 
-    char out[MAXCOLS + 1]; int n = 0;
-    const char *p = "vterm: "; while (*p && n < cols) out[n++] = *p++;
-    for (int i = 0; line[i] && n < cols - 20; i++) out[n++] = line[i];
-    p = ": command not found"; while (*p && n < cols) out[n++] = *p++;
-    out[n] = 0;
-    term_print(out);
+    /* Всё остальное — внешняя команда: бинарь ищется в /bin (позже добавим
+     * /usr/bin). Запуск через SYS_SPAWN_EX с пайпом: stdout утилиты приходит
+     * сюда IPC-сообщениями VOS_MSG_STDOUT, завершение — VOS_MSG_CHILD_EXIT.
+     * cwd наследуется ядром. Пока утилита работает, ввод заблокирован. */
+    int64_t pid = vos_spawn_ex(line, 1);
+    if (pid < 0) {
+        char out[MAXCOLS + 1]; int n = 0;
+        const char *p = "vsh: "; while (*p && n < cols) out[n++] = *p++;
+        for (int i = 0; line[i] && line[i] != ' ' && n < cols - 20; i++)
+            out[n++] = line[i];
+        p = ": command not found"; while (*p && n < cols) out[n++] = *p++;
+        out[n] = 0;
+        term_print(out);
+        return;
+    }
+    child_pid = (uint64_t)pid;
+    outlen = 0;
 }
 
 static void echo_input_line(void) {
     char out[MAXCOLS + 1]; int n = 0;
-    const char *p = "vortex> "; while (*p && n < cols) out[n++] = *p++;
+    const char *p = prompt; while (*p && n < cols) out[n++] = *p++;
     for (int i = 0; i < inlen && n < cols && n < MAXCOLS; i++) out[n++] = input[i];
     out[n] = 0;
     sb_push_raw(out);
@@ -281,6 +352,9 @@ void _start(void) {
     cols = win_w / CH_W;
     rows = win_h / CH_H;
 
+    if (vos_getcwd(cwd, sizeof(cwd)) <= 0) { cwd[0] = '/'; cwd[1] = 0; }
+    prompt_rebuild();
+
     term_print("VortexOS vterm 0.1 - userspace WM terminal");
     term_print("Type 'help' for the command list.");
     term_print("");
@@ -293,8 +367,24 @@ void _start(void) {
         for (;;) {
             switch (m.w[0]) {
             case VWM_EV_KEY:
-                if (m.w[1] == win_id && m.w[3]) {
+                /* пока работает утилита — ввод игнорируем (нет stdin v1) */
+                if (m.w[1] == win_id && m.w[3] && !child_pid) {
                     on_char((char)(m.w[2] & 0xFF));
+                    dirty = 1;
+                }
+                break;
+            case VOS_MSG_STDOUT:
+                if (child_pid && m.w[7] == child_pid) {
+                    const char *d = (const char *)&m.w[2];
+                    int len = (int)m.w[1];
+                    if (len > VOS_STDOUT_CHUNK) len = VOS_STDOUT_CHUNK;
+                    for (int i = 0; i < len; i++) stream_putc(d[i]);
+                    dirty = 1;
+                }
+                break;
+            case VOS_MSG_CHILD_EXIT:
+                if (child_pid && m.w[7] == child_pid) {
+                    child_exited(m.w[1]);
                     dirty = 1;
                 }
                 break;

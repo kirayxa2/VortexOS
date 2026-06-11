@@ -112,6 +112,20 @@ uint64_t ipc_sys_send(uint64_t dst_pid, uint64_t user_msg) {
     return ok;
 }
 
+/* Отправка сообщения ИЗ ЯДРА от имени задачи sender_pid (sys_write → stdout
+ * шелла, task_exit → CHILD_EXIT). Тот же путь, что ipc_sys_send, но сообщение
+ * уже в kernel-памяти. Безопасна и при включённых, и при выключенных
+ * прерываниях: IF сохраняется и восстанавливается. 0 = доставлено. */
+uint64_t ipc_kernel_send(uint32_t dst_pid, const uint64_t *msg8, uint32_t sender_pid) {
+    if (!msg8 || !sched_pid_alive(dst_pid)) return (uint64_t)-1;
+    uint64_t ok = (uint64_t)-1, flags;
+    __asm__ volatile("pushfq\n\tpop %0\n\tcli" : "=r"(flags));
+    ipc_mailbox_t *mb = mailbox_get(dst_pid, 1);
+    if (mb && mailbox_push(mb, msg8, sender_pid)) ok = 0;
+    if (flags & 0x200) __asm__ volatile("sti");
+    return ok;
+}
+
 /* timeout_ticks: ~0ULL = ждать вечно, 0 = не блокироваться (poll),
  * N = ждать максимум N тиков PIT. Возврат: 1 = сообщение получено, 0 = таймаут. */
 uint64_t ipc_sys_recv(uint64_t user_msg, uint64_t timeout_ticks) {

@@ -673,8 +673,16 @@ static void dock_bounds(int *x, int *y, int *w, int *h) {
 }
 
 /* ---------------------------------------------------------------------------
- * Верхняя панель (логотип + активное окно + часы через SYS_RTC)
+ * Верхняя панель — теперь отдельный процесс /bin/vpanel (логотип, заголовок,
+ * чипы-таскбар, часы). Здесь только композит его shm-поверхности поверх
+ * обоев per-pixel alpha + маршрутизация кликов и списка окон (VWM_PANEL_*).
+ * Это НЕ окно: без титлбара, фокуса и z-порядка. Если vpanel мёртв/не
+ * поднялся — рисуем пустую полупрозрачную плашку (fallback).
  * ------------------------------------------------------------------------- */
+static uint64_t  panel_pid = 0;     /* pid процесса vpanel (после ATTACH) */
+static uint32_t *panel_surf = 0;    /* его поверхность fbw x PANEL_H */
+static uint64_t  panel_shm = (uint64_t)-1;
+
 static vwin_t *find_window(uint64_t id) {
     if (!id) return 0;
     for (int i = 0; i < MAX_WINDOWS; i++)
@@ -704,97 +712,60 @@ static void panel_bounds(int *x, int *y, int *w, int *h) {
     *x = 0; *y = 0; *w = (int)fbw; *h = PANEL_H;
 }
 
-/* ---- Чипы свёрнутых окон в панели (слева от часов) --------------------
- * Раскладка считается заново и при отрисовке, и при hit-test — никакого
- * состояния между кадрами (та же дисциплина, что и с win_id). */
-#define CHIP_H        18
-#define CHIP_TITLE_MAX 12
-typedef struct { int x, w; uint64_t id; const char *title; } chip_t;
-
-static int panel_chips(chip_t *out) {
-    int n = 0;
+/* Слепок списка окон для vpanel: по одному сообщению на окно
+ * (id, idx/count, flags, title 23+0). count=0 -> одно msg с w1=0.
+ * Зовём при любом изменении набора/фокуса/заголовков — дёшево (<=16 msgs). */
+static void panel_send_wins(void) {
+    if (!panel_pid) return;
+    vos_msg_t m;
+    int count = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        if (windows[i].id) count++;
+    if (count == 0) {
+        for (int k = 0; k < 8; k++) m.w[k] = 0;
+        m.w[0] = VWM_PANEL_WINS;
+        vos_ipc_send(panel_pid, &m);
+        return;
+    }
+    int idx = 0;
     for (int i = 0; i < MAX_WINDOWS; i++) {
         vwin_t *w = &windows[i];
-        if (!w->id || !w->minimized) continue;
-        int len = 0;
-        while (w->title[len] && len < CHIP_TITLE_MAX) len++;
-        if (len == 0) len = 1;
-        out[n].w = len * 8 + 14;
-        out[n].id = w->id;
-        out[n].title = w->title;
-        n++;
-    }
-    /* правый край пачки — перед часами; чипы идут слева направо
-     * в порядке слотов */
-    int x = (int)fbw - 8 * 8 - 24;
-    for (int k = n - 1; k >= 0; k--) { x -= out[k].w + 6; out[k].x = x; }
-    return n;
-}
-static int panel_chip_hit(int mx, int my, uint64_t *id_out) {
-    if (my >= PANEL_H) return 0;
-    chip_t chips[MAX_WINDOWS];
-    int n = panel_chips(chips);
-    int cy = (PANEL_H - CHIP_H) / 2;
-    for (int k = 0; k < n; k++)
-        if (mx >= chips[k].x && mx < chips[k].x + chips[k].w &&
-            my >= cy && my < cy + CHIP_H) {
-            *id_out = chips[k].id;
-            return 1;
-        }
-    return 0;
-}
-static void draw_panel_chips(void) {
-    chip_t chips[MAX_WINDOWS];
-    int n = panel_chips(chips);
-    int cy = (PANEL_H - CHIP_H) / 2;
-    int ty = (PANEL_H - 16) / 2;
-    for (int k = 0; k < n; k++) {
-        fill_round(chips[k].x, cy, chips[k].w, CHIP_H, 9, 0xFF3A4156, 230);
-        char buf[CHIP_TITLE_MAX + 1];
-        int i = 0;
-        while (chips[k].title[i] && i < CHIP_TITLE_MAX) {
-            buf[i] = chips[k].title[i];
-            i++;
-        }
-        buf[i] = 0;
-        draw_string_t(chips[k].x + 7, ty, buf, 0xFFBDD0F0);
+        if (!w->id) continue;
+        for (int k = 0; k < 8; k++) m.w[k] = 0;
+        m.w[0] = VWM_PANEL_WINS;
+        m.w[1] = w->id;
+        m.w[2] = ((uint64_t)idx << 32) | (uint64_t)count;
+        m.w[3] = (w->minimized ? 1u : 0u) | ((w->id == focused_id) ? 2u : 0u);
+        char *t = (char *)&m.w[4];
+        int n = 0;
+        while (w->title[n] && n < 23) { t[n] = w->title[n]; n++; }
+        t[n] = 0;
+        vos_ipc_send(panel_pid, &m);
+        idx++;
     }
 }
 
 static void draw_panel(void) {
     int W = (int)fbw;
-    /* полупрозрачная тёмная плашка поверх обоев (а-ля Plasma) + тонкая
-     * акцентная линия снизу. Панель перерисовывается раз в секунду —
-     * блендинг полосы 28px дёшев. */
     fill_wall(0, 0, W, PANEL_H);
+    if (panel_surf) {
+        /* per-pixel alpha-blend поверхности vpanel поверх обоев: полоса
+         * 28px, перерисовывается редко — дёшево (как старая плашка). */
+        for (int j = 0; j < PANEL_H; j++) {
+            const uint32_t *row = &panel_surf[(uint32_t)j * W];
+            for (int i = 0; i < W; i++) {
+                uint32_t c = row[i];
+                if (c >> 24) blend_px(i, j, c);
+            }
+        }
+        return;
+    }
+    /* fallback: vpanel ещё не поднялся (или умер) — плашка без контента */
     for (int j = 0; j < PANEL_H - 1; j++)
         for (int i = 0; i < W; i++)
             blend_px(i, j, 0xD20D0E15u);
     for (int i = 0; i < W; i++)
         blend_px(i, PANEL_H - 1, 0xB0000000u | (ACCENT & 0x00FFFFFF));
-
-    int ty = (PANEL_H - 16) / 2;
-    fill_round(8, ty, 16, 16, 5, ACCENT, 255);
-    draw_string_t(12, ty, "V", 0xFFFFFFFF);
-    int lx = 30;
-    draw_string_t(lx, ty, "VortexOS", 0xFFE8EAF2);
-    lx += 8 * 8;
-
-    vwin_t *fw = find_window(focused_id);
-    if (fw && fw->title[0]) {
-        fill_rect(lx + 8, ty + 1, 1, 14, 0xFF3A3F55);
-        draw_string_t(lx + 16, ty, fw->title, 0xFFAFC6E8);
-    }
-
-    draw_panel_chips();
-
-    uint32_t hms[3];
-    vos_rtc(hms);
-    char clk[9];
-    clk[0] = '0' + hms[0] / 10; clk[1] = '0' + hms[0] % 10; clk[2] = ':';
-    clk[3] = '0' + hms[1] / 10; clk[4] = '0' + hms[1] % 10; clk[5] = ':';
-    clk[6] = '0' + hms[2] / 10; clk[7] = '0' + hms[2] % 10; clk[8] = 0;
-    draw_string_t(W - 8 * 8 - 10, ty, clk, 0xFFF2F4FA);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1234,6 +1205,7 @@ static void win_drop(vwin_t *win) {
     vos_shm_release(win->shm_id);
     win->shm_id = 0;
     needs_redraw = 1;
+    panel_send_wins();
 }
 
 static void close_window(vwin_t *win) {
@@ -1272,6 +1244,7 @@ static void minimize_window(vwin_t *win) {
             }
     }
     needs_redraw = 1;
+    panel_send_wins();
 }
 
 /* Развернуть из панели: показать, дать фокус, поднять наверх. */
@@ -1281,6 +1254,7 @@ static void restore_window(vwin_t *win) {
     focused_id = id;
     raise_window(id);                   /* win после этого невалиден */
     needs_redraw = 1;
+    panel_send_wins();
 }
 
 /* 🟢 Maximize — тоггл: на весь рабочий стол (под панелью) и обратно.
@@ -1451,16 +1425,18 @@ static void on_mouse_button(uint8_t buttons) {
         if (dock_pressed) { dock_pressed = 0; dock_dirty = 1; }
     }
 
-    /* --- Панель поверх окон: чипы свёрнутых окон --- */
-    if (buttons & 1) {
-        uint64_t cid;
-        if (panel_chip_hit(mx, my, &cid)) {
-            vwin_t *win = find_window(cid);
-            if (win) restore_window(win);
-            return;
-        }
-        /* пустая панель клик НЕ глотает: окно, затащенное под панель
-         * (y=0), иначе стало бы невозможно схватить за титлбар */
+    /* --- Панель: клик форвардим vpanel'у (чипы-таскбар там).  Клик НЕ
+     * глотаем: окно, затащенное под панель (y=0), остаётся доступным за
+     * титлбар. Редкий конфликт "чип против титлбара под ним" принят для
+     * v1 — vpanel разрулит активацией поверх. --- */
+    if ((buttons & 1) && my < PANEL_H && panel_pid) {
+        vos_msg_t pm;
+        for (int k = 0; k < 8; k++) pm.w[k] = 0;
+        pm.w[0] = VWM_PANEL_CLICK;
+        pm.w[1] = (uint64_t)mx;
+        pm.w[2] = (uint64_t)my;
+        pm.w[3] = (uint64_t)buttons;
+        vos_ipc_send(panel_pid, &pm);
     }
 
     /* --- Кнопки заголовка --- */
@@ -1579,6 +1555,10 @@ static void on_mouse_button(uint8_t buttons) {
         update_cursor_shape();   /* отпустили кнопку — форма по тому, что под курсором */
     }
 
+    /* клик мог сменить фокус/закрыть/свернуть — освежаем таскбар vpanel
+     * (часть путей уже слала список; дубль безвреден, vpanel перерисуется) */
+    if (buttons & 1) panel_send_wins();
+
     needs_redraw = 1;
 }
 
@@ -1637,6 +1617,32 @@ static void on_create(vos_msg_t *m) {
      * родиться ПОД существующими (низкий индекс = низ z-порядка). */
     raise_window(win->id);
     needs_redraw = 1;
+    panel_send_wins();
+}
+
+/* --- Панель: ATTACH/COMMIT/ACTIVATE от /bin/vpanel --- */
+static void on_panel_attach(vos_msg_t *m) {
+    uint64_t sender = m->w[7];
+    uint64_t shm_id = m->w[2];
+    uint32_t *pixels = (uint32_t *)vos_shm_map(shm_id);
+
+    vos_msg_t r;
+    for (int k = 0; k < 8; k++) r.w[k] = 0;
+    r.w[0] = VWM_PANEL_OK;
+    if (!pixels) {
+        vos_ipc_send(sender, &r);          /* w1=0 — отказ */
+        return;
+    }
+    /* рестарт vpanel: отпустить поверхность предыдущего */
+    if (panel_surf && panel_shm != (uint64_t)-1)
+        vos_shm_release(panel_shm);
+    panel_surf = pixels;
+    panel_shm = shm_id;
+    panel_pid = sender;
+    r.w[1] = ((uint64_t)fbw << 32) | (uint64_t)PANEL_H;
+    vos_ipc_send(sender, &r);
+    panel_send_wins();
+    panel_dirty = 1;
 }
 
 static void handle_msg(vos_msg_t *m) {
@@ -1662,6 +1668,25 @@ static void handle_msg(vos_msg_t *m) {
             win_drop(win);   /* в т.ч. отдаёт shm-поверхность */
         break;
     }
+    case VWM_PANEL_ATTACH:
+        on_panel_attach(m);
+        break;
+    case VWM_PANEL_COMMIT:
+        if (m->w[7] == panel_pid) panel_dirty = 1;
+        break;
+    case VWM_PANEL_ACTIVATE:
+        if (m->w[7] == panel_pid) {
+            vwin_t *win = find_window(m->w[1]);
+            if (win) {
+                if (win->minimized) restore_window(win);
+                else {
+                    focused_id = win->id;
+                    raise_window(win->id);   /* win невалиден дальше */
+                    panel_send_wins();
+                }
+            }
+        }
+        break;
     case VWM_COMMIT: {
         vwin_t *win = find_window(m->w[1]);
         if (win && win->owner_pid == m->w[7]) {
@@ -1727,6 +1752,7 @@ void _start(void) {
 
     /* 4. Первый кадр + стартовый терминал */
     render_all();
+    vos_spawn("/bin/vpanel");
     vos_spawn("/bin/vterm");
 
     /* 5. Event loop: ipc_recv — и очередь событий, и таймер кадра.

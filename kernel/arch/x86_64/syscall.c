@@ -45,8 +45,38 @@ extern uint64_t syscall_kernel_stack; /* kernel stack для syscall handler */
  * ------------------------------------------------------------------------- */
 
 static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
-    (void)fd; /* пока только stdout */
     const char *s = (const char *)buf;
+
+    /* stdout-пайп: если у процесса задан stdout_pid (его запустил шелл через
+     * SYS_SPAWN_EX с флагом pipe), fd=1 уходит шеллу IPC-сообщениями
+     * IPC_MSG_STDOUT чанками по 40 байт (w1=len, данные в w2..w6) — и НЕ
+     * дублируется в консоль ядра. Так /bin/ls печатает прямо в окно vterm. */
+    task_t *self = sched_current();
+    if (fd == 1 && self && self->stdout_pid) {
+        uint64_t sent = 0;
+        while (sent < len) {
+            uint64_t chunk = len - sent;
+            if (chunk > 40) chunk = 40;
+            uint64_t m[8] = {0};
+            m[0] = IPC_MSG_STDOUT;
+            m[1] = chunk;
+            char *dst = (char *)&m[2];
+            for (uint64_t i = 0; i < chunk; i++) dst[i] = s[sent + i];
+            /* mailbox полон — ждём, пока шелл разгребёт (он живой и спит в
+             * ipc_recv). Дедлайн ~4 c: если приёмник умер/завис, глотаем. */
+            int tries = 0;
+            while (ipc_kernel_send(self->stdout_pid, m, self->pid) != 0) {
+                if (!sched_pid_alive(self->stdout_pid) || ++tries > 400) {
+                    self->stdout_pid = 0;   /* приёмника нет — дальше в консоль */
+                    return len;
+                }
+                __asm__ volatile("sti\n\thlt");
+            }
+            sent += chunk;
+        }
+        return len;
+    }
+
     for (uint64_t i = 0; i < len; i++) fb_putchar(s[i]);
     return len;
 }
@@ -55,6 +85,12 @@ static uint64_t sys_exit(uint64_t code) {
     fb_puts("[SYSCALL] sys_exit(");
     fb_puthex(code);
     fb_puts(") — process terminated\n");
+
+    /* Код выхода — для VOS_MSG_CHILD_EXIT (его шлёт task_exit). */
+    {
+        task_t *self = sched_current();
+        if (self) self->exit_code = code;
+    }
     
     /* Переключаемся обратно на kernel PML4 */
     vmm_switch(vmm_kernel_pml4);
@@ -292,6 +328,207 @@ static uint64_t sys_fs_readdir(uint64_t user_path, uint64_t index, uint64_t user
     return ret;
 }
 
+/* -------------------------------------------------------------------------
+ * Файловые syscall'ы для утилит /bin (ls, cat, rm, find, ...) — тонкие
+ * обёртки над VFS (FAT32 уже умеет read/write/create/unlink/mkdir).
+ * Пути — ТОЛЬКО абсолютные: относительные разворачивает userspace по
+ * своему cwd (SYS_GETCWD). Все ноды vfs_open — kmalloc, освобождаем как
+ * в sys_fs_readdir.
+ * ------------------------------------------------------------------------- */
+extern vfs_node_t *vfs_root;
+
+static void fs_node_put(vfs_node_t *n) {
+    extern void kfree(void *);
+    if (!n || n == vfs_root) return;
+    if (n->fs_data) kfree(n->fs_data);
+    kfree(n);
+}
+
+/* Копия пути из userspace; 0 = ок (абсолютный, непустой). */
+static int fs_copy_path(uint64_t user_path, char *dst) {
+    if (!user_path) return -1;
+    const char *src = (const char *)user_path;
+    int n = 0;
+    while (src[n] && n < VFS_MAX_PATH - 1) { dst[n] = src[n]; n++; }
+    dst[n] = 0;
+    if (n == 0 || dst[0] != '/') return -1;
+    return 0;
+}
+
+#define FS_IO_MAX (64 * 1024)   /* лимит на один вызов read/write */
+
+static uint64_t sys_fs_read(uint64_t user_path, uint64_t offset,
+                            uint64_t user_buf, uint64_t len) {
+    char path[VFS_MAX_PATH];
+    if (fs_copy_path(user_path, path) || !user_buf) return (uint64_t)-1;
+    if (len > FS_IO_MAX) len = FS_IO_MAX;
+
+    vfs_node_t *node = vfs_open(path, 0);
+    if (!node) return (uint64_t)-1;
+    uint64_t ret = (uint64_t)-1;
+    if (node->type == VFS_FILE) {
+        int32_t got = vfs_read(node, (uint32_t)offset, (uint32_t)len,
+                               (uint8_t *)user_buf);
+        if (got >= 0) ret = (uint64_t)got;
+    }
+    fs_node_put(node);
+    return ret;
+}
+
+static uint64_t sys_fs_write(uint64_t user_path, uint64_t offset,
+                             uint64_t user_buf, uint64_t len) {
+    char path[VFS_MAX_PATH];
+    if (fs_copy_path(user_path, path) || !user_buf) return (uint64_t)-1;
+    if (len > FS_IO_MAX) return (uint64_t)-1;
+
+    vfs_node_t *node = vfs_open(path, 0);
+    if (!node) return (uint64_t)-1;
+    uint64_t ret = (uint64_t)-1;
+    if (node->type == VFS_FILE) {
+        int32_t put = vfs_write(node, (uint32_t)offset, (uint32_t)len,
+                                (const uint8_t *)user_buf);
+        if (put >= 0) ret = (uint64_t)put;
+    }
+    fs_node_put(node);
+    return ret;
+}
+
+/* is_dir: 0 = пустой файл (touch), 1 = каталог (mkdir). */
+static uint64_t sys_fs_create(uint64_t user_path, uint64_t is_dir) {
+    char path[VFS_MAX_PATH];
+    if (fs_copy_path(user_path, path)) return (uint64_t)-1;
+    int rc = is_dir ? vfs_mkdir(path) : vfs_create(path);
+    return (rc == 0) ? 0 : (uint64_t)-1;
+}
+
+static uint64_t sys_fs_unlink(uint64_t user_path) {
+    char path[VFS_MAX_PATH];
+    if (fs_copy_path(user_path, path)) return (uint64_t)-1;
+    return (vfs_unlink(path) == 0) ? 0 : (uint64_t)-1;
+}
+
+/* Должна побайтово совпадать с vos_stat_t в userspace/vos_abi.h. */
+typedef struct {
+    uint32_t type;   /* 0 = файл, 1 = каталог */
+    uint32_t size;   /* байты (для каталогов 0) */
+} sys_stat_t;
+
+static uint64_t sys_fs_stat(uint64_t user_path, uint64_t user_out) {
+    char path[VFS_MAX_PATH];
+    if (fs_copy_path(user_path, path) || !user_out) return (uint64_t)-1;
+
+    vfs_node_t *node = vfs_open(path, 0);
+    if (!node) return (uint64_t)-1;
+    sys_stat_t *out = (sys_stat_t *)user_out;
+    out->type = (node->type == VFS_DIR) ? 1 : 0;
+    out->size = (node->type == VFS_DIR) ? 0 : node->size;
+    fs_node_put(node);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * SYS_SPAWN_EX — запуск утилиты шеллом: вся командная строка ("ls -l /bin")
+ * + флаги. bit0 = пайп stdout: SYS_WRITE child'а уходит вызвавшему
+ * IPC-сообщениями, а на выходе придёт IPC_MSG_CHILD_EXIT.
+ * Существование бинаря проверяется СИНХРОННО (elf_open_exec ищет в /bin как
+ * $PATH) — «command not found» шелл узнаёт сразу из кода возврата, а не
+ * зависает в ожидании. cwd наследуется. Возврат: pid или -1.
+ * ------------------------------------------------------------------------- */
+static uint64_t sys_spawn_ex(uint64_t user_cmdline, uint64_t flags) {
+    extern void userspace_elf_loader_task(void);
+    extern void *kmalloc(uint64_t);
+    extern void kfree(void *);
+    extern vfs_node_t *elf_open_exec(const char *path);
+    if (!user_cmdline) return (uint64_t)-1;
+
+    /* Командная строка → kernel-память (читается в другом адресном пространстве) */
+    char cmdline[TASK_CMDLINE_MAX];
+    const char *src = (const char *)user_cmdline;
+    int n = 0;
+    while (src[n] && n < TASK_CMDLINE_MAX - 1) { cmdline[n] = src[n]; n++; }
+    cmdline[n] = 0;
+
+    /* argv[0] — имя программы */
+    int s = 0;
+    while (cmdline[s] == ' ') s++;
+    char prog[64];
+    int p = 0;
+    while (cmdline[s] && cmdline[s] != ' ' && p < 63) prog[p++] = cmdline[s++];
+    prog[p] = 0;
+    if (p == 0) return (uint64_t)-1;
+
+    /* Бинарь существует? (поиск в /bin как $PATH) */
+    vfs_node_t *exe = elf_open_exec(prog);
+    if (!exe) return (uint64_t)-1;
+    vfs_close(exe);
+    fs_node_put(exe);
+
+    /* Путь для загрузчика ELF — kmalloc, kfree при выходе задачи (как sys_spawn) */
+    char *path = (char *)kmalloc(64);
+    if (!path) return (uint64_t)-1;
+    for (int i = 0; i <= p; i++) path[i] = prog[i];
+
+    task_t *self = sched_current();
+    task_t *t = task_create(prog, userspace_elf_loader_task, 10);
+    if (!t) { kfree(path); return (uint64_t)-1; }
+    t->userdata = path;
+    task_track_alloc(t, path);
+
+    /* Наследование: cwd родителя; argv; stdout-пайп по флагу */
+    for (int i = 0; i < TASK_CMDLINE_MAX; i++) {
+        t->cmdline[i] = cmdline[i];
+        if (!cmdline[i]) break;
+    }
+    t->cmdline[TASK_CMDLINE_MAX - 1] = 0;
+    if (self) {
+        for (int i = 0; i < TASK_CWD_MAX; i++) {
+            t->cwd[i] = self->cwd[i];
+            if (!self->cwd[i]) break;
+        }
+        t->cwd[TASK_CWD_MAX - 1] = 0;
+        if (flags & 1) t->stdout_pid = self->pid;
+    }
+    return t->pid;
+}
+
+static uint64_t sys_getargs(uint64_t user_buf, uint64_t max) {
+    task_t *self = sched_current();
+    if (!self || !user_buf || max == 0) return (uint64_t)-1;
+    char *dst = (char *)user_buf;
+    uint64_t i = 0;
+    while (self->cmdline[i] && i < max - 1) { dst[i] = self->cmdline[i]; i++; }
+    dst[i] = 0;
+    return i;
+}
+
+static uint64_t sys_chdir(uint64_t user_path) {
+    task_t *self = sched_current();
+    char path[VFS_MAX_PATH];
+    if (!self || fs_copy_path(user_path, path)) return (uint64_t)-1;
+
+    vfs_node_t *node = vfs_open(path, 0);
+    if (!node) return (uint64_t)-1;
+    uint64_t ret = (uint64_t)-1;
+    if (node->type == VFS_DIR) {
+        int i = 0;
+        while (path[i] && i < TASK_CWD_MAX - 1) { self->cwd[i] = path[i]; i++; }
+        self->cwd[i] = 0;
+        ret = 0;
+    }
+    fs_node_put(node);
+    return ret;
+}
+
+static uint64_t sys_getcwd(uint64_t user_buf, uint64_t max) {
+    task_t *self = sched_current();
+    if (!self || !user_buf || max == 0) return (uint64_t)-1;
+    char *dst = (char *)user_buf;
+    uint64_t i = 0;
+    while (self->cwd[i] && i < max - 1) { dst[i] = self->cwd[i]; i++; }
+    dst[i] = 0;
+    return i;
+}
+
 /* Текущее время RTC (CMOS) — для часов на панели userspace WM. */
 static inline uint8_t cmos_read_sc(uint8_t reg) {
     uint8_t v;
@@ -413,6 +650,17 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, u
         case 28: return sys_fb_present(a1,a2,a3,a4);   // SYS_FB_PRESENT(x,y,w,h)
         case 29: return ipc_sys_shm_release(a1);       // SYS_SHM_RELEASE(id)
         case 30: return sys_fs_readdir(a1, a2, a3);    // SYS_FS_READDIR(path, idx, out)
+
+        /* --- утилиты /bin + шелл (vsh): файлы, spawn с argv, cwd --- */
+        case 31: return sys_fs_read(a1, a2, a3, a4);   // SYS_FS_READ(path, off, buf, len)
+        case 32: return sys_fs_write(a1, a2, a3, a4);  // SYS_FS_WRITE(path, off, buf, len)
+        case 33: return sys_fs_create(a1, a2);         // SYS_FS_CREATE(path, is_dir)
+        case 34: return sys_fs_unlink(a1);             // SYS_FS_UNLINK(path)
+        case 35: return sys_fs_stat(a1, a2);           // SYS_FS_STAT(path, out)
+        case 36: return sys_spawn_ex(a1, a2);          // SYS_SPAWN_EX(cmdline, flags)
+        case 37: return sys_getargs(a1, a2);           // SYS_GETARGS(buf, max)
+        case 38: return sys_chdir(a1);                 // SYS_CHDIR(path)
+        case 39: return sys_getcwd(a1, a2);            // SYS_GETCWD(buf, max)
         default: return (uint64_t)-1;
     }
 }
