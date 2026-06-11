@@ -17,6 +17,7 @@
 #include "simple_wm.h"
 #include "virtio_gpu.h"
 #include "ipc.h"
+#include "vfs.h"     // SYS_FS_READDIR (листинг каталога для /bin/vfiles)
 #include <stddef.h>  // для size_t
 
 /* MSR адреса */
@@ -231,6 +232,66 @@ static uint64_t sys_spawn(uint64_t user_path) {
     return t->pid;
 }
 
+/* -------------------------------------------------------------------------
+ * SYS_FS_READDIR — запись каталога №index для userspace (GUI-файлменеджер
+ * /bin/vfiles). Возвращает 0 и заполняет out, или -1 (нет такой записи /
+ * не каталог / плохие аргументы).
+ *
+ * Структура должна побайтово совпадать с vos_dirent_t в userspace/vos_abi.h.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    char     name[32];
+    uint32_t type;    /* 0 = файл, 1 = каталог */
+    uint32_t size;    /* байты (для каталогов 0) */
+} sys_dirent_t;
+
+static uint64_t sys_fs_readdir(uint64_t user_path, uint64_t index, uint64_t user_out) {
+    extern void kfree(void *);
+    if (!user_path || !user_out) return (uint64_t)-1;
+
+    /* Путь копируем в kernel-буфер (как в sys_spawn) */
+    const char *src = (const char *)user_path;
+    char path[VFS_MAX_PATH];
+    int n = 0;
+    while (src[n] && n < VFS_MAX_PATH - 1) { path[n] = src[n]; n++; }
+    path[n] = 0;
+    if (n == 0 || path[0] != '/') return (uint64_t)-1;
+
+    vfs_node_t *dir = vfs_open(path, 0);
+    if (!dir || dir->type != VFS_DIR) {
+        if (dir && dir != vfs_root) { if (dir->fs_data) kfree(dir->fs_data); kfree(dir); }
+        return (uint64_t)-1;
+    }
+
+    uint64_t ret = (uint64_t)-1;
+    const char *name = vfs_readdir(dir, (uint32_t)index);
+    if (name) {
+        sys_dirent_t *out = (sys_dirent_t *)user_out;
+        int i = 0;
+        while (name[i] && i < 31) { out->name[i] = name[i]; i++; }
+        out->name[i] = 0;
+        out->type = 0;
+        out->size = 0;
+        /* type/size — через finddir (имя уже знаем, она его найдёт) */
+        vfs_node_t *child = vfs_finddir(dir, name);
+        if (child) {
+            out->type = (child->type == VFS_DIR) ? 1 : 0;
+            out->size = (child->type == VFS_DIR) ? 0 : (uint32_t)child->size;
+            /* FAT32-ноды — чистый kmalloc (см. fat_make_vnode), освобождаем
+             * сразу: иначе каждая запись листинга текла бы по ~100 байт.
+             * ramfs здесь не бывает: он монтируется только если FAT32 не
+             * поднялся — тогда и /bin/vfiles читать некому. */
+            if (child != vfs_root) {
+                if (child->fs_data) kfree(child->fs_data);
+                kfree(child);
+            }
+        }
+        ret = 0;
+    }
+    if (dir != vfs_root) { if (dir->fs_data) kfree(dir->fs_data); kfree(dir); }
+    return ret;
+}
+
 /* Текущее время RTC (CMOS) — для часов на панели userspace WM. */
 static inline uint8_t cmos_read_sc(uint8_t reg) {
     uint8_t v;
@@ -351,6 +412,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, u
         case 27: return sys_vsync();                   // SYS_VSYNC — ждать vblank
         case 28: return sys_fb_present(a1,a2,a3,a4);   // SYS_FB_PRESENT(x,y,w,h)
         case 29: return ipc_sys_shm_release(a1);       // SYS_SHM_RELEASE(id)
+        case 30: return sys_fs_readdir(a1, a2, a3);    // SYS_FS_READDIR(path, idx, out)
         default: return (uint64_t)-1;
     }
 }

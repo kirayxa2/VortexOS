@@ -532,8 +532,9 @@ static void dock_bounds(int *x, int *y, int *w, int *h) {
 
 typedef struct { const char *path; const char *label; int kind; } desk_icon_t;
 static const desk_icon_t desk_icons[] = {
-    { "/bin/vterm", "Terminal", 0 },
-    { "/bin/vdemo", "Window",   2 },
+    { "/bin/vterm",  "Terminal", 0 },
+    { "/bin/vfiles", "Files",    1 },
+    { "/bin/vdemo",  "Window",   2 },
 };
 #define DESK_NICONS ((int)(sizeof(desk_icons) / sizeof(desk_icons[0])))
 
@@ -563,6 +564,13 @@ static void desk_draw_tile(int kind, int x, int y, int s) {
             draw_line(px + 8, py + 8 + t, px,     py + 16 + t, green);
         }
         fill_rect(x + 24, py + 12, 12, 4, green);
+    } else if (kind == 1) {
+        /* папка: задник + язычок + корпус */
+        fill_round(x, y, s, s, 10, 0xFF1E2433, 255);
+        uint32_t fold = 0xFFE8B64C, foldhi = 0xFFF2CC74;
+        fill_rect(x + 8,  y + 14, 14, 5, fold);     /* язычок */
+        fill_rect(x + 8,  y + 18, 32, 18, fold);    /* корпус */
+        fill_rect(x + 8,  y + 18, 32, 3,  foldhi);  /* блик   */
     } else {
         fill_round(x, y, s, s, 10, 0xFFEAEAF0, 255);
         fill_rect(x + 8,  y + 10, 32, 28, 0xFFFFFFFF);
@@ -1105,6 +1113,18 @@ static void send_event(uint64_t pid, uint64_t type, uint64_t a, uint64_t b, uint
     vos_ipc_send(pid, &m);
 }
 
+static void send_event4(uint64_t pid, uint64_t type,
+                        uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    vos_msg_t m;
+    for (int i = 0; i < 8; i++) m.w[i] = 0;
+    m.w[0] = type; m.w[1] = a; m.w[2] = b; m.w[3] = c; m.w[4] = d;
+    vos_ipc_send(pid, &m);
+}
+
+/* Кому отдали нажатие ЛКМ в содержимое окна (win_id, не указатель! —
+ * cross-frame состояние только по id). Отпускание шлём этому же окну. */
+static uint64_t mouse_press_win = 0;
+
 /* Окно умерло (крестик или DESTROY от клиента): снять его из таблицы и
  * ОТДАТЬ shm-поверхность (vos_shm_release). Без release наша ссылка держала
  * бы сегмент до конца жизни vwm — слоты shm кончались бы после ~24 окон за
@@ -1115,6 +1135,7 @@ static void win_drop(vwin_t *win) {
     if (focused_id == win->id) focused_id = 0;
     if (drag.active && drag.win_id == win->id) drag.active = 0;
     if (rz.active && rz.win_id == win->id) rz.active = 0;
+    if (mouse_press_win == win->id) mouse_press_win = 0;
     win->id = 0;
     win->pixels = 0;
     win->minimized = 0;   /* слот переиспользуется — флаги не наследуем */
@@ -1465,9 +1486,37 @@ static void on_mouse_button(uint8_t buttons) {
                 }
             }
         }
+        /* клик в СОДЕРЖИМОЕ окна — отдаём приложению (VWM_EV_MOUSE).
+         * Сюда доходим, только если клик не съели dock/панель/иконки/кнопки,
+         * не начался resize и не drag. После raise-on-click кликнутое окно —
+         * верхнее под курсором, ищем его заново (win после raise невалиден). */
+        if (!drag.active && !rz.active) {
+            for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
+                vwin_t *win = &windows[i];
+                if (!win->id || win->minimized) continue;
+                if (mx < win->x || mx >= win->x + win->w ||
+                    my < win->y || my >= win->y + win->h + TITLEBAR_H) continue;
+                if (my >= win->y + TITLEBAR_H) {
+                    send_event4(win->owner_pid, VWM_EV_MOUSE, win->id,
+                                (uint64_t)(mx - win->x),
+                                (uint64_t)(my - win->y - TITLEBAR_H), 1);
+                    mouse_press_win = win->id;
+                }
+                break;
+            }
+        }
     } else {
         drag.active = 0;
         rz.active = 0;
+        /* отпускание ЛКМ — тому окну, которому отдали нажатие */
+        if (mouse_press_win) {
+            vwin_t *win = find_window(mouse_press_win);
+            if (win && !win->minimized)
+                send_event4(win->owner_pid, VWM_EV_MOUSE, win->id,
+                            (uint64_t)(mx - win->x),
+                            (uint64_t)(my - win->y - TITLEBAR_H), 0);
+            mouse_press_win = 0;
+        }
         update_cursor_shape();   /* отпустили кнопку — форма по тому, что под курсором */
     }
 

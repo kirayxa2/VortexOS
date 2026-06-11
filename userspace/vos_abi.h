@@ -37,6 +37,8 @@ typedef long int64_t;
 #define SYS_SHM_RELEASE   29   /* (shm_id) отпустить ссылку + unmap -> 0 / -1.
                                 * Последний держатель освобождает страницы.
                                 * После release буфер трогать НЕЛЬЗЯ.          */
+#define SYS_FS_READDIR    30   /* (path*, index, vos_dirent_t*) -> 0 / -1.
+                                * Запись каталога №index (для /bin/vfiles).    */
 
 #define VOS_SVC_WM        0    /* service id window manager'а */
 
@@ -46,6 +48,15 @@ typedef long int64_t;
 
 /* --- IPC-сообщение: 8 x uint64. w[7] ядро затирает pid'ом отправителя. --- */
 typedef struct { uint64_t w[8]; } vos_msg_t;
+
+/* --- Запись каталога для SYS_FS_READDIR (должна совпадать с ядром) --- */
+#define VOS_DT_FILE 0
+#define VOS_DT_DIR  1
+typedef struct {
+    char     name[32];
+    uint32_t type;    /* VOS_DT_FILE / VOS_DT_DIR */
+    uint32_t size;    /* байты (для каталогов 0) */
+} vos_dirent_t;
 
 /* --- Ввод ядро -> WM (после SYS_INPUT_GRAB) --- */
 #define VIN_MOUSE         100  /* w1=dx(int64) w2=dy(int64) w3=buttons w4=btn_changed */
@@ -61,6 +72,10 @@ typedef struct { uint64_t w[8]; } vos_msg_t;
 #define VWM_EV_KEY        11   /* w1=win_id, w2=ascii, w3=pressed */
 #define VWM_EV_RESIZE     13   /* w1=win_id, w2=new_w, w3=new_h */
 #define VWM_EV_CLOSE      14   /* w1=win_id — клиент должен выйти */
+#define VWM_EV_MOUSE      15   /* w1=win_id, w2=x, w3=y, w4=buttons.
+                                * Координаты в СОДЕРЖИМОМ окна (без титлбара).
+                                * Шлётся на нажатие ЛКМ в содержимое и на
+                                * отпускание (buttons=0) тому же окну. */
 
 /* Максимум пикселей содержимого окна (как MAX_WINDOW_PIXELS в ядре).
  * Буфер окна всегда выделяется под максимум — resize не требует переалокации,
@@ -88,6 +103,9 @@ static inline uint64_t vos_input_grab(void) { return syscall0(SYS_INPUT_GRAB); }
 static inline uint64_t vos_svc_register(uint64_t svc) { return syscall1(SYS_SVC_REGISTER, svc); }
 static inline uint64_t vos_svc_lookup(uint64_t svc)   { return syscall1(SYS_SVC_LOOKUP, svc); }
 static inline uint64_t vos_spawn(const char *path)    { return syscall1(SYS_SPAWN, (uint64_t)path); }
+static inline int64_t  vos_fs_readdir(const char *path, uint64_t index, vos_dirent_t *out) {
+    return (int64_t)syscall3(SYS_FS_READDIR, (uint64_t)path, index, (uint64_t)out);
+}
 static inline uint64_t vos_uptime(void)               { return syscall0(SYS_UPTIME); }
 static inline void     vos_rtc(uint32_t hms[3])       { syscall1(SYS_RTC, (uint64_t)hms); }
 static inline void     vos_vsync(void)                { syscall0(SYS_VSYNC); }
