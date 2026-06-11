@@ -604,6 +604,25 @@ static vwin_t *find_window(uint64_t id) {
         if (windows[i].id == id) return &windows[i];
     return 0;
 }
+
+/* Поднять окно наверх (raise). Z-порядок — это порядок слотов в windows[]:
+ * рендер идёт 0..MAX_WINDOWS-1, верхнее окно = наибольший занятый индекс.
+ * Сдвигаем слоты выше нашего на один вниз и кладём окно в самый верхний
+ * занятый индекс — относительный порядок остальных не меняется.
+ * ВАЖНО: после вызова любые vwin_t* невалидны (содержимое слотов
+ * переехало) — drag/rz/focused и так живут через win_id. */
+static void raise_window(uint64_t id) {
+    int i = -1, top = -1;
+    for (int k = 0; k < MAX_WINDOWS; k++) {
+        if (windows[k].id == id) i = k;
+        if (windows[k].id)       top = k;
+    }
+    if (i < 0 || top <= i) return;            /* нет такого или уже сверху */
+    vwin_t tmp = windows[i];
+    for (int k = i; k < top; k++) windows[k] = windows[k + 1];
+    windows[top] = tmp;
+    needs_redraw = 1;
+}
 static void panel_bounds(int *x, int *y, int *w, int *h) {
     *x = 0; *y = 0; *w = (int)fbw; *h = PANEL_H;
 }
@@ -1240,13 +1259,14 @@ static void on_mouse_button(uint8_t buttons) {
     }
 
     if (buttons & 1) {
-        /* фокус — окну под кликом */
+        /* фокус — окну под кликом + поднять наверх (raise-on-click) */
         for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
             vwin_t *win = &windows[i];
             if (!win->id) continue;
             if (mx >= win->x && mx < win->x + win->w &&
                 my >= win->y && my < win->y + win->h + TITLEBAR_H) {
                 focused_id = win->id;
+                raise_window(win->id);   /* win после этого невалиден */
                 break;
             }
         }
@@ -1269,6 +1289,9 @@ static void on_mouse_button(uint8_t buttons) {
                     rz.rendered_x = win->x; rz.rendered_y = win->y;
                     rz.rendered_w = win->w; rz.rendered_h = win->h;
                     focused_id = win->id;
+                    /* клик по рамке может быть ВНЕ bounds окна — цикл фокуса
+                     * выше его не поднял, поднимаем здесь (win невалиден после) */
+                    raise_window(win->id);
                     needs_redraw = 1;
                     return;
                 }
@@ -1352,6 +1375,9 @@ static void on_create(vos_msg_t *m) {
 
     focused_id = win->id;
     send_event(sender, VWM_CREATED, win->id, shm_id, 0);
+    /* Слоты переиспользуются после close — без raise новое окно могло бы
+     * родиться ПОД существующими (низкий индекс = низ z-порядка). */
+    raise_window(win->id);
     needs_redraw = 1;
 }
 
