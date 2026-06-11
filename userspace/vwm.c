@@ -48,7 +48,7 @@
 #define PANEL_H       24
 #define PANEL_BG      0xFF15151Fu
 
-#define MAX_WINDOWS   8
+#define MAX_WINDOWS   16   /* окон одновременно; держать <= SHM_MAX_SEGS-1 в ядре */
 
 /* ---------------------------------------------------------------------------
  * Экран: front buffer (= то, что сканирует видеокарта) и back buffer (shm)

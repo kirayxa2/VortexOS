@@ -41,7 +41,7 @@
  *   - в ядре:      SHM_KERNEL_BASE + id*SHM_SLOT_SIZE
  *   - в userspace: SHM_USER_BASE   + id*SHM_SLOT_SIZE (одинаково во всех процессах)
  * 16MB хватает на back buffer 1920x1080x4 (~8MB) с запасом. */
-#define SHM_MAX_SEGS    24
+#define SHM_MAX_SEGS    32   /* 1 на back buffer vwm + по 1 на окно (+ запас) */
 #define SHM_REF_MAX     8    /* держателей на сегмент (создатель + map'нувшие) */
 #define SHM_SLOT_SIZE   (16ULL * 1024 * 1024)
 #define SHM_KERNEL_BASE 0xFFFFFFFF94000000ULL
