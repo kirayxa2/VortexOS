@@ -25,7 +25,7 @@
 /* ---------------------------------------------------------------------------
  * Геометрия и палитра (соответствуют kernel simple_wm, чтобы вид не менялся)
  * ------------------------------------------------------------------------- */
-#define TITLEBAR_H    24
+#define TITLEBAR_H    26
 #define WIN_CORNER    10
 #define WIN_SHADOW    10
 #define WIN_SHADOW_OY 4
@@ -44,11 +44,12 @@
 #define RZ_TOP        4
 #define RZ_BOTTOM     8
 
-#define DESK_BG       0xFF1A1A2Eu
-#define PANEL_H       24
-#define PANEL_BG      0xFF15151Fu
+#define DESK_BG       0xFF12121Eu  /* fallback-фон, если обои не выделились */
+#define PANEL_H       28
+#define ACCENT        0xFF5B8CFFu  /* акцент темы: рамка фокуса, панель, выделение */
 
-#define MAX_WINDOWS   16   /* окон одновременно; держать <= SHM_MAX_SEGS-1 в ядре */
+#define MAX_WINDOWS   16   /* окон одновременно; держать <= SHM_MAX_SEGS-2 в ядре
+                            * (2 сегмента ест сам vwm: back buffer + обои) */
 
 /* ---------------------------------------------------------------------------
  * Экран: front buffer (= то, что сканирует видеокарта) и back buffer (shm)
@@ -153,10 +154,29 @@ static void fill_rect(int x, int y, int w, int h, uint32_t c) {
         for (int i = 0; i < w; i++) row[i] = c;
     }
 }
+/* Покрытие пикселя кругом (4x4 суперсэмплинг) — базовый кирпич всего AA.
+ * Раньше жил ниже у оконного chrome; теперь им сглаживаются ВСЕ круги и
+ * скругления (кнопки, dock, чипы, иконки) — пиксельная «лесенка» ушла. */
+static int circ_cov(int px, int py, int cx, int cy, int r) {
+    int r2x64 = r * r * 64;
+    int in = 0;
+    for (int sy = 0; sy < 4; sy++)
+        for (int sx = 0; sx < 4; sx++) {
+            int fx = (px - cx) * 8 + sx * 2 + 1;
+            int fy = (py - cy) * 8 + sy * 2 + 1;
+            if (fx * fx + fy * fy <= r2x64) in++;
+        }
+    return in * 255 / 16;
+}
 static void fill_circle(int cx, int cy, int r, uint32_t c) {
-    for (int dy = -r; dy <= r; dy++)
-        for (int dx = -r; dx <= r; dx++)
-            if (dx * dx + dy * dy <= r * r) put_px(cx + dx, cy + dy, c);
+    uint32_t rgb = c & 0x00FFFFFF;
+    for (int dy = -r - 1; dy <= r + 1; dy++)
+        for (int dx = -r - 1; dx <= r + 1; dx++) {
+            int cov = circ_cov(cx + dx, cy + dy, cx, cy, r);
+            if (cov <= 0) continue;
+            if (cov >= 255) put_px(cx + dx, cy + dy, c);
+            else blend_px(cx + dx, cy + dy, ((uint32_t)cov << 24) | rgb);
+        }
 }
 static void draw_line(int x0, int y0, int x1, int y1, uint32_t c) {
     int dx = x1 - x0, dy = y1 - y0;
@@ -171,21 +191,42 @@ static void draw_line(int x0, int y0, int x1, int y1, uint32_t c) {
         if (e2 < dx)  { err += dx; y0 += sy; }
     }
 }
-static void draw_char(int x, int y, char ch, uint32_t fg, uint32_t bg) {
+/* Текст БЕЗ фона (только пиксели глифа) — для градиентов и обоев, где
+ * прямоугольная подложка под буквами выглядела бы коробкой. */
+static void draw_char_t(int x, int y, char ch, uint32_t fg) {
     uint8_t idx = (uint8_t)ch;
     if (idx >= 128) idx = '?';
     const unsigned char *glyph = vos_font[idx];
     for (int row = 0; row < 16; row++) {
         uint8_t bits = glyph[row];
         for (int col = 0; col < 8; col++)
-            put_px(x + col, y + row, (bits & (0x80 >> col)) ? fg : bg);
+            if (bits & (0x80 >> col)) put_px(x + col, y + row, fg);
     }
 }
-static void draw_string(int x, int y, const char *s, uint32_t fg, uint32_t bg) {
+static void draw_string_t(int x, int y, const char *s, uint32_t fg) {
     int cx = x;
     while (*s) {
         if (*s == '\n') { cx = x; y += 16; }
-        else { draw_char(cx, y, *s, fg, bg); cx += 8; }
+        else { draw_char_t(cx, y, *s, fg); cx += 8; }
+        s++;
+    }
+}
+/* Текст с мягкой тенью — читаемость на любых обоях (метки иконок стола). */
+static void draw_string_sh(int x, int y, const char *s, uint32_t fg) {
+    int cx = x;
+    while (*s) {
+        if (*s == '\n') { cx = x; y += 16; s++; continue; }
+        uint8_t idx = (uint8_t)*s;
+        if (idx >= 128) idx = '?';
+        const unsigned char *glyph = vos_font[idx];
+        for (int row = 0; row < 16; row++) {
+            uint8_t bits = glyph[row];
+            for (int col = 0; col < 8; col++)
+                if (bits & (0x80 >> col))
+                    blend_px(cx + col + 1, y + row + 1, 0xA0000000u);
+        }
+        draw_char_t(cx, y, *s, fg);
+        cx += 8;
         s++;
     }
 }
@@ -423,6 +464,75 @@ static void cursor_refresh(void) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Обои: «aurora» — диагональный градиент + два мягких свечения + ordered
+ * dithering (Bayer 4x4), чтобы на 8-битных каналах не было полос. Рендерятся
+ * ОДИН раз при старте в отдельный shm-буфер; дальше заливка фона — это
+ * копирование строк, т.е. так же дёшево, как старый fill_rect одним цветом.
+ * ------------------------------------------------------------------------- */
+static uint32_t *wall;   /* 0 => обои не выделились, fallback DESK_BG */
+
+static const uint8_t bayer4[4][4] = {
+    {  0,  8,  2, 10 },
+    { 12,  4, 14,  6 },
+    {  3, 11,  1,  9 },
+    { 15,  7, 13,  5 },
+};
+
+static void wall_render(void) {
+    /* база: тёмно-синий (верх-лево) -> фиолетовый (низ-право), fixed <<8 */
+    const int r0 = 0x0E, g0 = 0x11, b0 = 0x24;
+    const int r1 = 0x2C, g1 = 0x16, b1 = 0x46;
+    /* свечения: голубое возле верх-право, бирюзовое возле низ-лево */
+    int gx1 = (int)fbw * 82 / 100, gy1 = (int)fbh * 6 / 100;
+    int gx2 = (int)fbw * 10 / 100, gy2 = (int)fbh * 96 / 100;
+    int R1 = (int)fbw * 55 / 100, R1sq = R1 * R1;
+    int R2 = (int)fbw * 42 / 100, R2sq = R2 * R2;
+    for (int y = 0; y < (int)fbh; y++) {
+        for (int x = 0; x < (int)fbw; x++) {
+            int t = x * 128 / ((int)fbw - 1) + y * 128 / ((int)fbh - 1);
+            int rf = r0 * (256 - t) + r1 * t;       /* value <<8 */
+            int gf = g0 * (256 - t) + g1 * t;
+            int bf = b0 * (256 - t) + b1 * t;
+
+            int dx = x - gx1, dy = y - gy1;
+            int d2 = dx * dx + dy * dy;
+            if (d2 < R1sq) {
+                int a = (int)(((int64_t)(R1sq - d2) << 8) / R1sq);  /* 0..256 */
+                a = a * a >> 8;                     /* мягче к краю */
+                rf += 0x10 * a; gf += 0x26 * a; bf += 0x5E * a;
+            }
+            dx = x - gx2; dy = y - gy2;
+            d2 = dx * dx + dy * dy;
+            if (d2 < R2sq) {
+                int a = (int)(((int64_t)(R2sq - d2) << 8) / R2sq);
+                a = a * a >> 8;
+                rf += 0x06 * a; gf += 0x30 * a; bf += 0x2E * a;
+            }
+
+            int dth = bayer4[y & 3][x & 3] * 16;    /* 0..240 как дробь <<8 */
+            int r = (rf + dth) >> 8; if (r > 255) r = 255;
+            int g = (gf + dth) >> 8; if (g > 255) g = 255;
+            int b = (bf + dth) >> 8; if (b > 255) b = 255;
+            wall[(uint32_t)y * fbw + x] =
+                0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        }
+    }
+}
+
+/* Заливка региона обоями (клип + построчное копирование). */
+static void fill_wall(int x, int y, int w, int h) {
+    if (!wall) { fill_rect(x, y, w, h, DESK_BG); return; }
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (int)fbw) w = (int)fbw - x;
+    if (y + h > (int)fbh) h = (int)fbh - y;
+    if (w <= 0 || h <= 0) return;
+    for (int j = 0; j < h; j++)
+        copy_px_row(&bb[(uint32_t)(y + j) * fbw + x],
+                    &wall[(uint32_t)(y + j) * fbw + x], w);
+}
+
+/* ---------------------------------------------------------------------------
  * Dock (порт kernel simple_wm: «пилюля» в стиле macOS, терминал /vterm)
  * ------------------------------------------------------------------------- */
 #define DOCK_ICON   48
@@ -463,21 +573,25 @@ static void dock_put_blend(int x, int y, uint32_t color, int a) {
     if (a >= 255) { put_px(x, y, color); return; }
     blend_px(x, y, ((uint32_t)a << 24) | (color & 0x00FFFFFF));
 }
+/* AA-скруглённый прямоугольник: углы сглаживаются покрытием circ_cov —
+ * никакой «лесенки». Итоговая альфа пикселя = a * cov / 255. */
 static void fill_round(int x, int y, int w, int h, int r, uint32_t color, int a) {
     if (r * 2 > w) r = w / 2;
     if (r * 2 > h) r = h / 2;
+    uint32_t rgb = color & 0x00FFFFFF;
     for (int j = 0; j < h; j++) {
         for (int i = 0; i < w; i++) {
             int cx = -1, cy = -1;
-            if (i < r && j < r)               { cx = r;         cy = r;         }
-            else if (i >= w - r && j < r)     { cx = w - r - 1; cy = r;         }
-            else if (i < r && j >= h - r)     { cx = r;         cy = h - r - 1; }
-            else if (i >= w - r && j >= h - r){ cx = w - r - 1; cy = h - r - 1; }
-            if (cx >= 0) {
-                int ddx = i - cx, ddy = j - cy;
-                if (ddx * ddx + ddy * ddy > r * r) continue;
-            }
-            dock_put_blend(x + i, y + j, color, a);
+            if (i < r)           cx = r;
+            else if (i >= w - r) cx = w - r;
+            if (j < r)           cy = r;
+            else if (j >= h - r) cy = h - r;
+            int cov = 255;
+            if (cx >= 0 && cy >= 0) cov = circ_cov(i, j, cx, cy, r);
+            if (cov <= 0) continue;
+            int aa = a * cov / 255;
+            if (aa >= 255) put_px(x + i, y + j, 0xFF000000u | rgb);
+            else blend_px(x + i, y + j, ((uint32_t)aa << 24) | rgb);
         }
     }
 }
@@ -528,7 +642,6 @@ static void dock_bounds(int *x, int *y, int *w, int *h) {
 #define DESK_CELL_H 84
 #define DESK_X0     12
 #define DESK_Y0     36
-#define DESK_SEL_BG 0xFF273458u
 
 typedef struct { const char *path; const char *label; int kind; } desk_icon_t;
 static const desk_icon_t desk_icons[] = {
@@ -583,19 +696,16 @@ static void desk_draw_tile(int kind, int x, int y, int s) {
 static void desk_draw_one(int idx) {
     int cx, cy; desk_cell_rect(idx, &cx, &cy);
     int selected = (desk_selected == idx);
-    uint32_t lbl_bg = DESK_BG;
-    if (selected) {
+    if (selected)
         fill_round(cx + 2, cy + 2, DESK_CELL_W - 4, DESK_CELL_H - 6, 8,
-                   DESK_SEL_BG, 255);
-        lbl_bg = DESK_SEL_BG;
-    }
+                   ACCENT, 85);    /* полупрозрачное акцентное, как в Plasma */
     int ix = cx + (DESK_CELL_W - DESK_ICONSZ) / 2;
     int iy = cy + 8;
     desk_draw_tile(desk_icons[idx].kind, ix, iy, DESK_ICONSZ);
     const char *t = desk_icons[idx].label;
     int len = 0; while (t[len]) len++;
-    draw_string(cx + (DESK_CELL_W - len * 8) / 2, iy + DESK_ICONSZ + 6,
-                t, 0xFFE8E8F0, lbl_bg);
+    draw_string_sh(cx + (DESK_CELL_W - len * 8) / 2, iy + DESK_ICONSZ + 6,
+                   t, 0xFFF0F2F8);
 }
 static void draw_desktop_icons(int rx, int ry, int rw, int rh) {
     for (int k = 0; k < DESK_NICONS; k++) {
@@ -683,7 +793,7 @@ static void draw_panel_chips(void) {
     int cy = (PANEL_H - CHIP_H) / 2;
     int ty = (PANEL_H - 16) / 2;
     for (int k = 0; k < n; k++) {
-        fill_round(chips[k].x, cy, chips[k].w, CHIP_H, 6, 0xFF2A2A3E, 255);
+        fill_round(chips[k].x, cy, chips[k].w, CHIP_H, 9, 0xFF3A4156, 230);
         char buf[CHIP_TITLE_MAX + 1];
         int i = 0;
         while (chips[k].title[i] && i < CHIP_TITLE_MAX) {
@@ -691,25 +801,33 @@ static void draw_panel_chips(void) {
             i++;
         }
         buf[i] = 0;
-        draw_string(chips[k].x + 7, ty, buf, 0xFF9AB8D8, 0xFF2A2A3E);
+        draw_string_t(chips[k].x + 7, ty, buf, 0xFFBDD0F0);
     }
 }
 
 static void draw_panel(void) {
     int W = (int)fbw;
-    fill_rect(0, 0, W, PANEL_H, PANEL_BG);
-    fill_rect(0, PANEL_H - 1, W, 1, 0xFF007ACC);
+    /* полупрозрачная тёмная плашка поверх обоев (а-ля Plasma) + тонкая
+     * акцентная линия снизу. Панель перерисовывается раз в секунду —
+     * блендинг полосы 28px дёшев. */
+    fill_wall(0, 0, W, PANEL_H);
+    for (int j = 0; j < PANEL_H - 1; j++)
+        for (int i = 0; i < W; i++)
+            blend_px(i, j, 0xD20D0E15u);
+    for (int i = 0; i < W; i++)
+        blend_px(i, PANEL_H - 1, 0xB0000000u | (ACCENT & 0x00FFFFFF));
 
     int ty = (PANEL_H - 16) / 2;
-    fill_rect(8, PANEL_H / 2 - 4, 8, 8, 0xFF007ACC);
-    int lx = 24;
-    draw_string(lx, ty, "VortexOS", 0xFFE0E0E0, PANEL_BG);
+    fill_round(8, ty, 16, 16, 5, ACCENT, 255);
+    draw_string_t(12, ty, "V", 0xFFFFFFFF);
+    int lx = 30;
+    draw_string_t(lx, ty, "VortexOS", 0xFFE8EAF2);
     lx += 8 * 8;
 
     vwin_t *fw = find_window(focused_id);
     if (fw && fw->title[0]) {
-        fill_rect(lx + 8, ty + 1, 1, 14, 0xFF44445A);
-        draw_string(lx + 16, ty, fw->title, 0xFF9AB8D8, PANEL_BG);
+        fill_rect(lx + 8, ty + 1, 1, 14, 0xFF3A3F55);
+        draw_string_t(lx + 16, ty, fw->title, 0xFFAFC6E8);
     }
 
     draw_panel_chips();
@@ -720,7 +838,7 @@ static void draw_panel(void) {
     clk[0] = '0' + hms[0] / 10; clk[1] = '0' + hms[0] % 10; clk[2] = ':';
     clk[3] = '0' + hms[1] / 10; clk[4] = '0' + hms[1] % 10; clk[5] = ':';
     clk[6] = '0' + hms[2] / 10; clk[7] = '0' + hms[2] % 10; clk[8] = 0;
-    draw_string(W - 8 * 8 - 10, ty, clk, 0xFFFFFFFF, PANEL_BG);
+    draw_string_t(W - 8 * 8 - 10, ty, clk, 0xFFF2F4FA);
 }
 
 /* ---------------------------------------------------------------------------
@@ -801,22 +919,20 @@ static void win_draw_shadow(int wx, int wy, int ww, int wh) {
             }
     }
 }
-static int circ_cov(int px, int py, int cx, int cy, int r) {
-    int r2x64 = r * r * 64;
-    int in = 0;
-    for (int sy = 0; sy < 4; sy++)
-        for (int sx = 0; sx < 4; sx++) {
-            int fx = (px - cx) * 8 + sx * 2 + 1;
-            int fy = (py - cy) * 8 + sy * 2 + 1;
-            if (fx * fx + fy * fy <= r2x64) in++;
-        }
-    return in * 255 / 16;
-}
-static void fill_round_top(int x, int y, int w, int h, int r, uint32_t color) {
+/* Титлбар: вертикальный градиент ctop->cbot + AA-скругление верхних углов. */
+static void fill_round_top(int x, int y, int w, int h, int r,
+                           uint32_t ctop, uint32_t cbot) {
     if (r * 2 > w) r = w / 2;
     if (r > h) r = h;
-    uint32_t rgb = color & 0x00FFFFFF;
-    for (int j = 0; j < h; j++)
+    int rt = (ctop >> 16) & 0xFF, gt = (ctop >> 8) & 0xFF, bt = ctop & 0xFF;
+    int rB = (cbot >> 16) & 0xFF, gB = (cbot >> 8) & 0xFF, bB = cbot & 0xFF;
+    for (int j = 0; j < h; j++) {
+        int t = (h > 1) ? j * 256 / (h - 1) : 0;
+        uint32_t cr = (uint32_t)((rt * (256 - t) + rB * t) >> 8);
+        uint32_t cg = (uint32_t)((gt * (256 - t) + gB * t) >> 8);
+        uint32_t cb = (uint32_t)((bt * (256 - t) + bB * t) >> 8);
+        uint32_t color = 0xFF000000u | (cr << 16) | (cg << 8) | cb;
+        uint32_t rgb = color & 0x00FFFFFF;
         for (int i = 0; i < w; i++) {
             if (j < r && (i < r || i >= w - r)) {
                 int cx  = (i < r) ? r : (w - r);
@@ -828,6 +944,7 @@ static void fill_round_top(int x, int y, int w, int h, int r, uint32_t color) {
                 put_px(x + i, y + j, color);
             }
         }
+    }
 }
 static void round_bottom_aa(int x, int y, int w, int fh, int r,
                             const uint32_t *bgL, const uint32_t *bgR) {
@@ -930,21 +1047,38 @@ static void draw_window_chrome(vwin_t *win) {
 
     win_draw_shadow(win->x, win->y, win->w, fh);
 
-    uint32_t tcol = focused ? 0xFF3A3A5E : 0xFF2C2C3A;
-    fill_round_top(win->x, win->y, win->w, TITLEBAR_H, WIN_CORNER, tcol);
+    if (focused)
+        fill_round_top(win->x, win->y, win->w, TITLEBAR_H, WIN_CORNER,
+                       0xFF434A6A, 0xFF2D3148);
+    else
+        fill_round_top(win->x, win->y, win->w, TITLEBAR_H, WIN_CORNER,
+                       0xFF2B2D3C, 0xFF222330);
     for (int i = WIN_CORNER; i < win->w - WIN_CORNER; i++)
-        blend_px(win->x + i, win->y, 0x28FFFFFFu);
+        blend_px(win->x + i, win->y, 0x30FFFFFFu);
 
-    uint32_t cclose = focused ? 0xFFFF5F56 : 0xFF6E6E78;
-    uint32_t cmin   = focused ? 0xFFFFBD2E : 0xFF6E6E78;
-    uint32_t cmax   = focused ? 0xFF27C93F : 0xFF6E6E78;
+    uint32_t cclose = focused ? 0xFFFF5F56 : 0xFF565664;
+    uint32_t cmin   = focused ? 0xFFFFBD2E : 0xFF565664;
+    uint32_t cmax   = focused ? 0xFF27C93F : 0xFF565664;
     int cy = win->y + TITLEBAR_H / 2;
-    fill_circle(win->x + BTN_X0,               cy, BTN_R, cclose);
-    fill_circle(win->x + BTN_X0 + BTN_GAP,     cy, BTN_R, cmin);
-    fill_circle(win->x + BTN_X0 + 2 * BTN_GAP, cy, BTN_R, cmax);
+    int bx = win->x + BTN_X0;
+    fill_circle(bx,               cy, BTN_R, cclose);
+    fill_circle(bx + BTN_GAP,     cy, BTN_R, cmin);
+    fill_circle(bx + 2 * BTN_GAP, cy, BTN_R, cmax);
+    if (focused) {
+        /* глифы на светофорах (×  –  +) — тёмные поверх цвета кнопки */
+        const uint32_t g = 0x96000000u;
+        for (int d = -2; d <= 2; d++) {
+            blend_px(bx + d, cy + d, g);            /* ×  close    */
+            if (d) blend_px(bx + d, cy - d, g);
+            blend_px(bx + BTN_GAP + d, cy, g);      /* –  minimize */
+            blend_px(bx + 2 * BTN_GAP + d, cy, g);  /* +  maximize */
+            if (d) blend_px(bx + 2 * BTN_GAP, cy + d, g);
+        }
+    }
 
     int tx = win->x + BTN_X0 + 2 * BTN_GAP + BTN_R + 10;
-    draw_string(tx, win->y + (TITLEBAR_H - 16) / 2, win->title, 0xFFE0E0E0, tcol);
+    draw_string_t(tx, win->y + (TITLEBAR_H - 16) / 2, win->title,
+                  focused ? 0xFFEDEFF6 : 0xFF9A9DB0);
 
     const int rb = WIN_CORNER;
     uint32_t bgL[WIN_CORNER * WIN_CORNER], bgR[WIN_CORNER * WIN_CORNER];
@@ -963,7 +1097,8 @@ static void draw_window_chrome(vwin_t *win) {
     if (rb * 2 <= win->w && rb <= fh)
         round_bottom_aa(win->x, win->y, win->w, fh, rb, bgL, bgR);
 
-    uint32_t bord = focused ? 0xFF4A4A72 : 0xFF34343E;
+    /* активное окно очерчено акцентом (как в Plasma), остальные — нейтрально */
+    uint32_t bord = focused ? ACCENT : 0xFF363642u;
     draw_round_border(win->x, win->y, win->w, fh, WIN_CORNER, bord);
 }
 
@@ -971,7 +1106,7 @@ static void draw_window_chrome(vwin_t *win) {
  * Рендер: полный кадр + частичный регион (порт wm_render_all/wm_render_region)
  * ------------------------------------------------------------------------- */
 static void render_all(void) {
-    for (uint32_t i = 0; i < fbw * fbh; i++) bb[i] = DESK_BG;
+    fill_wall(0, 0, (int)fbw, (int)fbh);
     draw_desktop_icons(0, 0, (int)fbw, (int)fbh);
     for (int i = 0; i < MAX_WINDOWS; i++)
         if (windows[i].id && windows[i].pixels && !windows[i].minimized)
@@ -1002,7 +1137,7 @@ static void render_region(int rx, int ry, int rw, int rh) {
 
     dmg_reset();
     cursor_take_down();
-    fill_rect(rx, ry, rw, rh, DESK_BG);
+    fill_wall(rx, ry, rw, rh);
     draw_desktop_icons(rx, ry, rw, rh);
 
     for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -1646,6 +1781,14 @@ void _start(void) {
     if (!bb) {
         puts("vwm: shm_map back buffer failed\n");
         exit(1);
+    }
+
+    /* 2b. Обои: ещё один shm-сегмент, рендерим один раз. Не выделились —
+     * не страшно: fill_wall откатится на плоский DESK_BG. */
+    uint64_t wall_shm = vos_shm_create((uint64_t)fbw * fbh * 4);
+    if (wall_shm != (uint64_t)-1) {
+        wall = (uint32_t *)vos_shm_map(wall_shm);
+        if (wall) wall_render();
     }
 
     /* 3. Становимся WM: сервис + весь ввод наш */
