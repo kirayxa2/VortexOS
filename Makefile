@@ -57,6 +57,7 @@ ASM_SRCS := \
 
 C_SRCS := \
     kernel/kmain.c                     \
+    kernel/lib/string.c                \
     kernel/arch/x86_64/gdt.c           \
     kernel/arch/x86_64/idt.c           \
     kernel/arch/x86_64/syscall.c       \
