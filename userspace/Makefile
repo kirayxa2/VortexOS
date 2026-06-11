@@ -3,7 +3,7 @@ CC := $(TOOLCHAIN)/x86_64-elf-gcc
 CFLAGS := -std=c11 -ffreestanding -fno-stack-protector -nostdlib -fno-builtin -static -Wall -Wextra -O2
 LDFLAGS := -nostdlib -static -Wl,--build-id=none -Wl,-T,linker.ld
 
-all: hello vortexgraph test_window vsh
+all: hello vortexgraph test_window vsh vwm vterm vdemo
 
 hello: hello.c linker.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) hello.c -o hello
@@ -17,7 +17,16 @@ test_window: test_window.c syscalls.h linker.ld
 vsh: vsh.c syscalls.h linker.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) vsh.c -o vsh
 
+vwm: vwm.c vos_abi.h syscalls.h font8x16.h linker.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) vwm.c -o vwm
+
+vterm: vterm.c vos_abi.h syscalls.h font8x16.h linker.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) vterm.c -o vterm
+
+vdemo: vdemo.c vos_abi.h syscalls.h font8x16.h linker.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) vdemo.c -o vdemo
+
 clean:
-	rm -f hello vortexgraph test_window vsh
+	rm -f hello vortexgraph test_window vsh vwm vterm vdemo
 
 .PHONY: all clean

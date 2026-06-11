@@ -84,7 +84,23 @@ static void mouse_handler(interrupt_frame_t *frame) {
     /* Уведомляем WM о движении мыши */
     extern void wm_handle_mouse_move(int dx, int dy);
     extern void wm_handle_mouse_button(uint8_t buttons);
-    
+    extern int  ipc_input_grabbed(void);
+    extern void ipc_input_push_mouse(int dx, int dy, uint8_t buttons, int btn_changed);
+
+    /* Если userspace WM забрал ввод (feat/userspace-wm) — события мыши уходят
+     * сообщениями в его mailbox (движение коалесируется), kernel-WM спит. */
+    if (ipc_input_grabbed()) {
+        uint8_t btns = 0;
+        if (mouse_state.left)   btns |= 0x01;
+        if (mouse_state.right)  btns |= 0x02;
+        if (mouse_state.middle) btns |= 0x04;
+        int changed = (btns != last_button_state);
+        if (changed) last_button_state = btns;
+        if (dx != 0 || dy != 0 || changed)
+            ipc_input_push_mouse(dx, dy, btns, changed);
+        return;
+    }
+
     if (dx != 0 || dy != 0) {
         wm_handle_mouse_move(dx, dy);
     }

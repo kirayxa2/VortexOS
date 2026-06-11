@@ -15,6 +15,8 @@
 #include "pit.h"
 #include "vmm.h"
 #include "simple_wm.h"
+#include "virtio_gpu.h"
+#include "ipc.h"
 #include <stddef.h>  // для size_t
 
 /* MSR адреса */
@@ -55,17 +57,14 @@ static uint64_t sys_exit(uint64_t code) {
     
     /* Переключаемся обратно на kernel PML4 */
     vmm_switch(vmm_kernel_pml4);
-    
-    /* Просто уходим в бесконечный kernel idle loop.
-     * Scheduler больше не вызовет этот процесс. */
-    __asm__ volatile(
-        "cli\n"                     // Отключаем прерывания
-        "1:\n"
-        "   hlt\n"
-        "   jmp 1b\n"
-        ::: "memory"
-    );
-    
+
+    /* БАГФИКС: раньше тут был cli + hlt навсегда — это вешало ВСЮ машину
+     * (с выключенными прерываниями hlt никогда не проснётся, планировщик не
+     * получает IRQ0 и не может снять задачу с CPU). Теперь честно завершаем
+     * задачу: помечаем DEAD, снимаем с очереди и ждём первый IRQ с
+     * ВКЛЮЧЁННЫМИ прерываниями — sched_pick переключит на другую задачу и
+     * сюда больше никогда не вернётся. */
+    task_exit();
     __builtin_unreachable();
 }
 
@@ -110,12 +109,24 @@ static uint64_t sys_fb_info(uint64_t user_buf_addr) {
     
     fb_info_t info;
     
-    /* Получаем физический адрес framebuffer */
-    info.phys_addr = vmm_virt_to_phys(vmm_kernel_pml4, (uint64_t)fb_addr);
-    info.width = fb_width;
-    info.height = fb_height;
-    info.pitch = fb_pitch;
-    info.bpp = 32; /* BGRA 8888 */
+    /* Если активен virtio-gpu — «настоящий» экран это его backing-буфер
+     * (Limine fb больше не сканируется). Отдаём его геометрию, иначе
+     * userspace-рисование уйдёт в невидимый буфер. */
+    if (virtio_gpu_active()) {
+        info.phys_addr = vmm_virt_to_phys(vmm_kernel_pml4,
+                                          (uint64_t)virtio_gpu_framebuffer());
+        info.width  = virtio_gpu_width();
+        info.height = virtio_gpu_height();
+        info.pitch  = virtio_gpu_pitch();
+        info.bpp    = 32;
+    } else {
+        /* Получаем физический адрес framebuffer */
+        info.phys_addr = vmm_virt_to_phys(vmm_kernel_pml4, (uint64_t)fb_addr);
+        info.width = fb_width;
+        info.height = fb_height;
+        info.pitch = fb_pitch;
+        info.bpp = 32; /* BGRA 8888 */
+    }
     
     /* Копируем в userspace побайтово */
     fb_info_t *user_buf = (fb_info_t *)user_buf_addr;
@@ -133,43 +144,142 @@ static uint64_t sys_fb_map(void) {
     extern uint32_t fb_width, fb_height;
     extern uint64_t fb_pitch;
     extern uint64_t hhdm_offset; /* HHDM offset из vmm */
-    
-    /* Получаем физический адрес framebuffer */
-    /* fb_addr обычно уже в HHDM диапазоне от Limine */
-    uint64_t fb_virt = (uint64_t)fb_addr;
-    uint64_t fb_phys;
-    
-    if (fb_virt >= hhdm_offset) {
-        /* HHDM адрес — используем простую арифметику */
-        fb_phys = fb_virt - hhdm_offset;
+
+    /* Какой буфер на самом деле показывается? При активном virtio-gpu это его
+     * backing (kmalloc-память ядра, физически НЕ смежная — phys ищем walk'ом
+     * на каждую страницу). Иначе — линейный Limine framebuffer (физически
+     * смежный). */
+    uint64_t base_virt, fb_size;
+    int contiguous;
+    if (virtio_gpu_active()) {
+        base_virt  = (uint64_t)virtio_gpu_framebuffer();
+        fb_size    = (uint64_t)virtio_gpu_height() * virtio_gpu_pitch();
+        contiguous = 0;
     } else {
-        /* Попытка через page table walk */
-        fb_phys = vmm_virt_to_phys(vmm_kernel_pml4, fb_virt);
-        if (!fb_phys) return 0;
+        base_virt  = (uint64_t)fb_addr;
+        fb_size    = fb_height * fb_pitch;
+        contiguous = 1;
     }
-    
+
+    uint64_t fb_phys = 0;
+    if (contiguous) {
+        if (base_virt >= hhdm_offset) {
+            /* HHDM адрес — используем простую арифметику */
+            fb_phys = base_virt - hhdm_offset;
+        } else {
+            /* Попытка через page table walk */
+            fb_phys = vmm_virt_to_phys(vmm_kernel_pml4, base_virt);
+            if (!fb_phys) return 0;
+        }
+    }
+
     /* Мапим framebuffer в userspace на фиксированный адрес 0x80000000 */
     uint64_t user_fb_vaddr = 0x80000000;
-    uint64_t fb_size = fb_height * fb_pitch;
     uint64_t num_pages = (fb_size + 4095) / 4096;
-    
+
     /* Получаем текущий PML4 из CR3 (физический адрес) */
     uint64_t cr3_phys;
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3_phys));
     cr3_phys &= ~0xFFF; /* Убираем флаги */
-    
+
     /* Преобразуем физический адрес PML4 в виртуальный через HHDM */
     pte_t *user_pml4 = (pte_t *)(cr3_phys + hhdm_offset);
-    
+
     /* Мапим страницы framebuffer в USER page table */
     for (uint64_t i = 0; i < num_pages; i++) {
+        uint64_t page_phys;
+        if (contiguous) {
+            page_phys = fb_phys + i * 4096;
+        } else {
+            page_phys = vmm_virt_to_phys(vmm_kernel_pml4, base_virt + i * 4096);
+            if (!page_phys) return 0;
+        }
         vmm_map(user_pml4,
                 user_fb_vaddr + i * 4096,
-                fb_phys + i * 4096,
+                page_phys,
                 VMM_PRESENT | VMM_WRITABLE | VMM_USER);
     }
     
     return user_fb_vaddr;
+}
+
+/* -------------------------------------------------------------------------
+ * Syscall'ы для userspace window manager'а (feat/userspace-wm)
+ * ------------------------------------------------------------------------- */
+
+/* Запустить ELF с диска: sys_spawn("/vterm"). Путь копируем в kernel-память —
+ * userdata читается загрузчиком уже в ДРУГОМ адресном пространстве. */
+static uint64_t sys_spawn(uint64_t user_path) {
+    extern void userspace_elf_loader_task(void);
+    extern void *kmalloc(uint64_t);
+    if (!user_path) return (uint64_t)-1;
+
+    const char *src = (const char *)user_path;
+    char *path = (char *)kmalloc(64);
+    if (!path) return (uint64_t)-1;
+    int i = 0;
+    while (src[i] && i < 63) { path[i] = src[i]; i++; }
+    path[i] = 0;
+    if (i == 0) return (uint64_t)-1;
+
+    task_t *t = task_create("app", userspace_elf_loader_task, 10);
+    if (!t) return (uint64_t)-1;
+    t->userdata = path;
+    return t->pid;
+}
+
+/* Текущее время RTC (CMOS) — для часов на панели userspace WM. */
+static inline uint8_t cmos_read_sc(uint8_t reg) {
+    uint8_t v;
+    __asm__ volatile("outb %0, $0x70" :: "a"(reg));
+    __asm__ volatile("inb $0x71, %0" : "=a"(v));
+    return v;
+}
+
+static uint64_t sys_rtc(uint64_t user_buf) {
+    if (!user_buf) return (uint64_t)-1;
+    uint8_t h = cmos_read_sc(0x04), m = cmos_read_sc(0x02), s = cmos_read_sc(0x00);
+    uint8_t status_b = cmos_read_sc(0x0B);
+    if (!(status_b & 0x04)) {   /* BCD-режим — конвертируем */
+        h = (uint8_t)((h >> 4) * 10 + (h & 0x0F));
+        m = (uint8_t)((m >> 4) * 10 + (m & 0x0F));
+        s = (uint8_t)((s >> 4) * 10 + (s & 0x0F));
+    }
+    uint32_t *out = (uint32_t *)user_buf;
+    out[0] = h; out[1] = m; out[2] = s;
+    return 0;
+}
+
+/* Программный vsync для userspace WM (Limine-путь): ждём начало vblank через
+ * VGA Input Status 1 (порт 0x3DA, бит 3). На UEFI/GOP-железе регистр может
+ * быть мёртв — оба цикла с таймаутом, при срабатывании сами отключаемся.
+ * При virtio-gpu vsync не нужен (RESOURCE_FLUSH показывает кадр атомарно). */
+static int user_vsync_enabled = 1;
+
+static uint64_t sys_vsync(void) {
+    if (virtio_gpu_active() || !user_vsync_enabled) return 0;
+    uint8_t v; uint32_t guard;
+    guard = 1000000;
+    do {
+        __asm__ volatile("inb $0x3DA, %0" : "=a"(v));
+    } while ((v & 0x08) && --guard);
+    if (!guard) { user_vsync_enabled = 0; return 0; }
+    guard = 1000000;
+    do {
+        __asm__ volatile("inb $0x3DA, %0" : "=a"(v));
+    } while (!(v & 0x08) && --guard);
+    if (!guard) user_vsync_enabled = 0;
+    return 0;
+}
+
+/* Present для virtio-gpu: после записи пикселей в backing нужно явно запушить
+ * прямоугольник в хост (TRANSFER + FLUSH). На Limine-пути — no-op (запись в
+ * linear framebuffer видна сразу). */
+static uint64_t sys_fb_present(uint64_t x, uint64_t y, uint64_t w, uint64_t h) {
+    if (virtio_gpu_active())
+        virtio_gpu_flush((int)(int64_t)x, (int)(int64_t)y,
+                         (int)(int64_t)w, (int)(int64_t)h);
+    return 0;
 }
 
 /* Структура для событий ввода */
@@ -222,6 +332,20 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, u
             return wm_wait_event(a1, (void *)a2);
         case 16: // SYS_BLOCK — припарковать задачу навсегда (0% CPU)
             return sys_block();
+
+        /* --- userspace window manager (feat/userspace-wm) --- */
+        case 17: return ipc_sys_send(a1, a2);          // SYS_IPC_SEND(dst_pid, msg)
+        case 18: return ipc_sys_recv(a1, a2);          // SYS_IPC_RECV(msg, timeout)
+        case 19: return ipc_sys_shm_create(a1);        // SYS_SHM_CREATE(size) -> id
+        case 20: return ipc_sys_shm_map(a1);           // SYS_SHM_MAP(id) -> vaddr
+        case 21: return ipc_sys_input_grab();          // SYS_INPUT_GRAB
+        case 22: return ipc_sys_svc_register(a1);      // SYS_SVC_REGISTER(svc)
+        case 23: return ipc_sys_svc_lookup(a1);        // SYS_SVC_LOOKUP(svc) -> pid
+        case 24: return sys_spawn(a1);                 // SYS_SPAWN(path) -> pid
+        case 25: return pit_ticks();                   // SYS_UPTIME -> тики PIT (100 Hz)
+        case 26: return sys_rtc(a1);                   // SYS_RTC(buf: 3 x uint32 h,m,s)
+        case 27: return sys_vsync();                   // SYS_VSYNC — ждать vblank
+        case 28: return sys_fb_present(a1,a2,a3,a4);   // SYS_FB_PRESENT(x,y,w,h)
         default: return (uint64_t)-1;
     }
 }

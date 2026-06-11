@@ -92,7 +92,15 @@ static void kb_handler(interrupt_frame_t *frame) {
 
     /* Доставляем символ в GUI-окно с фокусом (userspace терминал и т.п.).
      * Если фокуса/окон нет — функция тихо ничего не делает. */
-    wm_handle_key(c);
+    /* Если userspace WM забрал ввод (feat/userspace-wm) — клавиша уходит
+     * сообщением в его mailbox, встроенный kernel-WM её не видит. */
+    extern int  ipc_input_grabbed(void);
+    extern void ipc_input_push_key(char ascii, int pressed);
+    if (ipc_input_grabbed()) {
+        ipc_input_push_key(c, 1);
+    } else {
+        wm_handle_key(c);
+    }
 }
 
 void keyboard_init(void) {

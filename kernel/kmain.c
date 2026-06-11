@@ -476,7 +476,12 @@ void kmain(void) {
     ata_init();
 
     syscall_init();
-    
+
+    /* IPC (сообщения, shared memory, input grab) — фундамент userspace WM. */
+    extern void ipc_init(void);
+    ipc_init();
+    fb_puts("[OK] IPC initialized\n");
+
     /* Initialize Window Manager */
     extern void wm_init(void);
     wm_init();
@@ -537,6 +542,34 @@ void kmain(void) {
     /* Создаём тестовые задачи */
     /* GUI теперь полностью в userspace через window manager */
     
+    /* --- userspace window manager (feat/userspace-wm) -------------------
+     * Если на диске есть /vwm — вся графика уходит в userspace «по-взрослому»:
+     * /vwm сам маппит framebuffer, забирает ввод (input grab), регистрируется
+     * сервисом WM и запускает приложения (/vterm, /vdemo) через sys_spawn.
+     * Встроенный kernel-WM (simple_wm) в этом случае НЕ запускаем вообще:
+     * ни /vsh, ни задачу рендера, ни dock — нечему конфликтовать.
+     * Если /vwm на диске нет — всё работает по-старому (как в main). */
+    int use_userspace_wm = 0;
+    {
+        vfs_node_t *vwm_node = vfs_open("/vwm", 0);
+        if (vwm_node) {
+            vfs_close(vwm_node);
+            use_userspace_wm = 1;
+            fb_puts("[OK] /vwm FOUND! Starting userspace window manager\n");
+
+            /* Та же задержка 3 секунды, что и у остальных GUI-задач. */
+            uint64_t start = pit_ticks();
+            while (pit_ticks() - start < 300);
+
+            task_t *vwm_task = task_create("vwm", userspace_elf_loader_task, 10);
+            if (vwm_task) vwm_task->userdata = (void *)"/vwm";
+
+            fb_puts("[SCHEDULER] Starting multitasking (userspace WM)...\n\n");
+            for (;;) __asm__ volatile("hlt");   /* kmain = idle task */
+        }
+    }
+    (void)use_userspace_wm;
+
     /* Сначала пробуем терминал /vsh (userspace Vortex Shell), потом
      * window test / vgraph если терминала нет на диске. */
     fb_puts("[TEST] Checking for /vsh...\n");

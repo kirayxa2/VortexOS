@@ -34,7 +34,8 @@ CFLAGS := \
     -Ikernel/drivers      \
     -Ikernel/mm           \
     -Ikernel/sched        \
-    -Ikernel/fs
+    -Ikernel/fs           \
+    -Ikernel/ipc
 
 ASFLAGS := -f elf64
 
@@ -77,6 +78,7 @@ C_SRCS := \
     kernel/fs/fat32.c                  \
     kernel/fs/elf.c                    \
     kernel/fs/shell.c                  \
+    kernel/ipc/ipc.c                   \
     kernel/sched/sched.c
 
 ASM_OBJS := $(patsubst %.asm, build/%.o, $(ASM_SRCS))
@@ -185,4 +187,7 @@ disk-with-apps: disk userspace
 	python3 tools/add_file.py build/disk.img userspace/vortexgraph vgraph
 	python3 tools/add_file.py build/disk.img userspace/test_window testwin
 	python3 tools/add_file.py build/disk.img userspace/vsh vsh
+	python3 tools/add_file.py build/disk.img userspace/vwm vwm
+	python3 tools/add_file.py build/disk.img userspace/vterm vterm
+	python3 tools/add_file.py build/disk.img userspace/vdemo vdemo
 	@echo "=== Disk with apps ready ==="

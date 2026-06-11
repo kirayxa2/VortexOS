@@ -141,7 +141,11 @@ void task_exit(void) {
     current->state = TASK_DEAD;
     queue_remove(current);
     vos_need_resched = 1;
-    for (;;) __asm__ volatile("hlt");
+    /* БАГФИКС: hlt с ВЫКЛЮЧЕННЫМИ прерываниями никогда не проснётся — машина
+     * висла бы намертво при первом же выходе процесса. Включаем прерывания:
+     * первый IRQ вызовет sched_pick, который (раз мы DEAD и сняты с очереди)
+     * переключится на другую задачу и сюда больше не вернётся. */
+    for (;;) __asm__ volatile("sti\n\thlt");
 }
 
 void sched_irq_tick(void) {

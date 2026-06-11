@@ -68,6 +68,11 @@ static void pit_handler(interrupt_frame_t *frame) {
         render_request = 1;
     }
 
+    /* Будим ipc_sys_recv с истёкшим таймаутом (userspace WM использует
+     * recv-с-таймаутом как «таймер кадра»). */
+    extern void ipc_tick(void);
+    ipc_tick();
+
     extern void sched_irq_tick(void);
     sched_irq_tick();
 }
