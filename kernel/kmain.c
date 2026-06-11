@@ -502,19 +502,48 @@ void kmain(void) {
     wm_init();
     fb_puts("[OK] Window Manager initialized\n");
 
-    /* --- FAT32 тест ------------------------------------------------ */
-    fb_puts("[TEST] Trying to mount FAT32...\n");
+    /* --- Файловые системы ------------------------------------------------
+     * Порядок: VortexFS (drive 0) → FAT32 (drive 0) → ramfs (fallback).
+     * VortexFS — нативная FS VortexOS, по умолчанию корневая.
+     * FAT32 и ramfs остаются как fallback на случай отсутствия VortexFS.
+     * -------------------------------------------------------------------- */
     vfs_init();
-    if (fat32_init() == 0) {
-        fb_puts("[OK] FAT32 boot sector read\n");
-        fat32_mount();
-    } else {
-        fb_puts("[WARN] FAT32 failed, using ramfs\n");
+    int root_mounted = 0;
+    int root_is_vortexfs = 0;  /* VortexFS single-instance guard */
+
+    /* 1) VortexFS на ATA master (drive 0) */
+    {
+        ata_drive_t *master_drv = ata_get_drive(0);
+        if (master_drv) {
+            fb_puts("[FS] Trying VortexFS on drive 0...\n");
+            if (vortexfs_init(0, 0) == 0) {
+                vfs_node_t *vtxfs_root = vortexfs_get_root();
+                if (vtxfs_root) {
+                    vfs_mount_root(vtxfs_root);
+                    fb_puts("[OK] VortexFS mounted as root\n");
+                    root_mounted = 1;
+                    root_is_vortexfs = 1;
+                }
+            }
+        }
+    }
+
+    /* 2) Fallback: FAT32 на ATA master */
+    if (!root_mounted) {
+        fb_puts("[FS] Trying FAT32...\n");
+        if (fat32_init() == 0) {
+            fb_puts("[OK] FAT32 boot sector read\n");
+            fat32_mount();
+            root_mounted = 1;
+        }
+    }
+
+    /* 3) Fallback: ramfs */
+    if (!root_mounted) {
+        fb_puts("[WARN] No disk FS found, using ramfs\n");
         vfs_node_t *ramfs_root = ramfs_create_root();
         vfs_mount_root(ramfs_root);
         fb_puts("[OK] VFS + ramfs mounted\n");
-        
-        /* Создаём базовую структуру директорий */
         vfs_mkdir("/bin");
         vfs_mkdir("/etc");
         vfs_mkdir("/tmp");
@@ -535,9 +564,9 @@ void kmain(void) {
         }
         vfs_close(testfile);
     } else {
-        fb_puts("[VFS] /test.txt NOT FOUND!\n");
+        fb_puts("[VFS] /test.txt not found (OK if fresh image)\n");
     }
-    
+
     fb_puts("[TEST] Checking /bin/hello...\n");
     vfs_node_t *hello_test = elf_open_exec("/bin/hello");
     if (hello_test) {
@@ -547,13 +576,17 @@ void kmain(void) {
         fb_puts("[VFS] /bin/hello NOT FOUND!\n");
     }
 
-    /* --- VortexFS на втором ATA диске (slave) ----------------------------- */
+    /* --- Второй ATA диск (slave) — доп. хранилище --------------------------
+     * VortexFS пока single-instance (один набор глобалов), поэтому если
+     * root уже VortexFS — второй диск не монтируем как VortexFS (иначе
+     * перезапишем глобалы и сломаем root). TODO: multi-instance VortexFS. */
     {
         ata_drive_t *slave_drv = ata_get_drive(1);
-        if (slave_drv) {
-            fb_puts("[TEST] Found ATA slave, trying VortexFS...\n");
+        if (slave_drv && !root_is_vortexfs) {
+            /* root не VortexFS — можно попробовать VortexFS на slave */
+            fb_puts("[FS] Found ATA slave, trying VortexFS...\n");
             if (vortexfs_init(1, 0) != 0) {
-                fb_puts("[VortexFS] No FS found, formatting...\n");
+                fb_puts("[VortexFS] No FS found on slave, formatting...\n");
                 vortexfs_mkfs(1, 0, slave_drv->sectors);
                 vortexfs_init(1, 0);
             }
@@ -563,8 +596,8 @@ void kmain(void) {
                 vfs_mount("/mnt", vtxfs_root);
                 fb_puts("[OK] VortexFS mounted at /mnt\n");
             }
-        } else {
-            fb_puts("[INFO] No ATA slave — VortexFS skipped\n");
+        } else if (slave_drv) {
+            fb_puts("[INFO] ATA slave present but VortexFS is single-instance; skipping\n");
         }
     }
 
