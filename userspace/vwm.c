@@ -25,7 +25,7 @@
 /* ---------------------------------------------------------------------------
  * Геометрия и палитра (соответствуют kernel simple_wm, чтобы вид не менялся)
  * ------------------------------------------------------------------------- */
-#define TITLEBAR_H    20
+#define TITLEBAR_H    24
 #define WIN_CORNER    10
 #define WIN_SHADOW    10
 #define WIN_SHADOW_OY 4
@@ -35,6 +35,8 @@
 #define BTN_X0        14
 
 #define RESIZE_BORDER 6
+#define RZ_TOP_INNER  3   /* зона ресайза ВНУТРИ титлбара — узкая, чтобы не съедать drag */
+#define CORNER_GRAB   16  /* захват угла: столько px вдоль кромки от угла = диагональ  */
 #define MIN_WIN_W     140
 #define MIN_WIN_H     80
 #define RZ_LEFT       1
@@ -235,9 +237,20 @@ static void present(void) {
 /* ---------------------------------------------------------------------------
  * Курсор (save-under, порт kernel compositor.c)
  * ------------------------------------------------------------------------- */
-#define CUR_W 12
-#define CUR_H 19
-static const char *const cursor_arrow[CUR_H] = {
+#define CUR_MAX_W 19
+#define CUR_MAX_H 19
+
+/* Формы курсора: стрелка + 4 ресайзных (как в Windows) */
+enum {
+    CUR_ARROW = 0,
+    CUR_SIZE_H,      /* ↔  левый/правый край          */
+    CUR_SIZE_V,      /* ↕  верхний/нижний край         */
+    CUR_SIZE_NWSE,   /* ⤡  углы ЛВ/ПН                  */
+    CUR_SIZE_NESW,   /* ⤢  углы ПВ/ЛН                  */
+    CUR_NSHAPES
+};
+
+static const char *const cur_rows_arrow[19] = {
     "X           ",
     "XX          ",
     "X.X         ",
@@ -258,49 +271,132 @@ static const char *const cursor_arrow[CUR_H] = {
     "      X..X  ",
     "       XX   ",
 };
-static uint32_t cur_save[CUR_W * CUR_H];
-static int cur_x, cur_y, cur_in_back = 0;
+static const char *const cur_rows_size_h[9] = {
+    "    X         X    ",
+    "   XX         XX   ",
+    "  X.X         X.X  ",
+    " X..XXXXXXXXXXX..X ",
+    "X.................X",
+    " X..XXXXXXXXXXX..X ",
+    "  X.X         X.X  ",
+    "   XX         XX   ",
+    "    X         X    ",
+};
+static const char *const cur_rows_size_v[19] = {
+    "    X    ",
+    "   X.X   ",
+    "  X...X  ",
+    " X.....X ",
+    "XXXX.XXXX",
+    "   X.X   ",
+    "   X.X   ",
+    "   X.X   ",
+    "   X.X   ",
+    "   X.X   ",
+    "   X.X   ",
+    "   X.X   ",
+    "   X.X   ",
+    "   X.X   ",
+    "XXXX.XXXX",
+    " X.....X ",
+    "  X...X  ",
+    "   X.X   ",
+    "    X    ",
+};
+static const char *const cur_rows_size_nwse[15] = {
+    "XXXXXXX        ",
+    "X....X         ",
+    "X...X          ",
+    "X..X.X         ",
+    "X.X...X        ",
+    "XX X...X       ",
+    "X   X...X      ",
+    "     X...X     ",
+    "      X...X   X",
+    "       X...X XX",
+    "        X...X.X",
+    "         X.X..X",
+    "          X...X",
+    "         X....X",
+    "        XXXXXXX",
+};
+static const char *const cur_rows_size_nesw[15] = {
+    "        XXXXXXX",
+    "         X....X",
+    "          X...X",
+    "         X.X..X",
+    "        X...X.X",
+    "       X...X XX",
+    "      X...X   X",
+    "     X...X     ",
+    "X   X...X      ",
+    "XX X...X       ",
+    "X.X...X        ",
+    "X..X.X         ",
+    "X...X          ",
+    "X....X         ",
+    "XXXXXXX        ",
+};
 
-static void cursor_sprite(int x, int y) {
-    for (int j = 0; j < CUR_H; j++) {
-        const char *row = cursor_arrow[j];
-        for (int i = 0; i < CUR_W; i++) {
+typedef struct {
+    int w, h;                 /* размер спрайта                  */
+    int hx, hy;               /* hotspot (точка под mouse_x/y)   */
+    const char *const *rows;
+} cur_shape_t;
+
+static const cur_shape_t cur_shapes[CUR_NSHAPES] = {
+    [CUR_ARROW]     = { 12, 19, 0, 0, cur_rows_arrow     },
+    [CUR_SIZE_H]    = { 19,  9, 9, 4, cur_rows_size_h    },
+    [CUR_SIZE_V]    = {  9, 19, 4, 9, cur_rows_size_v    },
+    [CUR_SIZE_NWSE] = { 15, 15, 7, 7, cur_rows_size_nwse },
+    [CUR_SIZE_NESW] = { 15, 15, 7, 7, cur_rows_size_nesw },
+};
+
+static int cur_shape = CUR_ARROW;             /* текущая форма (hover)      */
+static uint32_t cur_save[CUR_MAX_W * CUR_MAX_H];
+static int cur_x, cur_y, cur_w, cur_h, cur_in_back = 0;
+
+static void cursor_sprite(const cur_shape_t *s, int x, int y) {
+    for (int j = 0; j < s->h; j++) {
+        const char *row = s->rows[j];
+        for (int i = 0; i < s->w; i++) {
             if (row[i] == 'X')      put_px(x + i, y + j, 0xFF000000);
             else if (row[i] == '.') put_px(x + i, y + j, 0xFFFFFFFF);
         }
     }
 }
 static void cursor_blit(void) {
-    int x = mouse_x, y = mouse_y;
-    for (int j = 0; j < CUR_H; j++)
-        for (int i = 0; i < CUR_W; i++)
-            cur_save[j * CUR_W + i] = get_px(x + i, y + j);
-    cursor_sprite(x, y);
-    cur_x = x; cur_y = y; cur_in_back = 1;
+    const cur_shape_t *s = &cur_shapes[cur_shape];
+    int x = mouse_x - s->hx, y = mouse_y - s->hy;
+    for (int j = 0; j < s->h; j++)
+        for (int i = 0; i < s->w; i++)
+            cur_save[j * s->w + i] = get_px(x + i, y + j);
+    cursor_sprite(s, x, y);
+    cur_x = x; cur_y = y; cur_w = s->w; cur_h = s->h; cur_in_back = 1;
 }
 static void cursor_unblit(void) {
     if (!cur_in_back) return;
-    for (int j = 0; j < CUR_H; j++)
-        for (int i = 0; i < CUR_W; i++)
-            put_px(cur_x + i, cur_y + j, cur_save[j * CUR_W + i]);
+    for (int j = 0; j < cur_h; j++)
+        for (int i = 0; i < cur_w; i++)
+            put_px(cur_x + i, cur_y + j, cur_save[j * cur_w + i]);
     cur_in_back = 0;
 }
 static void cursor_compose(void) {
     cur_in_back = 0;
     cursor_blit();
-    dmg_add(cur_x, cur_y, CUR_W, CUR_H);
+    dmg_add(cur_x, cur_y, cur_w, cur_h);
 }
 static void cursor_take_down(void) {
     if (!cur_in_back) return;
-    dmg_add(cur_x, cur_y, CUR_W, CUR_H);
+    dmg_add(cur_x, cur_y, cur_w, cur_h);
     cursor_unblit();
 }
 static void cursor_refresh(void) {
-    int ox = cur_x, oy = cur_y, had = cur_in_back;
+    int ox = cur_x, oy = cur_y, ow = cur_w, oh = cur_h, had = cur_in_back;
     cursor_unblit();
     cursor_blit();
-    if (had) dmg_add(ox, oy, CUR_W, CUR_H);
-    dmg_add(cur_x, cur_y, CUR_W, CUR_H);
+    if (had) dmg_add(ox, oy, ow, oh);
+    dmg_add(cur_x, cur_y, cur_w, cur_h);
     present();
 }
 
@@ -647,9 +743,38 @@ static int resize_edge_hit(const vwin_t *win, int mx, int my) {
     int edge = 0;
     if (mx >= ox - rb && mx <= ox + rb)           edge |= RZ_LEFT;
     if (mx >= ox + ow - rb && mx <= ox + ow + rb) edge |= RZ_RIGHT;
-    if (my >= oy - rb && my <= oy + rb)           edge |= RZ_TOP;
+    /* верх: снаружи полные rb, внутрь титлбара — только RZ_TOP_INNER px,
+     * чтобы ресайз не съедал зону перетаскивания заголовка */
+    if (my >= oy - rb && my <= oy + RZ_TOP_INNER) edge |= RZ_TOP;
     if (my >= oy + oh - rb && my <= oy + oh + rb) edge |= RZ_BOTTOM;
+
+    /* углы (как в Windows): возле угла захват идёт ВДОЛЬ кромки на
+     * CORNER_GRAB px — попадание в боковую полосу рядом с углом даёт
+     * диагональный ресайз по двум осям сразу */
+    if (edge & (RZ_LEFT | RZ_RIGHT)) {
+        if (my <= oy + CORNER_GRAB)           edge |= RZ_TOP;
+        else if (my >= oy + oh - CORNER_GRAB) edge |= RZ_BOTTOM;
+    }
+    if (edge & (RZ_TOP | RZ_BOTTOM)) {
+        if (mx <= ox + CORNER_GRAB)           edge |= RZ_LEFT;
+        else if (mx >= ox + ow - CORNER_GRAB) edge |= RZ_RIGHT;
+    }
     return edge;
+}
+
+/* Какую форму курсора показывает данный edge-битмаск */
+static int edge_to_shape(int edge) {
+    int h = edge & (RZ_LEFT | RZ_RIGHT);
+    int v = edge & (RZ_TOP | RZ_BOTTOM);
+    if (h && v) {
+        if (((edge & RZ_LEFT)  && (edge & RZ_TOP)) ||
+            ((edge & RZ_RIGHT) && (edge & RZ_BOTTOM)))
+            return CUR_SIZE_NWSE;
+        return CUR_SIZE_NESW;
+    }
+    if (h) return CUR_SIZE_H;
+    if (v) return CUR_SIZE_V;
+    return CUR_ARROW;
 }
 static void draw_window_chrome(vwin_t *win) {
     int focused = (win->id == focused_id);
@@ -671,7 +796,7 @@ static void draw_window_chrome(vwin_t *win) {
     fill_circle(win->x + BTN_X0 + 2 * BTN_GAP, cy, BTN_R, cmax);
 
     int tx = win->x + BTN_X0 + 2 * BTN_GAP + BTN_R + 10;
-    draw_string(tx, win->y + 2, win->title, 0xFFE0E0E0, tcol);
+    draw_string(tx, win->y + (TITLEBAR_H - 16) / 2, win->title, 0xFFE0E0E0, tcol);
 
     const int rb = WIN_CORNER;
     uint32_t bgL[WIN_CORNER * WIN_CORNER], bgR[WIN_CORNER * WIN_CORNER];
@@ -864,6 +989,33 @@ static int point_over_window(int mx, int my) {
     return 0;
 }
 
+/* Пересчитать форму курсора по тому, что под ним (hover):
+ * над краем/углом верхнего окна — ресайзная стрелка, иначе обычная. */
+static void update_cursor_shape(void) {
+    int shape = CUR_ARROW;
+    if (rz.active) {
+        shape = edge_to_shape(rz.edge);        /* во время ресайза — форма захвата */
+    } else if (!drag.active) {
+        if (dock_hit(mouse_x, mouse_y) == -1) {    /* dock поверх окон — там стрелка */
+            for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
+                vwin_t *win = &windows[i];
+                if (!win->id) continue;
+                int owns = (mouse_x >= win->x - RESIZE_BORDER &&
+                            mouse_x <= win->x + win->w + RESIZE_BORDER &&
+                            mouse_y >= win->y - RESIZE_BORDER &&
+                            mouse_y <= win->y + win->h + TITLEBAR_H + RESIZE_BORDER);
+                if (!owns) continue;
+                shape = edge_to_shape(resize_edge_hit(win, mouse_x, mouse_y));
+                break;                          /* верхнее окно под курсором решает */
+            }
+        }
+    }
+    if (shape != cur_shape) {
+        cur_shape = shape;
+        cursor_moved = 1;                       /* перерисовать спрайт */
+    }
+}
+
 static void on_mouse_move(int dx, int dy) {
     mouse_x += dx;
     mouse_y -= dy;                  /* PS/2: Y растёт вверх, экран — вниз */
@@ -940,7 +1092,9 @@ static void on_mouse_move(int dx, int dy) {
         }
     }
 
-    if (drag.active) needs_redraw = 1;
+    update_cursor_shape();
+
+    if (drag.active || rz.active) needs_redraw = 1;
     else cursor_moved = 1;
 }
 
@@ -1062,6 +1216,7 @@ static void on_mouse_button(uint8_t buttons) {
     } else {
         drag.active = 0;
         rz.active = 0;
+        update_cursor_shape();   /* отпустили кнопку — форма по тому, что под курсором */
     }
 
     needs_redraw = 1;
