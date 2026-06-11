@@ -34,7 +34,7 @@ vortexgraph: vortexgraph.c linker.ld
 test_window: test_window.c syscalls.h linker.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) test_window.c -o test_window
 
-vsh: vsh.c syscalls.h linker.ld
+vsh: vsh.c syscalls.h vos_abi.h linker.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) vsh.c -o vsh
 
 vwm: vwm.c vos_abi.h syscalls.h font8x16.h linker.ld

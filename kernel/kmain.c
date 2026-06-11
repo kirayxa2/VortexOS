@@ -263,9 +263,14 @@ void userspace_elf_loader_task(void) {
     fb_puts(elf_path);
     fb_puts("...\n");
     
-    vfs_node_t *elf_node = vfs_open(elf_path, 0);
+    /* ФИКС: раньше vfs_open требовал абсолютный путь — если sys_spawn_ex
+     * передавал голое имя (\"ls\"), проверка не проходила и утилита не
+     * запускалась. Теперь используем elf_open_exec, который ищет в /bin. */
+    vfs_node_t *elf_node = elf_open_exec(elf_path);
     if (!elf_node) {
-        fb_puts("[TASK] File not found\n");
+        fb_puts("[TASK] File not found: ");
+        fb_puts(elf_path);
+        fb_puts("\n");
         task_exit();
         return;
     }

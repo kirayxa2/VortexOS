@@ -463,10 +463,20 @@ static uint64_t sys_spawn_ex(uint64_t user_cmdline, uint64_t flags) {
     vfs_close(exe);
     fs_node_put(exe);
 
-    /* Путь для загрузчика ELF — kmalloc, kfree при выходе задачи (как sys_spawn) */
+    /* Путь для загрузчика ELF — kmalloc, kfree при выходе задачи (как sys_spawn).
+     * ФИКС: раньше хранили голое имя (\"ls\") — а userspace_elf_loader_task
+     * вызывал vfs_open, которому нужен абсолютный путь → \"File not found\" →
+     * task_exit без запуска программы. Теперь формируем \"/bin/prog\" если
+     * prog — короткое имя без '/'. */
     char *path = (char *)kmalloc(64);
     if (!path) return (uint64_t)-1;
-    for (int i = 0; i <= p; i++) path[i] = prog[i];
+    if (prog[0] == '/') {
+        for (int i = 0; i <= p; i++) path[i] = prog[i];
+    } else {
+        path[0] = '/'; path[1] = 'b'; path[2] = 'i';
+        path[3] = 'n'; path[4] = '/';
+        for (int i = 0; i <= p; i++) path[5 + i] = prog[i];
+    }
 
     task_t *self = sched_current();
     task_t *t = task_create(prog, userspace_elf_loader_task, 10);

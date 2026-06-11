@@ -6,9 +6,13 @@
  * Это НЕ часть ядра — ядро лишь доставляет нажатые клавиши в окно с фокусом
  * (keyboard.c -> wm_handle_key -> очередь событий окна). Терминал сам ведёт
  * буфер строк, эхо ввода, разбор команд и отрисовку.
+ *
+ * Внешние команды (/bin/ls, cat, ...) запускаются через SYS_SPAWN_EX с
+ * stdout-пайпом: вывод утилиты приходит IPC-сообщениями VOS_MSG_STDOUT,
+ * завершение — VOS_MSG_CHILD_EXIT. cd/pwd — встроенные.
  * ============================================================================= */
 
-#include "syscalls.h"
+#include "vos_abi.h"    /* включает syscalls.h */
 
 /* ---- Геометрия окна и текстовой сетки ---- */
 #define WIN_X      80
@@ -38,6 +42,25 @@ static char   input[INPUT_MAX + 1];
 static int    inlen = 0;
 
 static uint64_t g_win = 0;
+
+/* ---- cwd / prompt ---- */
+static char cwd[64]      = "/";
+static char prompt[72]   = "/> ";
+static int  prompt_len   = 3;
+
+/* ---- запущенная утилита (stdout-пайп через SYS_SPAWN_EX) ---- */
+static uint64_t child_pid = 0;     /* 0 = промпт активен */
+static char  outbuf[COLS + 1];     /* недопечатанная строка stdout child'а */
+static int   outlen = 0;
+
+static void prompt_rebuild(void) {
+    int n = 0;
+    while (cwd[n] && n < 64) { prompt[n] = cwd[n]; n++; }
+    prompt[n++] = '>';
+    prompt[n++] = ' ';
+    prompt[n] = 0;
+    prompt_len = n;
+}
 
 /* --------------------- мини-libc --------------------- */
 static int s_len(const char *s) { int n = 0; while (s[n]) n++; return n; }
@@ -94,6 +117,32 @@ static void term_print(const char *s) {
     }
 }
 
+/* --------------------- stdout child'а --------------------- */
+/* Поток байт из ядра (VOS_MSG_STDOUT): собираем строки. */
+static void stream_putc(char c) {
+    if (c == '\n') { outbuf[outlen] = 0; sb_push_raw(outbuf); outlen = 0; return; }
+    if (c == '\t') {
+        int adv = 4 - (outlen & 3);
+        while (adv-- && outlen < COLS - 1) outbuf[outlen++] = ' ';
+    } else if (c >= 32 && c < 127) {
+        outbuf[outlen++] = c;
+    }
+    if (outlen >= COLS) { outbuf[outlen] = 0; sb_push_raw(outbuf); outlen = 0; }
+}
+
+static void child_exited(uint64_t code) {
+    if (outlen) { outbuf[outlen] = 0; sb_push_raw(outbuf); outlen = 0; }
+    if (code) {
+        char buf[24]; u_to_dec(code, buf);
+        char out[48]; int n = 0;
+        const char *p = "exit code: "; while (*p) out[n++] = *p++;
+        p = buf; while (*p) out[n++] = *p++;
+        out[n] = 0;
+        term_print(out);
+    }
+    child_pid = 0;
+}
+
 /* --------------------- отрисовка --------------------- */
 static void term_render(void) {
     /* фон всего окна */
@@ -120,36 +169,57 @@ static void term_render(void) {
 
     /* строка ввода — прямо следующей строкой после последнего вывода */
     int iy = row * CH_H;
-    wm_draw_string(g_win, 0, iy, "vortex> ", COL_PROMPT);
-    int px = 8 * CH_W;                          /* после "vortex> " */
-    /* показываем хвост ввода, если он не влезает */
-    int shown = inlen;
-    int off = 0;
-    int maxin = COLS - 8 - 1;                    /* -1 под курсор */
-    if (shown > maxin) { off = shown - maxin; }
-    char ib[INPUT_MAX + 1];
-    int k = 0;
-    for (int i = off; i < inlen; i++) ib[k++] = input[i];
-    ib[k] = 0;
-    wm_draw_string(g_win, px, iy, ib, COL_FG);
-    /* курсор-блок */
-    int cx = px + k * CH_W;
-    wm_draw_rect(g_win, cx, iy, CH_W, CH_H, COL_CURSOR);
+
+    if (child_pid) {
+        /* Утилита работает: вместо промпта — её недопечатанная строка */
+        outbuf[outlen] = 0;
+        wm_draw_string(g_win, 0, iy, outbuf, COL_FG);
+        wm_draw_rect(g_win, outlen * CH_W, iy, CH_W, CH_H, COL_CURSOR);
+    } else {
+        wm_draw_string(g_win, 0, iy, prompt, COL_PROMPT);
+        int px = prompt_len * CH_W;
+        /* показываем хвост ввода, если он не влезает */
+        int maxin = COLS - prompt_len - 1;        /* -1 под курсор */
+        if (maxin < 1) maxin = 1;
+        int off = (inlen > maxin) ? inlen - maxin : 0;
+        char ib[INPUT_MAX + 1];
+        int k = 0;
+        for (int i = off; i < inlen; i++) ib[k++] = input[i];
+        ib[k] = 0;
+        wm_draw_string(g_win, px, iy, ib, COL_FG);
+        /* курсор-блок */
+        int cx = px + k * CH_W;
+        wm_draw_rect(g_win, cx, iy, CH_W, CH_H, COL_CURSOR);
+    }
 
     wm_flush(g_win);
 }
 
 /* --------------------- команды --------------------- */
 static void cmd_help(void) {
-    term_print("vsh — Vortex Shell. Доступные команды:");
-    term_print("  help            этот список");
-    term_print("  clear           очистить экран");
-    term_print("  echo <текст>    напечатать текст");
-    term_print("  ver             версия VortexOS");
-    term_print("  about           о терминале");
-    term_print("  pid             PID процесса терминала");
-    term_print("  fb              разрешение framebuffer");
-    term_print("  cols            размер сетки терминала");
+    term_print("vsh -- Vortex Shell. Commands:");
+    term_print("  help            this list");
+    term_print("  clear           clear screen");
+    term_print("  cd <dir>, pwd   change / show current directory");
+    term_print("  echo <text>     print text");
+    term_print("  ver             VortexOS version");
+    term_print("  about           about this terminal");
+    term_print("  pid             terminal PID");
+    term_print("  fb              framebuffer resolution");
+    term_print("  cols            terminal grid size");
+    term_print("Everything else runs from /bin with args:");
+    term_print("  ls -l /bin | cat /etc/motd | mkdir /tmp/a");
+    term_print("  cat cp mv rm find mkdir touch echo pwd stat head wc");
+}
+
+static void print_kv(const char *key, uint64_t v) {
+    char num[24]; u_to_dec(v, num);
+    char out[64]; int n = 0;
+    while (*key) out[n++] = *key++;
+    const char *p = num;
+    while (*p) out[n++] = *p++;
+    out[n] = 0;
+    term_print(out);
 }
 
 static void run_command(const char *line) {
@@ -160,20 +230,13 @@ static void run_command(const char *line) {
 
     if (s_eq(line, "help")) { cmd_help(); return; }
     if (s_eq(line, "clear") || s_eq(line, "cls")) { sb_count = 0; sb_start = 0; return; }
-    if (s_eq(line, "ver") || s_eq(line, "version")) { term_print("VortexOS — vsh 0.1 (userspace)"); return; }
+    if (s_eq(line, "ver") || s_eq(line, "version")) { term_print("VortexOS -- vsh 0.2 (userspace)"); return; }
     if (s_eq(line, "about")) {
-        term_print("vsh: userspace-терминал VortexOS.");
-        term_print("Окно и ввод идут через WM-syscalls (ring3).");
+        term_print("vsh: userspace shell for VortexOS.");
+        term_print("Window and input via WM-syscalls (ring3).");
         return;
     }
-    if (s_eq(line, "pid")) {
-        char buf[24]; u_to_dec(syscall0(SYS_GETPID), buf);
-        char out[40]; int n = 0;
-        const char *p = "pid: "; while (*p) out[n++] = *p++;
-        p = buf; while (*p) out[n++] = *p++; out[n] = 0;
-        term_print(out);
-        return;
-    }
+    if (s_eq(line, "pid")) { print_kv("pid: ", syscall0(SYS_GETPID)); return; }
     if (s_eq(line, "fb")) {
         struct { uint64_t phys; uint32_t w, h, pitch, bpp; } info;
         syscall1(SYS_FB_INFO, (uint64_t)&info);
@@ -201,19 +264,42 @@ static void run_command(const char *line) {
     if (s_starts(line, "echo ")) { term_print(line + 5); return; }
     if (s_eq(line, "echo")) { term_print(""); return; }
 
-    /* неизвестная команда */
-    char out[COLS + 1]; int n = 0;
-    const char *p = "vsh: "; while (*p && n < COLS) out[n++] = *p++;
-    for (int i = 0; line[i] && n < COLS - 18; i++) out[n++] = line[i];
-    p = ": команда не найдена"; while (*p && n < COLS) out[n++] = *p++;
-    out[n] = 0;
-    term_print(out);
+    /* ---- pwd ---- */
+    if (s_eq(line, "pwd")) { term_print(cwd); return; }
+
+    /* ---- cd ---- */
+    if (s_eq(line, "cd") || s_starts(line, "cd ")) {
+        const char *arg = (line[2] == ' ') ? line + 3 : "";
+        while (*arg == ' ') arg++;
+        if (!*arg) arg = "/";
+        char abs[256];
+        vos_abspath(cwd, arg, abs, sizeof(abs));
+        if (vos_chdir(abs) != 0) { term_print("cd: no such directory"); return; }
+        vos_getcwd(cwd, sizeof(cwd));
+        prompt_rebuild();
+        return;
+    }
+
+    /* ---- внешняя команда: /bin/* через SYS_SPAWN_EX с stdout-пайпом ---- */
+    int64_t pid = vos_spawn_ex(line, 1);   /* flag 1 = pipe stdout */
+    if (pid < 0) {
+        char out[COLS + 1]; int n = 0;
+        const char *p = "vsh: "; while (*p && n < COLS) out[n++] = *p++;
+        for (int i = 0; line[i] && line[i] != ' ' && n < COLS - 20; i++)
+            out[n++] = line[i];
+        p = ": command not found"; while (*p && n < COLS) out[n++] = *p++;
+        out[n] = 0;
+        term_print(out);
+        return;
+    }
+    child_pid = (uint64_t)pid;
+    outlen = 0;
 }
 
-/* эхо введённой строки в scrollback как "vortex> <line>" */
+/* эхо введённой строки в scrollback как "<prompt><line>" */
 static void echo_input_line(void) {
     char out[COLS + 1]; int n = 0;
-    const char *p = "vortex> "; while (*p && n < COLS) out[n++] = *p++;
+    const char *p = prompt; while (*p && n < COLS) out[n++] = *p++;
     for (int i = 0; i < inlen && n < COLS; i++) out[n++] = input[i];
     out[n] = 0;
     sb_push_raw(out);
@@ -241,15 +327,38 @@ static void on_char(char c) {
     }
 }
 
+/* --------------------- IPC: выгрести stdout/exit от child'а -------------- */
+static int drain_ipc(void) {
+    vos_msg_t m;
+    int dirty = 0;
+    while (vos_ipc_recv(&m, VOS_IPC_NOWAIT)) {
+        if (m.w[0] == VOS_MSG_STDOUT && child_pid && m.w[7] == child_pid) {
+            const char *d = (const char *)&m.w[2];
+            int len = (int)m.w[1];
+            if (len > VOS_STDOUT_CHUNK) len = VOS_STDOUT_CHUNK;
+            for (int i = 0; i < len; i++) stream_putc(d[i]);
+            dirty = 1;
+        } else if (m.w[0] == VOS_MSG_CHILD_EXIT && child_pid && m.w[7] == child_pid) {
+            child_exited(m.w[1]);
+            dirty = 1;
+        }
+    }
+    return dirty;
+}
+
 void _start(void) {
-    g_win = wm_create_window("vsh — Vortex Shell", WIN_X, WIN_Y, WIN_W, WIN_H);
+    g_win = wm_create_window("vsh -- Vortex Shell", WIN_X, WIN_Y, WIN_W, WIN_H);
     if (!g_win) {
         puts("vsh: failed to create window\n");
         exit(1);
     }
 
-    term_print("VortexOS vsh 0.1 — userspace terminal");
-    term_print("Наберите 'help' для списка команд.");
+    /* Инициализация cwd/prompt */
+    if (vos_getcwd(cwd, sizeof(cwd)) <= 0) { cwd[0] = '/'; cwd[1] = 0; }
+    prompt_rebuild();
+
+    term_print("VortexOS vsh 0.2 -- userspace terminal");
+    term_print("Type 'help' for the command list.");
     term_print("");
     term_render();
 
@@ -259,24 +368,38 @@ void _start(void) {
     uint32_t evraw[8];
     wm_event_t *ev = (wm_event_t *)evraw;
     for (;;) {
-        /* «Block, don't poll»: засыпаем в ядре до прихода события, не сжигая
-         * квант busy-loop'ом. Пока мы спим, задача рендера получает процессор
-         * беспрепятственно — курсор и перетаскивание окон идут плавно. */
-        if (!wm_wait_event(g_win, ev)) break;   /* окно пропало — выходим */
+        int dirty = 0;
 
-        int got = 0;
-        if (ev->type == 4 && ev->key_pressed) {
-            on_char((char)(ev->key_code & 0xFF));
-            got = 1;
-        }
-        /* выгребаем все накопившиеся события за проход (без сна) */
-        while (wm_get_event(g_win, ev)) {
+        if (child_pid) {
+            /* Утилита работает — поллим WM-события и IPC (stdout-пайп).
+             * Спим между итерациями чтобы не жечь CPU. */
+            while (wm_get_event(g_win, ev)) {
+                /* Пока child работает, ввод игнорируем (нет stdin v1) */
+            }
+            dirty = drain_ipc();
+            if (dirty) term_render();
+            syscall1(SYS_SLEEP, 1);   /* ~10 мс */
+        } else {
+            /* Промпт — блокируем на WM-событии, CPU не тратим */
+            if (!wm_wait_event(g_win, ev)) break;
+
             if (ev->type == 4 && ev->key_pressed) {
                 on_char((char)(ev->key_code & 0xFF));
-                got = 1;
+                dirty = 1;
             }
+            /* выгребаем все накопившиеся события за проход */
+            while (wm_get_event(g_win, ev)) {
+                if (ev->type == 4 && ev->key_pressed) {
+                    on_char((char)(ev->key_code & 0xFF));
+                    dirty = 1;
+                }
+            }
+            /* Если только что запустили child (run_command сделал spawn),
+             * проверяем IPC — может уже пришёл вывод */
+            if (child_pid) dirty |= drain_ipc();
+
+            if (dirty) term_render();
         }
-        if (got) term_render();
     }
 
     exit(0);
