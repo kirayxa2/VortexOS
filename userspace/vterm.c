@@ -161,7 +161,7 @@ static void cmd_help(void) {
     term_print("  wm              window manager PID");
     term_print("  fb              framebuffer resolution");
     term_print("  cols            terminal grid size");
-    term_print("  run <path>      spawn ELF (e.g. run /vdemo)");
+    term_print("  run <name>      spawn ELF from /bin (e.g. run vdemo)");
     term_print("  uptime          PIT ticks since boot");
 }
 
@@ -221,7 +221,8 @@ static void run_command(const char *line) {
     if (s_starts(line, "run ")) {
         const char *path = line + 4;
         while (*path == ' ') path++;
-        if (*path != '/') { term_print("run: path must start with /"); return; }
+        if (!*path) { term_print("run: usage: run <name|/path>"); return; }
+        /* без слэша ядро само ищет в /bin (elf_open_exec) — как $PATH */
         uint64_t pid = vos_spawn(path);
         if (pid == (uint64_t)-1) term_print("run: spawn failed");
         else print_kv("spawned pid: ", pid);

@@ -25,6 +25,61 @@ static void serial_write(const char *s) {
     fb_puts(s);
 }
 
+/* -----------------------------------------------------------------------------
+ * Поиск исполняемого файла а-ля $PATH (FS-иерархия как в Linux).
+ *
+ * Бинарники теперь живут в /bin (см. Makefile disk-with-apps). Порядок:
+ *   "vterm"      → /bin/vterm, потом /vterm
+ *   "/vterm"     → /vterm, потом /bin/vterm   (старые захардкоженные пути)
+ *   "/bin/vterm" → /bin/vterm, потом /vterm   (новый диск ↔ старый диск)
+ * Пути с подкаталогами ("/etc/motd") идут как есть, без фоллбеков.
+ * ----------------------------------------------------------------------------- */
+vfs_node_t *elf_open_exec(const char *path) {
+    if (!path || !path[0]) return 0;
+
+    char alt[VFS_MAX_PATH];
+    const char *name = 0;   /* короткое имя без каталога, если удалось выделить */
+
+    if (path[0] != '/') {
+        name = path;
+    } else if (path[1]) {
+        const char *slash2 = 0;
+        for (int i = 1; path[i]; i++)
+            if (path[i] == '/') { slash2 = &path[i]; break; }
+        if (!slash2) {
+            name = path + 1;                       /* "/vterm" */
+        } else {
+            /* "/bin/vterm" → name = "vterm"; глубже ("/etc/x/y") не трогаем */
+            if (path[1] == 'b' && path[2] == 'i' && path[3] == 'n' &&
+                path[4] == '/' && path[5]) {
+                int deeper = 0;
+                for (int i = 5; path[i]; i++)
+                    if (path[i] == '/') { deeper = 1; break; }
+                if (!deeper) name = path + 5;
+            }
+        }
+        vfs_node_t *node = vfs_open(path, 0);      /* абсолютный путь — как есть */
+        if (node) return node;
+    }
+
+    if (!name || !name[0]) return 0;
+
+    /* /bin/<name> */
+    int n = 0;
+    alt[n++] = '/'; alt[n++] = 'b'; alt[n++] = 'i'; alt[n++] = 'n'; alt[n++] = '/';
+    for (int i = 0; name[i] && n < VFS_MAX_PATH - 1; i++) alt[n++] = name[i];
+    alt[n] = 0;
+    vfs_node_t *node = vfs_open(alt, 0);
+    if (node) return node;
+
+    /* /<name> — fallback для старых образов диска */
+    n = 0;
+    alt[n++] = '/';
+    for (int i = 0; name[i] && n < VFS_MAX_PATH - 1; i++) alt[n++] = name[i];
+    alt[n] = 0;
+    return vfs_open(alt, 0);
+}
+
 elf_load_result_t elf_load(const char *path) {
     elf_load_result_t result = {0, NULL};
     
@@ -43,8 +98,8 @@ elf_load_result_t elf_load(const char *path) {
      * построенная таблица текла при каждом неудачном запуске. */
     result.user_pml4 = user_pml4;
 
-    // Open file through VFS
-    vfs_node_t *node = vfs_open(path, 0);
+    // Open file through VFS (с поиском в /bin — см. elf_open_exec)
+    vfs_node_t *node = elf_open_exec(path);
     if (!node) {
         serial_write("[ELF] Error: File not found\n");
         return result;

@@ -275,8 +275,8 @@ typedef struct { const char *path; const char *label; int kind; } desk_icon_t;
  * приложения, создающие окно через WM (чисто компонуются). /vgraph рисует
  * fullscreen прямо в framebuffer (мимо компоновщика) — поэтому пока не в доке. */
 static const desk_icon_t g_desk_icons[] = {
-    { "/vsh",     "Terminal", 0 },
-    { "/testwin", "Window",   2 },
+    { "/bin/vsh",     "Terminal", 0 },
+    { "/bin/testwin", "Window",   2 },
 };
 #define DESK_NICONS ((int)(sizeof(g_desk_icons) / sizeof(g_desk_icons[0])))
 
@@ -495,7 +495,7 @@ int wm_dock_consume_launch(void) {
 const char *wm_consume_launch_path(void) {
     if (g_dock_launch_request) {
         g_dock_launch_request = 0;
-        return g_launch_path ? g_launch_path : "/vsh";
+        return g_launch_path ? g_launch_path : "/bin/vsh";
     }
     return 0;
 }
@@ -1465,7 +1465,7 @@ void wm_handle_mouse_button(uint8_t buttons) {
                 /* Запрос на запуск терминала; задача-лаунчер заберёт путь.
                  * Мы в обработчике mouse IRQ (прерывания off) — флаг выставлен
                  * до sched_wake, поэтому lost-wakeup невозможен. */
-                wm_request_launch("/vsh");
+                wm_request_launch("/bin/vsh");
             }
             return;  /* не таскаем окно под доком */
         }

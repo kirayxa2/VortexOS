@@ -104,7 +104,7 @@ build/disk.img:
 	dd if=/dev/zero of=build/disk.img bs=1M count=16
 	python3 tools/mkfat32.py build/disk.img
 	@echo "=== Adding test file to disk ==="
-	python3 tools/add_file.py build/disk.img test.txt "Hello from FAT32!"
+	python3 tools/add_file.py build/disk.img "Hello from FAT32!" /test.txt
 	@echo "=== Disk image ready: build/disk.img ==="
 
 build/kernel.bin: $(ALL_OBJS)
@@ -182,12 +182,16 @@ userspace:
 	$(MAKE) -C userspace
 
 disk-with-apps: disk userspace
-	@echo "=== Adding userspace programs to disk ==="
-	python3 tools/add_file.py build/disk.img userspace/hello hello
-	python3 tools/add_file.py build/disk.img userspace/vortexgraph vgraph
-	python3 tools/add_file.py build/disk.img userspace/test_window testwin
-	python3 tools/add_file.py build/disk.img userspace/vsh vsh
-	python3 tools/add_file.py build/disk.img userspace/vwm vwm
-	python3 tools/add_file.py build/disk.img userspace/vterm vterm
-	python3 tools/add_file.py build/disk.img userspace/vdemo vdemo
+	@echo "=== Adding userspace programs to /bin ==="
+	python3 tools/add_file.py build/disk.img userspace/hello /bin/hello
+	python3 tools/add_file.py build/disk.img userspace/vortexgraph /bin/vgraph
+	python3 tools/add_file.py build/disk.img userspace/test_window /bin/testwin
+	python3 tools/add_file.py build/disk.img userspace/vsh /bin/vsh
+	python3 tools/add_file.py build/disk.img userspace/vwm /bin/vwm
+	python3 tools/add_file.py build/disk.img userspace/vterm /bin/vterm
+	python3 tools/add_file.py build/disk.img userspace/vdemo /bin/vdemo
+	@echo "=== Creating FS hierarchy (/etc, /home, /tmp) ==="
+	python3 tools/add_file.py build/disk.img "Welcome to VortexOS!" /etc/motd
+	python3 tools/add_file.py build/disk.img --mkdir /home
+	python3 tools/add_file.py build/disk.img --mkdir /tmp
 	@echo "=== Disk with apps ready ==="

@@ -532,8 +532,8 @@ static void dock_bounds(int *x, int *y, int *w, int *h) {
 
 typedef struct { const char *path; const char *label; int kind; } desk_icon_t;
 static const desk_icon_t desk_icons[] = {
-    { "/vterm", "Terminal", 0 },
-    { "/vdemo", "Window",   2 },
+    { "/bin/vterm", "Terminal", 0 },
+    { "/bin/vdemo", "Window",   2 },
 };
 #define DESK_NICONS ((int)(sizeof(desk_icons) / sizeof(desk_icons[0])))
 
@@ -1342,7 +1342,7 @@ static void on_mouse_button(uint8_t buttons) {
             dock_pressed = 1;
             dock_dirty = 1;
             if (dh == 0 && active_window_count() < MAX_WINDOWS)
-                vos_spawn("/vterm");
+                vos_spawn("/bin/vterm");
             return;
         }
         if (dh == -2) return;
@@ -1611,7 +1611,7 @@ void _start(void) {
 
     /* 4. Первый кадр + стартовый терминал */
     render_all();
-    vos_spawn("/vterm");
+    vos_spawn("/bin/vterm");
 
     /* 5. Event loop: ipc_recv — и очередь событий, и таймер кадра.
      * Спим максимум 1 тик; кадр рисуем не чаще раза в 2 тика (~50 FPS). */

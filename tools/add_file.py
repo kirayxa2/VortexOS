@@ -1,147 +1,261 @@
 #!/usr/bin/env python3
 """
-Добавляет файл в FAT32 образ диска
+Добавляет файл (или директорию) в FAT32 образ диска.
+
+Поддерживает подкаталоги: `add_file.py disk.img userspace/vwm /bin/vwm`
+создаст каталог /bin (если его нет) и положит файл внутрь. Недостающие
+каталоги по пути создаются автоматически (с записями `.` и `..`).
+Существующий файл с тем же именем перезаписывается (старая цепочка
+кластеров освобождается) — повторный `make disk-with-apps` не плодит
+дубликатов.
+
+Режимы:
+    add_file.py <disk.img> <source_file|text> <dest_path>   — записать файл
+    add_file.py <disk.img> --mkdir <dir_path>               — создать каталог
+
+Имена — классические 8.3 (как понимает ядро VortexOS), регистр не важен.
 """
 import struct
 import sys
 import os
 
-def add_file_to_fat32(disk_path, source_file, dest_path):
-    # Читаем исходный файл
-    if os.path.isfile(source_file):
-        with open(source_file, 'rb') as sf:
-            content = sf.read()
-    else:
-        # Если не файл, то это текстовая строка
-        content = source_file.encode('utf-8')
-    
-    # Парсим путь назначения
-    parts = dest_path.strip('/').split('/')
-    if len(parts) > 1:
-        # Есть директория - пока не поддерживается полностью
-        # Создадим файл в root с полным именем
-        filename = '_'.join(parts)  # Временное решение
-    else:
-        filename = parts[0] if parts else 'file.txt'
-    
-    with open(disk_path, 'r+b') as f:
-        # Читаем boot sector
-        f.seek(0)
-        boot = f.read(512)
-        
-        bytes_per_sector = struct.unpack_from('<H', boot, 11)[0]
-        sectors_per_cluster = struct.unpack_from('<B', boot, 13)[0]
-        reserved_sectors = struct.unpack_from('<H', boot, 14)[0]
-        num_fats = struct.unpack_from('<B', boot, 16)[0]
-        sectors_per_fat = struct.unpack_from('<I', boot, 36)[0]
-        root_cluster = struct.unpack_from('<I', boot, 44)[0]
-        
-        # Вычисляем позиции
-        fat_begin_lba = reserved_sectors
-        cluster_begin_lba = reserved_sectors + (num_fats * sectors_per_fat)
-        
-        # Ищем свободный slot в root directory
-        root_lba = cluster_begin_lba + (root_cluster - 2) * sectors_per_cluster
-        f.seek(root_lba * bytes_per_sector)
-        root_data = f.read(sectors_per_cluster * bytes_per_sector)
-        
-        free_slot = -1
-        for i in range(0, len(root_data), 32):
-            first_byte = root_data[i]
-            if first_byte == 0x00 or first_byte == 0xE5:  # Free slot
-                free_slot = i
-                break
-        
-        if free_slot == -1:
-            print("Error: No free directory entries")
-            sys.exit(1)
-        
-        # Ищем свободный cluster для данных
-        # Читаем FAT
-        f.seek(fat_begin_lba * bytes_per_sector)
-        fat = f.read(sectors_per_fat * bytes_per_sector)
-        
-        free_cluster = -1
-        for i in range(2, sectors_per_fat * bytes_per_sector // 4):
-            entry = struct.unpack_from('<I', fat, i * 4)[0]
-            if entry == 0:  # Free cluster
-                free_cluster = i
-                break
-        
-        if free_cluster == -1:
-            print("Error: No free clusters")
-            sys.exit(1)
-        
-        # Создаём 8.3 имя
-        name_base = filename.upper()[:8].ljust(8)
-        name_ext = '   '
-        if '.' in filename:
-            parts = filename.upper().split('.')
-            name_base = parts[0][:8].ljust(8)
-            name_ext = parts[1][:3].ljust(3)
-        
-        # Создаём directory entry
-        dirent = bytearray(32)
-        dirent[0:8] = name_base.encode('ascii')
-        dirent[8:11] = name_ext.encode('ascii')
-        dirent[11] = 0x20  # Attribute: Archive
-        dirent[20:22] = struct.pack('<H', (free_cluster >> 16) & 0xFFFF)  # Cluster high
-        dirent[26:28] = struct.pack('<H', free_cluster & 0xFFFF)  # Cluster low
-        dirent[28:32] = struct.pack('<I', len(content))  # File size
-        
-        # Пишем directory entry
-        f.seek(root_lba * bytes_per_sector + free_slot)
-        f.write(dirent)
-        
-        # Пишем данные в clusters
-        clusters_needed = (len(content) + (sectors_per_cluster * bytes_per_sector) - 1) // (sectors_per_cluster * bytes_per_sector)
-        current_cluster = free_cluster
-        offset = 0
-        
-        for i in range(clusters_needed):
-            # Пишем данные
-            data_lba = cluster_begin_lba + (current_cluster - 2) * sectors_per_cluster
-            chunk_size = min(sectors_per_cluster * bytes_per_sector, len(content) - offset)
-            f.seek(data_lba * bytes_per_sector)
-            f.write(content[offset:offset + chunk_size])
-            offset += chunk_size
-            
-            # Обновляем FAT
-            if i < clusters_needed - 1:
-                # Ищем следующий свободный cluster
-                next_cluster = -1
-                for j in range(current_cluster + 1, sectors_per_fat * bytes_per_sector // 4):
-                    entry = struct.unpack_from('<I', fat, j * 4)[0]
-                    if entry == 0:
-                        next_cluster = j
-                        break
-                
-                if next_cluster == -1:
-                    print("Error: Out of clusters")
-                    sys.exit(1)
-                
-                # Обновляем FAT: current -> next
-                for fat_num in range(num_fats):
-                    fat_offset = (fat_begin_lba + fat_num * sectors_per_fat) * bytes_per_sector + current_cluster * 4
-                    f.seek(fat_offset)
-                    f.write(struct.pack('<I', next_cluster))
-                
-                current_cluster = next_cluster
+ATTR_ARCHIVE = 0x20
+ATTR_DIR     = 0x10
+ATTR_LFN     = 0x0F
+ATTR_VOLUME  = 0x08
+FAT_EOC      = 0x0FFFFFF8
+FAT_FREE     = 0x00000000
+
+
+class Fat32Image:
+    def __init__(self, path):
+        self.f = open(path, 'r+b')
+        self.f.seek(0)
+        boot = self.f.read(512)
+        self.bps  = struct.unpack_from('<H', boot, 11)[0]   # bytes/sector
+        self.spc  = struct.unpack_from('<B', boot, 13)[0]   # sectors/cluster
+        reserved  = struct.unpack_from('<H', boot, 14)[0]
+        self.nfats = struct.unpack_from('<B', boot, 16)[0]
+        self.spf  = struct.unpack_from('<I', boot, 36)[0]   # sectors/FAT
+        self.root_cluster = struct.unpack_from('<I', boot, 44)[0]
+
+        self.fat_lba = reserved
+        self.data_lba = reserved + self.nfats * self.spf
+        self.cluster_bytes = self.spc * self.bps
+
+        # FAT целиком в память; пишем обе копии при close()
+        self.f.seek(self.fat_lba * self.bps)
+        self.fat = bytearray(self.f.read(self.spf * self.bps))
+        self.nclusters = len(self.fat) // 4
+
+        # FAT[0]/FAT[1] — служебные; корневой кластер должен быть занят.
+        if self.fat_get(0) == 0:
+            self.fat_set(0, 0x0FFFFFF8)
+            self.fat_set(1, 0x0FFFFFFF)
+        if self.fat_get(self.root_cluster) == FAT_FREE:
+            self.fat_set(self.root_cluster, FAT_EOC)
+
+    # --- FAT --------------------------------------------------------------
+    def fat_get(self, c):
+        return struct.unpack_from('<I', self.fat, c * 4)[0] & 0x0FFFFFFF
+
+    def fat_set(self, c, v):
+        struct.pack_into('<I', self.fat, c * 4, v & 0x0FFFFFFF)
+
+    def alloc_cluster(self):
+        for c in range(2, self.nclusters):
+            if self.fat_get(c) == FAT_FREE:
+                self.fat_set(c, FAT_EOC)
+                self.write_cluster(c, b'\x00' * self.cluster_bytes)
+                return c
+        raise RuntimeError('FAT32: нет свободных кластеров')
+
+    def free_chain(self, c):
+        while 2 <= c < FAT_EOC:
+            nxt = self.fat_get(c)
+            self.fat_set(c, FAT_FREE)
+            c = nxt
+
+    def chain(self, c):
+        out = []
+        while 2 <= c < FAT_EOC:
+            out.append(c)
+            c = self.fat_get(c)
+        return out
+
+    # --- кластеры ----------------------------------------------------------
+    def cluster_lba(self, c):
+        return self.data_lba + (c - 2) * self.spc
+
+    def read_cluster(self, c):
+        self.f.seek(self.cluster_lba(c) * self.bps)
+        return bytearray(self.f.read(self.cluster_bytes))
+
+    def write_cluster(self, c, data):
+        assert len(data) == self.cluster_bytes
+        self.f.seek(self.cluster_lba(c) * self.bps)
+        self.f.write(data)
+
+    # --- 8.3 имена ----------------------------------------------------------
+    @staticmethod
+    def name_83(name):
+        name = name.upper()
+        if '.' in name:
+            base, ext = name.rsplit('.', 1)
+        else:
+            base, ext = name, ''
+        base, ext = base[:8], ext[:3]
+        if not base:
+            raise ValueError(f'плохое имя FAT: {name!r}')
+        return base.ljust(8).encode('ascii') + ext.ljust(3).encode('ascii')
+
+    # --- директории ----------------------------------------------------------
+    def dir_entries(self, dir_cluster):
+        """Итератор (cluster, offset_in_cluster, raw32) по записям каталога."""
+        for c in self.chain(dir_cluster):
+            data = self.read_cluster(c)
+            for off in range(0, self.cluster_bytes, 32):
+                yield c, off, data[off:off + 32]
+
+    def find_entry(self, dir_cluster, name):
+        want = self.name_83(name)
+        for c, off, raw in self.dir_entries(dir_cluster):
+            if raw[0] in (0x00, 0xE5):
+                if raw[0] == 0x00:
+                    return None
+                continue
+            if raw[11] == ATTR_LFN or (raw[11] & ATTR_VOLUME):
+                continue
+            if raw[0:11] == want:
+                return c, off, raw
+        return None
+
+    def find_free_slot(self, dir_cluster):
+        for c, off, raw in self.dir_entries(dir_cluster):
+            if raw[0] in (0x00, 0xE5):
+                return c, off
+        # каталог полон — расширяем цепочку
+        last = self.chain(dir_cluster)[-1]
+        newc = self.alloc_cluster()
+        self.fat_set(last, newc)
+        return newc, 0
+
+    def write_entry(self, c, off, raw):
+        data = self.read_cluster(c)
+        data[off:off + 32] = raw
+        self.write_cluster(c, data)
+
+    @staticmethod
+    def make_dirent(name83, attr, cluster, size):
+        e = bytearray(32)
+        e[0:11] = name83
+        e[11] = attr
+        struct.pack_into('<H', e, 20, (cluster >> 16) & 0xFFFF)
+        struct.pack_into('<H', e, 26, cluster & 0xFFFF)
+        struct.pack_into('<I', e, 28, size)
+        return bytes(e)
+
+    @staticmethod
+    def entry_cluster(raw):
+        hi = struct.unpack_from('<H', raw, 20)[0]
+        lo = struct.unpack_from('<H', raw, 26)[0]
+        return (hi << 16) | lo
+
+    def make_dir(self, parent_cluster, name):
+        """Создаёт подкаталог, возвращает его кластер."""
+        newc = self.alloc_cluster()
+        data = bytearray(self.cluster_bytes)
+        data[0:32]  = self.make_dirent(b'.       ' + b'   ', ATTR_DIR, newc, 0)
+        # у `..` корня cluster = 0 по соглашению FAT
+        pc = 0 if parent_cluster == self.root_cluster else parent_cluster
+        data[32:64] = self.make_dirent(b'..      ' + b'   ', ATTR_DIR, pc, 0)
+        self.write_cluster(newc, data)
+
+        c, off = self.find_free_slot(parent_cluster)
+        self.write_entry(c, off, self.make_dirent(self.name_83(name), ATTR_DIR, newc, 0))
+        return newc
+
+    def walk_dirs(self, components, create=True):
+        """Спускается по списку каталогов от корня, создавая недостающие."""
+        cur = self.root_cluster
+        for comp in components:
+            found = self.find_entry(cur, comp)
+            if found:
+                _, _, raw = found
+                if not (raw[11] & ATTR_DIR):
+                    raise RuntimeError(f'/{comp}: уже существует и это не каталог')
+                cur = self.entry_cluster(raw)
+            elif create:
+                cur = self.make_dir(cur, comp)
             else:
-                # Последний cluster - ставим EOF
-                for fat_num in range(num_fats):
-                    fat_offset = (fat_begin_lba + fat_num * sectors_per_fat) * bytes_per_sector + current_cluster * 4
-                    f.seek(fat_offset)
-                    f.write(struct.pack('<I', 0x0FFFFFF8))
-        
-        print(f"Added '{filename}' ({len(content)} bytes) to FAT32 disk in cluster {free_cluster}")
+                return None
+        return cur
+
+    # --- файлы ----------------------------------------------------------------
+    def add_file(self, content, dest_path):
+        parts = [p for p in dest_path.strip('/').split('/') if p]
+        if not parts:
+            raise ValueError('пустой путь назначения')
+        filename, dirs = parts[-1], parts[:-1]
+        dir_cluster = self.walk_dirs(dirs)
+
+        # перезапись: убираем старую запись и освобождаем её кластеры
+        old = self.find_entry(dir_cluster, filename)
+        if old:
+            c, off, raw = old
+            if raw[11] & ATTR_DIR:
+                raise RuntimeError(f'{dest_path}: уже существует как каталог')
+            oldc = self.entry_cluster(raw)
+            if oldc >= 2:
+                self.free_chain(oldc)
+            self.write_entry(c, off, b'\xE5' + raw[1:])
+
+        # данные
+        first = 0
+        if content:
+            clusters = []
+            for i in range(0, len(content), self.cluster_bytes):
+                clusters.append(self.alloc_cluster())
+            for i, c in enumerate(clusters):
+                chunk = content[i * self.cluster_bytes:(i + 1) * self.cluster_bytes]
+                self.write_cluster(c, chunk.ljust(self.cluster_bytes, b'\x00'))
+                self.fat_set(c, clusters[i + 1] if i + 1 < len(clusters) else FAT_EOC)
+            first = clusters[0]
+
+        c, off = self.find_free_slot(dir_cluster)
+        self.write_entry(c, off, self.make_dirent(
+            self.name_83(filename), ATTR_ARCHIVE, first, len(content)))
+
+    def close(self):
+        for n in range(self.nfats):
+            self.f.seek((self.fat_lba + n * self.spf) * self.bps)
+            self.f.write(self.fat)
+        self.f.close()
+
+
+def main():
+    if len(sys.argv) != 4:
+        print('Usage: add_file.py <disk.img> <source_file|text> <dest_path>')
+        print('       add_file.py <disk.img> --mkdir <dir_path>')
+        sys.exit(1)
+
+    disk_path, source, dest = sys.argv[1], sys.argv[2], sys.argv[3]
+    img = Fat32Image(disk_path)
+    try:
+        if source == '--mkdir':
+            img.walk_dirs([p for p in dest.strip('/').split('/') if p])
+            print(f"mkdir '{dest}' OK")
+        else:
+            if os.path.isfile(source):
+                with open(source, 'rb') as sf:
+                    content = sf.read()
+            else:
+                content = source.encode('utf-8')
+            img.add_file(content, dest)
+            print(f"Added '{dest}' ({len(content)} bytes)")
+    finally:
+        img.close()
+
 
 if __name__ == '__main__':
-    if len(sys.argv) != 4:
-        print("Usage: add_file.py <disk.img> <source_file> <dest_path>")
-        print("  source_file: file path or text string")
-        print("  dest_path: /path/on/disk")
-        sys.exit(1)
-    
-    add_file_to_fat32(sys.argv[1], sys.argv[2], sys.argv[3])
-
+    main()

@@ -207,7 +207,8 @@ static uint64_t sys_fb_map(void) {
  * Syscall'ы для userspace window manager'а (feat/userspace-wm)
  * ------------------------------------------------------------------------- */
 
-/* Запустить ELF с диска: sys_spawn("/vterm"). Путь копируем в kernel-память —
+/* Запустить ELF с диска: sys_spawn("/bin/vterm") или sys_spawn("vterm") —
+ * elf_open_exec ищет в /bin как $PATH. Путь копируем в kernel-память —
  * userdata читается загрузчиком уже в ДРУГОМ адресном пространстве. */
 static uint64_t sys_spawn(uint64_t user_path) {
     extern void userspace_elf_loader_task(void);

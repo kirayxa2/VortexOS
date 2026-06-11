@@ -76,4 +76,10 @@ typedef struct {
 // Returns {entry_point, user_pml4} on success, {0, NULL} on failure
 elf_load_result_t elf_load(const char *path);
 
+/* Открыть исполняемый файл с поиском а-ля $PATH:
+ * "vterm" / "/vterm" / "/bin/vterm" → находит бинарник и в /bin, и в корне
+ * (старые образы диска). Возвращает vfs-ноду или 0. */
+struct vfs_node;
+struct vfs_node *elf_open_exec(const char *path);
+
 #endif

@@ -372,7 +372,7 @@ void userspace_elf_loader_task(void) {
 
 void userspace_hello_task(void) {
     task_t *current = sched_current();
-    if (current) current->userdata = (void *)"/hello";
+    if (current) current->userdata = (void *)"/bin/hello";
     userspace_elf_loader_task();
 }
 
@@ -532,13 +532,13 @@ void kmain(void) {
         fb_puts("[VFS] /test.txt NOT FOUND!\n");
     }
     
-    fb_puts("[TEST] Checking /hello...\n");
-    vfs_node_t *hello_test = vfs_open("/hello", 0);
+    fb_puts("[TEST] Checking /bin/hello...\n");
+    vfs_node_t *hello_test = elf_open_exec("/bin/hello");
     if (hello_test) {
-        fb_puts("[VFS] /hello FOUND!\n");
+        fb_puts("[VFS] /bin/hello FOUND!\n");
         vfs_close(hello_test);
     } else {
-        fb_puts("[VFS] /hello NOT FOUND!\n");
+        fb_puts("[VFS] /bin/hello NOT FOUND!\n");
     }
 
     /* --- Планировщик + таймер ------------------------------------------- */
@@ -560,18 +560,19 @@ void kmain(void) {
      * Если /vwm на диске нет — всё работает по-старому (как в main). */
     int use_userspace_wm = 0;
     {
-        vfs_node_t *vwm_node = vfs_open("/vwm", 0);
+        /* elf_open_exec ищет и /bin/vwm, и /vwm (старые образы диска) */
+        vfs_node_t *vwm_node = elf_open_exec("/bin/vwm");
         if (vwm_node) {
             vfs_close(vwm_node);
             use_userspace_wm = 1;
-            fb_puts("[OK] /vwm FOUND! Starting userspace window manager\n");
+            fb_puts("[OK] /bin/vwm FOUND! Starting userspace window manager\n");
 
             /* Та же задержка 3 секунды, что и у остальных GUI-задач. */
             uint64_t start = pit_ticks();
             while (pit_ticks() - start < 300);
 
             task_t *vwm_task = task_create("vwm", userspace_elf_loader_task, 10);
-            if (vwm_task) vwm_task->userdata = (void *)"/vwm";
+            if (vwm_task) vwm_task->userdata = (void *)"/bin/vwm";
 
             fb_puts("[SCHEDULER] Starting multitasking (userspace WM)...\n\n");
             for (;;) __asm__ volatile("hlt");   /* kmain = idle task */
@@ -581,11 +582,11 @@ void kmain(void) {
 
     /* Сначала пробуем терминал /vsh (userspace Vortex Shell), потом
      * window test / vgraph если терминала нет на диске. */
-    fb_puts("[TEST] Checking for /vsh...\n");
-    vfs_node_t *vsh_node = vfs_open("/vsh", 0);
-    vfs_node_t *tw_node = vsh_node ? 0 : vfs_open("/testwin", 0);
+    fb_puts("[TEST] Checking for /bin/vsh...\n");
+    vfs_node_t *vsh_node = elf_open_exec("/bin/vsh");
+    vfs_node_t *tw_node = vsh_node ? 0 : elf_open_exec("/bin/testwin");
     if (vsh_node) {
-        fb_puts("[OK] /vsh FOUND! Launching Vortex Shell\n");
+        fb_puts("[OK] /bin/vsh FOUND! Launching Vortex Shell\n");
         vfs_close(vsh_node);
 
         /* ЗАДЕРЖКА 3 секунды (как у остальных GUI-задач) */
@@ -593,11 +594,11 @@ void kmain(void) {
         while (pit_ticks() - start < 300);
 
         task_t *vsh_task = task_create("vsh", userspace_elf_loader_task, 10);
-        if (vsh_task) vsh_task->userdata = (void *)"/vsh";
+        if (vsh_task) vsh_task->userdata = (void *)"/bin/vsh";
     } else if (tw_node) {
-        fb_puts("[OK] /testwin FOUND!\n");
+        fb_puts("[OK] /bin/testwin FOUND!\n");
         vfs_close(tw_node);
-        fb_puts("[OK] /testwin found, creating window test task\n");
+        fb_puts("[OK] /bin/testwin found, creating window test task\n");
         
         /* ЗАДЕРЖКА 3 секунды */
         fb_puts("[DEBUG] Starting window test in 3 seconds...\n");
@@ -605,14 +606,14 @@ void kmain(void) {
         while (pit_ticks() - start < 300);
         
         task_t *tw_task = task_create("testwin", userspace_elf_loader_task, 10);
-        if (tw_task) tw_task->userdata = (void *)"/testwin";
+        if (tw_task) tw_task->userdata = (void *)"/bin/testwin";
     } else {
-        fb_puts("[TEST] /testwin not found, checking for /vgraph...\n");
-        vfs_node_t *vg_node = vfs_open("/vgraph", 0);
+        fb_puts("[TEST] /bin/testwin not found, checking for /bin/vgraph...\n");
+        vfs_node_t *vg_node = elf_open_exec("/bin/vgraph");
         if (vg_node) {
-            fb_puts("[OK] /vgraph FOUND!\n");
+            fb_puts("[OK] /bin/vgraph FOUND!\n");
             vfs_close(vg_node);
-            fb_puts("[OK] /vgraph found, creating compositor task\n");
+            fb_puts("[OK] /bin/vgraph found, creating compositor task\n");
             
             /* ЗАДЕРЖКА 3 секунды */
             fb_puts("[DEBUG] Starting compositor in 3 seconds...\n");
@@ -620,7 +621,7 @@ void kmain(void) {
             while (pit_ticks() - start < 300);
             
             task_t *vg_task = task_create("vgraph", userspace_elf_loader_task, 10);
-            if (vg_task) vg_task->userdata = (void *)"/vgraph";
+            if (vg_task) vg_task->userdata = (void *)"/bin/vgraph";
         } else {
             fb_puts("[WARN] No GUI programs found\n");
         }

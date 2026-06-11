@@ -69,5 +69,16 @@ if __name__ == '__main__':
     # Write boot sector to existing disk image
     with open(disk_path, 'r+b') as f:
         f.write(boot_sector)
+
+        # Инициализируем обе копии FAT: FAT[0]/FAT[1] служебные,
+        # FAT[2] = EOC (корневой каталог занимает кластер 2).
+        # Раньше FAT оставалась нулевой и первый же add_file.py мог
+        # выделить кластер 2 под данные — прямо поверх корня.
+        reserved_sectors = 32
+        sectors_per_fat = 128
+        fat_init = struct.pack('<III', 0x0FFFFFF8, 0x0FFFFFFF, 0x0FFFFFF8)
+        for n in range(2):
+            f.seek((reserved_sectors + n * sectors_per_fat) * 512)
+            f.write(fat_init)
     
     print(f"FAT32 boot sector written to {disk_path}")
