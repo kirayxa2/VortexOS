@@ -1,0 +1,4 @@
+# VortexOS window manager (композитор). Падает — vinit перезапустит.
+name=vwm
+exec=/bin/vwm
+restart=yes

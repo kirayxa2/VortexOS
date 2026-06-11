@@ -11,10 +11,10 @@ LIBC_OBJS   := libc/crt0.o libc/string.o libc/malloc.o libc/stdio.o libc/stdlib.
 LIBC_HDRS   := $(wildcard libc/include/*.h) syscalls.h vos_abi.h
 
 # --- утилиты /bin (libc-приложения: crt0 разбирает argv из SYS_GETARGS) ------
-UTILS := ls cat rm find mkdir touch cp mv echo pwd stat head wc
+UTILS := ls cat rm find mkdir touch cp mv echo pwd stat head wc vctl
 UTIL_BINS := $(addprefix bin/,$(UTILS))
 
-all: hello vortexgraph test_window vsh vwm vterm vdemo vfiles vuidemo vpanel $(UTIL_BINS)
+all: hello vortexgraph test_window vsh vwm vterm vdemo vfiles vuidemo vpanel vinit $(UTIL_BINS)
 
 libc/%.o: libc/src/%.c $(LIBC_HDRS)
 	$(CC) $(LIBC_CFLAGS) -c $< -o $@
@@ -24,6 +24,9 @@ libvui/vui.o: libvui/vui.c libvui/vui.h font8x16.h $(LIBC_HDRS)
 
 vuidemo: vuidemo.c $(LIBC_OBJS) libvui/vui.o linker.ld
 	$(CC) $(LIBC_CFLAGS) $(LDFLAGS) vuidemo.c $(LIBC_OBJS) libvui/vui.o -o vuidemo
+
+vinit: vinit.c $(LIBC_OBJS) linker.ld
+	$(CC) $(LIBC_CFLAGS) $(LDFLAGS) vinit.c $(LIBC_OBJS) -o vinit
 
 hello: hello.c linker.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) hello.c -o hello
@@ -56,7 +59,7 @@ bin/%: bin/%.c bin/vutil.h $(LIBC_OBJS) linker.ld
 	$(CC) $(LIBC_CFLAGS) $(LDFLAGS) $< $(LIBC_OBJS) -o $@
 
 clean:
-	rm -f hello vortexgraph test_window vsh vwm vterm vdemo vfiles vuidemo vpanel
+	rm -f hello vortexgraph test_window vsh vwm vterm vdemo vfiles vuidemo vpanel vinit
 	rm -f $(UTIL_BINS)
 	rm -f libc/*.o libvui/*.o
 

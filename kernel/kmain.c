@@ -611,6 +611,31 @@ void kmain(void) {
     /* Создаём тестовые задачи */
     /* GUI теперь полностью в userspace через window manager */
     
+    /* --- init система /bin/vinit (этап 4 роадмапа) -----------------------
+     * Если на диске есть /bin/vinit — ядро запускает ТОЛЬКО его (аналог
+     * PID 1). Дальше vinit сам читает .svc-конфиги из /etc/vinit, параллельно
+     * стартует сервисы (vwm, vpanel, ...), перезапускает упавшие и
+     * отвечает на команды /bin/vctl (start|stop|status) по IPC.
+     * Нет vinit на диске — работаем по-старому (прямой запуск vwm ниже). */
+    {
+        vfs_node_t *vinit_node = elf_open_exec("/bin/vinit");
+        if (vinit_node) {
+            vfs_close(vinit_node);
+            fb_puts("[OK] /bin/vinit FOUND! Starting init system\n");
+
+            /* Та же задержка 3 секунды, что была у прямого запуска vwm. */
+            uint64_t start = pit_ticks();
+            while (pit_ticks() - start < 300);
+
+            task_t *vinit_task = task_create("vinit", userspace_elf_loader_task, 10);
+            if (vinit_task) vinit_task->userdata = (void *)"/bin/vinit";
+
+            fb_puts("[SCHEDULER] Starting multitasking (vinit)...\n\n");
+            for (;;) __asm__ volatile("hlt");   /* kmain = idle task */
+        }
+        fb_puts("[INFO] /bin/vinit not found, falling back to direct vwm start\n");
+    }
+
     /* --- userspace window manager (feat/userspace-wm) -------------------
      * Если на диске есть /vwm — вся графика уходит в userspace «по-взрослому»:
      * /vwm сам маппит framebuffer, забирает ввод (input grab), регистрируется

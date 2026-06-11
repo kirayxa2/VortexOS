@@ -613,11 +613,40 @@ static uint64_t sys_input_poll(uint64_t user_buf_addr) {
 }
 
 /* -------------------------------------------------------------------------
+ * SYS_KILL — завершить чужой процесс (vinit: `vctl stop <svc>`).
+ * Убить задачу «снаружи» напрямую нельзя: task_exit обязан выполняться на
+ * её собственном kernel-стеке (он сносит её PML4 и heap-аллокации). Поэтому
+ * только помечаем pending_kill: жертва завершится сама при ближайшем
+ * syscall'е (диспетчер вызовет task_exit), а спящую в ipc_recv — будим.
+ * Ограничение: задача в чистом compute-цикле без syscall'ов умрёт только
+ * при следующем syscall'е. Возврат: 0 = принято, -1 = нет такой/нельзя.
+ * ------------------------------------------------------------------------- */
+static uint64_t sys_kill(uint64_t pid) {
+    task_t *self = sched_current();
+    if (!pid) return (uint64_t)-1;
+    if (self && self->pid == (uint32_t)pid) {  /* kill самого себя = exit(137) */
+        self->exit_code = 137;
+        vmm_switch(vmm_kernel_pml4);
+        task_exit();
+        __builtin_unreachable();
+    }
+    task_t *t = sched_find_task((uint32_t)pid);
+    if (!t) return (uint64_t)-1;
+    /* Только userspace-процессы: у kernel-задач (kmain/idle) нет своего PML4 —
+     * их убивать нельзя. Задачу в стадии ELF-загрузки тоже не трогаем. */
+    if (!t->pml4 || t->pml4 == (void *)vmm_kernel_pml4) return (uint64_t)-1;
+    t->exit_code = 137;          /* 128 + SIGKILL, как в Unix */
+    t->pending_kill = 1;
+    ipc_force_wake((uint32_t)pid);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
  * Диспетчер — вызывается из syscall_entry.asm
  * Аргументы по System V AMD64 ABI для syscall:
  *   rax = номер,  rdi = arg1,  rsi = arg2,  rdx = arg3
  * ------------------------------------------------------------------------- */
-uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
+static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
     switch (num) {
         case 0: return sys_write(a1, a2, a3);
         case 1: return sys_exit(a1);
@@ -676,8 +705,24 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, u
          * обновляется ТОЛЬКО по SYS_FB_PRESENT, промежуточные записи в fb
          * не видны => композитор может рисовать прямо в fb без back buffer. */
         case 40: return virtio_gpu_active() ? 1 : 0;
+
+        case 41: return sys_kill(a1);                  // SYS_KILL(pid) — см. выше
         default: return (uint64_t)-1;
     }
+}
+
+uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
+    uint64_t ret = syscall_do(num, a1, a2, a3, a4, a5, a6);
+    /* SYS_KILL: нас пометили на завершение, пока мы были в syscall'е (или
+     * прямо перед ним). Завершаемся здесь — на СВОЁМ kernel-стеке, ровно как
+     * это делает sys_exit. exit_code уже выставлен убийцей (137). */
+    task_t *self = sched_current();
+    if (self && self->pending_kill) {
+        vmm_switch(vmm_kernel_pml4);
+        task_exit();
+        __builtin_unreachable();
+    }
+    return ret;
 }
 
 void syscall_set_kernel_stack(uint64_t rsp0) {

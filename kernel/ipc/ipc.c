@@ -139,6 +139,10 @@ uint64_t ipc_sys_recv(uint64_t user_msg, uint64_t timeout_ticks) {
         deadline = pit_ticks() + timeout_ticks;
 
     for (;;) {
+        /* SYS_KILL: убитая задача не должна снова заснуть в recv — выходим
+         * из syscall'а, диспетчер увидит pending_kill и вызовет task_exit. */
+        if (self->pending_kill) return 0;
+
         __asm__ volatile("cli");
         ipc_mailbox_t *mb = mailbox_get(self->pid, 1);
         if (!mb) { __asm__ volatile("sti"); return 0; }
@@ -168,6 +172,20 @@ uint64_t ipc_sys_recv(uint64_t user_msg, uint64_t timeout_ticks) {
         __asm__ volatile("sti\n\thlt");
         /* Проснулись (сообщение или таймаут) — новый круг перечитает очередь. */
     }
+}
+
+/* SYS_KILL: разбудить задачу, спящую в ipc_sys_recv, чтобы она дошла до
+ * проверки pending_kill (иначе recv(FOREVER) спал бы до первого сообщения). */
+void ipc_force_wake(uint32_t pid) {
+    uint64_t flags;
+    __asm__ volatile("pushfq\n\tpop %0\n\tcli" : "=r"(flags));
+    ipc_mailbox_t *mb = mailbox_get(pid, 0);
+    if (mb && mb->waiter) {
+        sched_wake((task_t *)mb->waiter);
+        mb->waiter = 0;
+        mb->wait_deadline = 0;
+    }
+    if (flags & 0x200) __asm__ volatile("sti");
 }
 
 /* Зовётся из PIT IRQ0 (прерывания выключены): будим получателей с истёкшим

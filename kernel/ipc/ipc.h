@@ -76,6 +76,9 @@ void ipc_input_push_mouse(int dx, int dy, uint8_t buttons, int btn_changed);
 /* Зовётся из PIT IRQ0: будит ipc_sys_recv, у которых истёк timeout. */
 void ipc_tick(void);
 
+/* SYS_KILL: разбудить задачу, спящую в ipc_sys_recv (см. pending_kill). */
+void ipc_force_wake(uint32_t pid);
+
 /* Зовётся из task_exit (под cli): освобождает mailbox/сервисы/grab задачи. */
 void ipc_on_task_exit(uint32_t pid);
 

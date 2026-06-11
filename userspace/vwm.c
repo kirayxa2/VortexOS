@@ -1891,10 +1891,10 @@ void _start(void) {
 
     puts("vwm: userspace window manager up\n");
 
-    /* 4. Первый кадр + стартовый терминал */
+    /* 4. Первый кадр. vpanel теперь запускает vinit (/etc/vinit/20-panel.svc),
+     * автостарт терминала убран по просьбе пользователя — Terminal
+     * запускается кликом в dock. */
     render_all();
-    vos_spawn("/bin/vpanel");
-    vos_spawn("/bin/vterm");
 
     /* 5. Event loop: ipc_recv — и очередь событий, и таймер кадра.
      * Спим максимум 1 тик; кадр рисуем не чаще раза в 2 тика (~50 FPS). */

@@ -38,6 +38,8 @@ typedef struct task {
     uint32_t        stdout_pid; /* куда зеркалить SYS_WRITE IPC-сообщениями
                                  * (VOS_MSG_STDOUT); 0 = только консоль ядра */
     uint64_t        exit_code;  /* код выхода (sys_exit) для VOS_MSG_CHILD_EXIT */
+    uint8_t         pending_kill; /* SYS_KILL: задача завершится при следующем
+                                   * syscall (диспетчер вызовет task_exit) */
     char            cmdline[TASK_CMDLINE_MAX]; /* argv процесса (SYS_GETARGS) */
     char            cwd[TASK_CWD_MAX];         /* текущий каталог (SYS_GETCWD) */
 } task_t;
@@ -55,6 +57,7 @@ void    task_exit(void);
 int     task_track_alloc(task_t *t, void *raw);
 task_t *sched_current(void);
 int     sched_pid_alive(uint32_t pid);
+task_t *sched_find_task(uint32_t pid);   /* живая задача по pid (или 0) */
 uint64_t sched_pick(uint64_t frame_rsp);
 
 extern int vos_need_resched;

@@ -105,6 +105,7 @@ task_t *task_create(const char *name, void (*entry)(void), uint8_t priority) {
     t->n_allocs = 0;   /* список kfree-при-выходе: чистый для нового владельца */
     t->stdout_pid = 0;          /* по умолчанию вывод — в консоль ядра */
     t->exit_code  = 0;
+    t->pending_kill = 0;        /* в переиспользованном слоте мог остаться флаг */
     t->cmdline[0] = 0;
     t->cwd[0] = '/'; t->cwd[1] = 0;   /* стартовый каталог — корень */
     for (int k = 0; k < TASK_MAX_ALLOCS; k++) t->allocs[k] = 0;
@@ -166,6 +167,14 @@ int sched_pid_alive(uint32_t pid) {
     if (!pid) return 0;
     for (uint32_t i = 0; i < task_count; i++)
         if (tasks[i].pid == pid && tasks[i].state != TASK_DEAD) return 1;
+    return 0;
+}
+
+/* Живая задача по pid — для SYS_KILL (vinit/vctl stop). 0 = нет такой. */
+task_t *sched_find_task(uint32_t pid) {
+    if (!pid) return 0;
+    for (uint32_t i = 0; i < task_count; i++)
+        if (tasks[i].pid == pid && tasks[i].state != TASK_DEAD) return &tasks[i];
     return 0;
 }
 

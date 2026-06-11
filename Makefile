@@ -254,7 +254,9 @@ disk-with-apps: disk userspace
 	python3 tools/add_file.py build/disk.img userspace/vfiles bin/vfiles
 	python3 tools/add_file.py build/disk.img userspace/vuidemo bin/vuidemo
 	python3 tools/add_file.py build/disk.img userspace/vpanel bin/vpanel
+	python3 tools/add_file.py build/disk.img userspace/vinit bin/vinit
 	@echo "=== Adding /bin utilities (ls, cat, rm, find, ...) ==="
+	python3 tools/add_file.py build/disk.img userspace/bin/vctl bin/vctl
 	python3 tools/add_file.py build/disk.img userspace/bin/ls bin/ls
 	python3 tools/add_file.py build/disk.img userspace/bin/cat bin/cat
 	python3 tools/add_file.py build/disk.img userspace/bin/rm bin/rm
@@ -272,6 +274,9 @@ disk-with-apps: disk userspace
 	python3 tools/add_file.py build/disk.img "Welcome to VortexOS!" etc/motd
 	python3 tools/add_file.py build/disk.img --mkdir home
 	python3 tools/add_file.py build/disk.img --mkdir tmp
+	@echo "=== Adding vinit service configs (/etc/vinit) ==="
+	python3 tools/add_file.py build/disk.img userspace/etc/vinit/10-vwm.svc etc/vinit/10-vwm.svc
+	python3 tools/add_file.py build/disk.img userspace/etc/vinit/20-panel.svc etc/vinit/20-panel.svc
 	@echo "=== FAT32 disk with apps ready ==="
 
 # --- VortexFS disk с приложениями (заменяет FAT32 как корневую FS) ----------
@@ -289,7 +294,9 @@ vortexfs-with-apps: vortexfs-disk userspace
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vfiles bin/vfiles
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vuidemo bin/vuidemo
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vpanel bin/vpanel
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vinit bin/vinit
 	@echo "=== Adding /bin utilities (ls, cat, rm, find, ...) ==="
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/vctl bin/vctl
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/ls bin/ls
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/cat bin/cat
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/rm bin/rm
@@ -307,4 +314,7 @@ vortexfs-with-apps: vortexfs-disk userspace
 	python3 tools/add_vortexfs_file.py build/vortexfs.img "Welcome to VortexOS!" etc/motd
 	python3 tools/add_vortexfs_file.py build/vortexfs.img --mkdir home
 	python3 tools/add_vortexfs_file.py build/vortexfs.img --mkdir tmp
+	@echo "=== Adding vinit service configs (/etc/vinit) ==="
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/etc/vinit/10-vwm.svc etc/vinit/10-vwm.svc
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/etc/vinit/20-panel.svc etc/vinit/20-panel.svc
 	@echo "=== VortexFS disk with apps ready ==="

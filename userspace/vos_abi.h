@@ -40,6 +40,9 @@ typedef long int64_t;
 #define SYS_FS_READDIR    30   /* (path*, index, vos_dirent_t*) -> 0 / -1.
                                 * Запись каталога №index (для /bin/vfiles).    */
 #define SYS_FB_CAPS       40   /* () -> битовая маска возможностей экрана      */
+#define SYS_KILL          41   /* (pid) -> 0 / -1. Помечает процесс на
+                                * завершение (exit_code 137); умрёт при
+                                * ближайшем своём syscall'е. Для vctl stop.   */
 #define VOS_FB_CAP_OFFSCREEN 1 /* present-модель (virtio): экран меняется
                                 * ТОЛЬКО по SYS_FB_PRESENT => можно безопасно
                                 * компоновать прямо в fb, без back buffer      */
@@ -59,6 +62,7 @@ typedef long int64_t;
 #define SYS_GETCWD        39   /* (buf*, max) -> len                           */
 
 #define VOS_SVC_WM        0    /* service id window manager'а */
+#define VOS_SVC_INIT      1    /* service id init-системы /bin/vinit */
 
 /* recv: ждать вечно / не ждать */
 #define VOS_IPC_FOREVER   ((uint64_t)-1)
@@ -86,6 +90,24 @@ typedef struct {
 #define VOS_MSG_STDOUT     200  /* w1=len (<=40), байты в w2..w6, w7=pid child'а */
 #define VOS_MSG_CHILD_EXIT 201  /* w1=exit_code, w7=pid child'а */
 #define VOS_STDOUT_CHUNK   40
+
+/* --- Протокол init-системы (/bin/vctl <-> /bin/vinit) --------------------
+ * vinit регистрируется сервисом VOS_SVC_INIT; vctl находит его pid через
+ * SYS_SVC_LOOKUP. Имя сервиса пакуется в w2..w4 (24 байта, max 23 + NUL). */
+#define VINIT_NAME_MAX     24
+#define VINIT_CMD_STATUS  300  /* w2..w4=имя; пустое имя = все сервисы */
+#define VINIT_CMD_START   301  /* w2..w4=имя */
+#define VINIT_CMD_STOP    302  /* w2..w4=имя (kill + restart выключается) */
+
+#define VINIT_R_INFO      310  /* w1=state (см. VINIT_ST_*),
+                                * w2=(idx<<32)|count,
+                                * w3=(pid<<32)|restarts,
+                                * w4..w6=имя (24 байта). count=0 -> пусто. */
+#define VINIT_R_ERR       311  /* w1=код: 1=нет такого сервиса, 2=уже запущен,
+                                * 3=spawn не удался */
+#define VINIT_ST_STOPPED   0
+#define VINIT_ST_RUNNING   1
+#define VINIT_ST_FAILED    2   /* слишком часто падает — перезапуск отключён */
 
 /* --- Ввод ядро -> WM (после SYS_INPUT_GRAB) --- */
 #define VIN_MOUSE         100  /* w1=dx(int64) w2=dy(int64) w3=buttons w4=btn_changed */
@@ -148,6 +170,7 @@ static inline uint64_t vos_input_grab(void) { return syscall0(SYS_INPUT_GRAB); }
 static inline uint64_t vos_svc_register(uint64_t svc) { return syscall1(SYS_SVC_REGISTER, svc); }
 static inline uint64_t vos_svc_lookup(uint64_t svc)   { return syscall1(SYS_SVC_LOOKUP, svc); }
 static inline uint64_t vos_spawn(const char *path)    { return syscall1(SYS_SPAWN, (uint64_t)path); }
+static inline int64_t  vos_kill(uint64_t pid)         { return (int64_t)syscall1(SYS_KILL, pid); }
 static inline int64_t  vos_fs_readdir(const char *path, uint64_t index, vos_dirent_t *out) {
     return (int64_t)syscall3(SYS_FS_READDIR, (uint64_t)path, index, (uint64_t)out);
 }
