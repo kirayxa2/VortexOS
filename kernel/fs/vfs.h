@@ -18,6 +18,11 @@
 #define VFS_FL_CACHED 0x1   /* нода живёт в кэше своей ФС — НЕ kfree'ить
                              * (vortexfs кэширует ноды; см. fs_node_put) */
 
+/* Маски прав для vfs_access (классический rwx) */
+#define VFS_PERM_R 4
+#define VFS_PERM_W 2
+#define VFS_PERM_X 1
+
 struct vfs_node;
 
 /* Таблица операций — каждая ФС заполняет свою */
@@ -32,6 +37,9 @@ typedef struct vfs_ops {
     int      (*unlink) (struct vfs_node *node, const char *name);
     /* Итерация директории: index = 0,1,2... возвращает имя или NULL */
     const char *(*readdir)(struct vfs_node *node, uint32_t index);
+    /* Права (опционально; ФС без прав оставляют NULL) */
+    int      (*chmod)  (struct vfs_node *node, uint32_t mode);
+    int      (*chown)  (struct vfs_node *node, uint32_t uid, uint32_t gid);
 } vfs_ops_t;
 
 /* VFS нода — универсальный объект (файл, директория, ...) */
@@ -41,6 +49,9 @@ typedef struct vfs_node {
     uint32_t    size;       /* размер в байтах */
     uint32_t    inode;      /* номер inode в конкретной ФС */
     uint32_t    flags;
+    uint32_t    mode;       /* права rwxrwxrwx (0 = ФС без прав → 0755) */
+    uint32_t    uid;        /* владелец */
+    uint32_t    gid;        /* группа   */
     vfs_ops_t  *ops;        /* операции */
     void       *fs_data;    /* указатель на данные конкретной ФС */
     struct vfs_node *mount; /* если VFS_MOUNT — точка монтирования */
@@ -68,6 +79,17 @@ int          vfs_mkdir(const char *path);
 int          vfs_create(const char *path);
 int          vfs_unlink(const char *path);
 const char  *vfs_readdir(vfs_node_t *node, uint32_t index);
+
+/* --- Права --- */
+
+/* Креды текущей задачи (root=0 до старта планировщика и для kernel-тасков) */
+uint32_t     vfs_cur_uid(void);
+uint32_t     vfs_cur_gid(void);
+/* Проверка доступа: mask = VFS_PERM_R|W|X. 0 = ок, -1 = отказ.
+ * uid 0 (root) проходит всё, кроме X на файлах вообще без x-битов. */
+int          vfs_access(vfs_node_t *node, uint32_t mask);
+int          vfs_chmod(const char *path, uint32_t mode);  /* владелец/root */
+int          vfs_chown(const char *path, uint32_t uid, uint32_t gid); /* root */
 
 /* Глобальный корень */
 extern vfs_node_t *vfs_root;

@@ -280,6 +280,25 @@ static void run_command(const char *line) {
         return;
     }
 
+    /* ---- setuid <uid> [gid]: сбросить привилегии шелла (назад нельзя).
+     * Дети наследуют креды при spawn — удобно проверять права VortexFS. ---- */
+    if (s_starts(line, "setuid ")) {
+        const char *a = line + 7;
+        while (*a == ' ') a++;
+        uint32_t uid = 0, gid = 0;
+        int ok = (*a >= '0' && *a <= '9');
+        while (*a >= '0' && *a <= '9') uid = uid * 10 + (uint32_t)(*a++ - '0');
+        while (*a == ' ') a++;
+        if (*a) {
+            ok = ok && (*a >= '0' && *a <= '9');
+            while (*a >= '0' && *a <= '9') gid = gid * 10 + (uint32_t)(*a++ - '0');
+        } else gid = uid;
+        if (!ok) { term_print("usage: setuid <uid> [gid]"); return; }
+        if (vos_setuid(uid, gid) != 0) { term_print("setuid: not root"); return; }
+        term_print("ok, privileges dropped");
+        return;
+    }
+
     /* ---- внешняя команда: /bin/* через SYS_SPAWN_EX с stdout-пайпом ---- */
     int64_t pid = vos_spawn_ex(line, 1);   /* flag 1 = pipe stdout */
     if (pid < 0) {

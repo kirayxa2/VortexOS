@@ -52,8 +52,15 @@ typedef struct __attribute__((packed)) {
     uint32_t direct[VTXFS_MAX_DIRECT]; /* прямые указатели (0 = нет) */
     uint32_t indirect;              /* один уровень косвенности      */
     uint32_t dbl_indirect;          /* двойная косвенность           */
-    uint32_t _pad;                  /* выравнивание до 64 байт       */
+    /* Права (бывший _pad — старые образы читаются: mode==0 → дефолт) */
+    uint16_t mode;                  /* unix-права rwxrwxrwx (07777)  */
+    uint8_t  uid;                   /* владелец                      */
+    uint8_t  gid;                   /* группа                        */
 } vtxfs_inode_t;
+
+/* Дефолтные права (и интерпретация mode==0 в старых образах) */
+#define VTXFS_DEF_DIR_MODE  0755
+#define VTXFS_DEF_FILE_MODE 0644
 
 /* === On-disk запись каталога (64 байта) =================================== */
 typedef struct __attribute__((packed)) {

@@ -61,6 +61,12 @@ typedef long int64_t;
 #define SYS_CHDIR         38   /* (path*) только каталог  -> 0 / -1            */
 #define SYS_GETCWD        39   /* (buf*, max) -> len                           */
 
+/* --- права (VortexFS: mode/uid/gid в иноде) --- */
+#define SYS_FS_CHMOD      42   /* (path*, mode) владелец/root -> 0 / -1        */
+#define SYS_FS_CHOWN      43   /* (path*, uid, gid) только root -> 0 / -1      */
+#define SYS_GETUID        44   /* () -> (gid<<32)|uid                          */
+#define SYS_SETUID        45   /* (uid, gid) только root; назад нельзя -> 0/-1 */
+
 #define VOS_SVC_WM        0    /* service id window manager'а */
 #define VOS_SVC_INIT      1    /* service id init-системы /bin/vinit */
 
@@ -84,6 +90,9 @@ typedef struct {
 typedef struct {
     uint32_t type;    /* VOS_DT_FILE / VOS_DT_DIR */
     uint32_t size;    /* байты (для каталогов 0) */
+    uint32_t mode;    /* права rwxrwxrwx (07777) */
+    uint32_t uid;     /* владелец */
+    uint32_t gid;     /* группа   */
 } vos_stat_t;
 
 /* --- Сообщения ядро -> шелл (stdout-пайп SYS_SPAWN_EX, см. ipc.h) --- */
@@ -212,6 +221,22 @@ static inline int64_t vos_getargs(char *buf, uint64_t max) {
 }
 static inline int64_t vos_chdir(const char *path) {
     return (int64_t)syscall1(SYS_CHDIR, (uint64_t)path);
+}
+static inline int64_t vos_fs_chmod(const char *path, uint32_t mode) {
+    return (int64_t)syscall3(SYS_FS_CHMOD, (uint64_t)path, (uint64_t)mode, 0);
+}
+static inline int64_t vos_fs_chown(const char *path, uint32_t uid, uint32_t gid) {
+    return (int64_t)syscall3(SYS_FS_CHOWN, (uint64_t)path,
+                             (uint64_t)uid, (uint64_t)gid);
+}
+/* uid в нижних 32 битах, gid в верхних */
+static inline uint64_t vos_getuid_raw(void) {
+    return (uint64_t)syscall1(SYS_GETUID, 0);
+}
+static inline uint32_t vos_getuid(void) { return (uint32_t)vos_getuid_raw(); }
+static inline uint32_t vos_getgid(void) { return (uint32_t)(vos_getuid_raw() >> 32); }
+static inline int64_t vos_setuid(uint32_t uid, uint32_t gid) {
+    return (int64_t)syscall3(SYS_SETUID, (uint64_t)uid, (uint64_t)gid, 0);
 }
 static inline int64_t vos_getcwd(char *buf, uint64_t max) {
     return (int64_t)syscall3(SYS_GETCWD, (uint64_t)buf, max, 0);

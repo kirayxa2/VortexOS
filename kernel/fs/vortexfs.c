@@ -279,6 +279,12 @@ static vfs_node_t *node_make(uint32_t ino) {
     n->ops     = &vtxfs_ops;
     n->fs_data = 0;
     n->flags   = VFS_FL_CACHED;   /* нода в node_cache — kfree запрещён */
+    /* Права: mode==0 — инод из старого образа (v1 без прав) → дефолт */
+    n->mode    = di.mode ? di.mode
+                         : ((di.type == VFS_DIR) ? VTXFS_DEF_DIR_MODE
+                                                 : VTXFS_DEF_FILE_MODE);
+    n->uid     = di.uid;
+    n->gid     = di.gid;
 
     if (node_cache_n < NODE_CACHE_MAX)
         node_cache[node_cache_n++] = n;
@@ -545,6 +551,9 @@ static int vtxfs_mkdir_cb(vfs_node_t *vn, const char *name) {
     di.type   = VFS_DIR;
     di.size   = 0;
     di.blocks = 0;
+    di.mode   = VTXFS_DEF_DIR_MODE;
+    di.uid    = (uint8_t)vfs_cur_uid();
+    di.gid    = (uint8_t)vfs_cur_gid();
     ino_write((uint32_t)ino, &di);
 
     if (dir_add(vn->inode, name, (uint32_t)ino) != 0) {
@@ -568,6 +577,9 @@ static int vtxfs_create_cb(vfs_node_t *vn, const char *name) {
     di.type   = VFS_FILE;
     di.size   = 0;
     di.blocks = 0;
+    di.mode   = VTXFS_DEF_FILE_MODE;
+    di.uid    = (uint8_t)vfs_cur_uid();
+    di.gid    = (uint8_t)vfs_cur_gid();
     ino_write((uint32_t)ino, &di);
 
     if (dir_add(vn->inode, name, (uint32_t)ino) != 0) {
@@ -645,6 +657,31 @@ static int vtxfs_unlink_cb(vfs_node_t *vn, const char *name) {
     return 0;
 }
 
+/* --- chmod / chown -------------------------------------------------------
+ * Политика (владелец/root) проверена в vfs_chmod/vfs_chown — здесь только
+ * запись инода + обновление кэшированной ноды. */
+static int vtxfs_chmod_cb(vfs_node_t *vn, uint32_t mode) {
+    if (!vn) return -1;
+    vtxfs_inode_t di;
+    if (ino_read(vn->inode, &di) != 0) return -1;
+    di.mode = (uint16_t)(mode & 07777);
+    if (ino_write(vn->inode, &di) != 0) return -1;
+    vn->mode = di.mode;
+    return 0;
+}
+
+static int vtxfs_chown_cb(vfs_node_t *vn, uint32_t uid, uint32_t gid) {
+    if (!vn || uid > 255 || gid > 255) return -1;  /* в иноде по байту */
+    vtxfs_inode_t di;
+    if (ino_read(vn->inode, &di) != 0) return -1;
+    di.uid = (uint8_t)uid;
+    di.gid = (uint8_t)gid;
+    if (ino_write(vn->inode, &di) != 0) return -1;
+    vn->uid = uid;
+    vn->gid = gid;
+    return 0;
+}
+
 /* ========================================================================= *
  *  mkfs — форматирование раздела                                           *
  * ========================================================================= */
@@ -710,6 +747,7 @@ int vortexfs_mkfs(uint8_t ata_slave, uint32_t start_lba,
     root.size      = 0;
     root.blocks    = 1;
     root.direct[0] = 1;  /* data block 1 */
+    root.mode      = VTXFS_DEF_DIR_MODE;   /* root:root rwxr-xr-x */
     ino_write(0, &root);
 
     /* Обнуляем первый блок данных root-каталога */
@@ -751,6 +789,8 @@ int vortexfs_init(uint8_t ata_slave, uint32_t start_lba) {
     vtxfs_ops.mkdir   = vtxfs_mkdir_cb;
     vtxfs_ops.create  = vtxfs_create_cb;
     vtxfs_ops.unlink  = vtxfs_unlink_cb;
+    vtxfs_ops.chmod   = vtxfs_chmod_cb;
+    vtxfs_ops.chown   = vtxfs_chown_cb;
 
     g_root = node_make(g_sb.root_inode);
     if (!g_root) {

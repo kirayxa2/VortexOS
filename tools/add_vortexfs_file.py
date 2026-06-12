@@ -150,6 +150,7 @@ class VortexFSImage:
         direct = list(struct.unpack_from('<' + 'I' * MAX_DIRECT, raw, 12))
         indirect = struct.unpack_from('<I', raw, 12 + MAX_DIRECT * 4)[0]
         dbl_indirect = struct.unpack_from('<I', raw, 12 + MAX_DIRECT * 4 + 4)[0]
+        mode, uid, gid = struct.unpack_from('<HBB', raw, 12 + MAX_DIRECT * 4 + 8)
         return {
             'type': typ,
             'size': size,
@@ -157,6 +158,9 @@ class VortexFSImage:
             'direct': direct,
             'indirect': indirect,
             'dbl_indirect': dbl_indirect,
+            'mode': mode,
+            'uid': uid,
+            'gid': gid,
         }
 
     @staticmethod
@@ -166,7 +170,8 @@ class VortexFSImage:
         raw += struct.pack('<' + 'I' * MAX_DIRECT, *ino_dict['direct'])
         raw += struct.pack('<I', ino_dict['indirect'])
         raw += struct.pack('<I', ino_dict.get('dbl_indirect', 0))
-        raw += struct.pack('<I', 0)  # _pad
+        raw += struct.pack('<HBB', ino_dict.get('mode', 0),
+                           ino_dict.get('uid', 0), ino_dict.get('gid', 0))
         assert len(raw) == INODE_SIZE
         return raw
 
@@ -347,6 +352,7 @@ class VortexFSImage:
             'direct': [0] * MAX_DIRECT,
             'indirect': 0,
             'dbl_indirect': 0,
+            'mode': 0o755,   # root:root rwxr-xr-x
         }
         self._ino_write(ino, self._pack_inode(new_inode))
 
@@ -362,7 +368,7 @@ class VortexFSImage:
             cur = self.mkdir(cur, comp)
         return cur
 
-    def add_file(self, content, dest_path):
+    def add_file(self, content, dest_path, mode=None):
         """Add a file with given content to dest_path in the image."""
         parts = [p for p in dest_path.strip('/').split('/') if p]
         if not parts:
@@ -394,6 +400,10 @@ class VortexFSImage:
             'direct': [0] * MAX_DIRECT,
             'indirect': 0,
             'dbl_indirect': 0,
+            # /bin/* — исполняемые (0755), остальное — данные (0644)
+            'mode': mode if mode is not None
+                    else (0o755 if dest_path.strip('/').startswith('bin/')
+                          else 0o644),
         }
 
         # Write data blocks

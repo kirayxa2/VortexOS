@@ -45,6 +45,18 @@ static inline void vu_join(const char *dir, const char *name,
     out[o] = 0;
 }
 
+/* "drwxr-xr-x" из типа и mode (для ls -l / stat). out — минимум 11 байт. */
+static inline void vu_modestr(uint32_t is_dir, uint32_t mode, char *out) {
+    out[0] = is_dir ? 'd' : '-';
+    for (int i = 0; i < 3; i++) {
+        uint32_t t = (mode >> ((2 - i) * 3)) & 7;
+        out[1 + i * 3] = (t & 4) ? 'r' : '-';
+        out[2 + i * 3] = (t & 2) ? 'w' : '-';
+        out[3 + i * 3] = (t & 1) ? 'x' : '-';
+    }
+    out[10] = 0;
+}
+
 /* Маска с '*' (любая подстрока) и '?' (один символ) — для find -name. */
 static inline int vu_match(const char *pat, const char *s) {
     if (*pat == 0) return *s == 0;

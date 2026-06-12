@@ -13,10 +13,13 @@ int main(int argc, char **argv) {
             rc = 1;
             continue;
         }
+        char m[11];
+        vu_modestr(st.type == VOS_DT_DIR, st.mode, m);
         if (st.type == VOS_DT_DIR)
-            printf("%s: directory\n", abs);
+            printf("%s: directory, %s uid=%u gid=%u\n", abs, m, st.uid, st.gid);
         else
-            printf("%s: file, %u bytes\n", abs, st.size);
+            printf("%s: file, %u bytes, %s uid=%u gid=%u\n",
+                   abs, st.size, m, st.uid, st.gid);
     }
     return rc;
 }

@@ -108,6 +108,7 @@ task_t *task_create(const char *name, void (*entry)(void), uint8_t priority) {
     t->pending_kill = 0;        /* в переиспользованном слоте мог остаться флаг */
     t->cmdline[0] = 0;
     t->cwd[0] = '/'; t->cwd[1] = 0;   /* стартовый каталог — корень */
+    t->uid = 0; t->gid = 0;           /* root; spawn перепишет кредами родителя */
     for (int k = 0; k < TASK_MAX_ALLOCS; k++) t->allocs[k] = 0;
     /* По умолчанию задача живёт в kernel-пространстве. usermode-задача
      * перезапишет это своим user-pml4 (см. userspace_elf_loader_task). */

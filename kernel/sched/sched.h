@@ -42,6 +42,10 @@ typedef struct task {
                                    * syscall (диспетчер вызовет task_exit) */
     char            cmdline[TASK_CMDLINE_MAX]; /* argv процесса (SYS_GETARGS) */
     char            cwd[TASK_CWD_MAX];         /* текущий каталог (SYS_GETCWD) */
+
+    /* --- права (VortexFS / VFS) --- */
+    uint32_t        uid;        /* пользователь; 0 = root. Наследуется при spawn */
+    uint32_t        gid;        /* группа; SYS_SETUID меняет (только root) */
 } task_t;
 
 void    sched_init(void);

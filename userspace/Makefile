@@ -11,7 +11,7 @@ LIBC_OBJS   := libc/crt0.o libc/string.o libc/malloc.o libc/stdio.o libc/stdlib.
 LIBC_HDRS   := $(wildcard libc/include/*.h) syscalls.h vos_abi.h
 
 # --- утилиты /bin (libc-приложения: crt0 разбирает argv из SYS_GETARGS) ------
-UTILS := ls cat rm find mkdir touch cp mv echo pwd stat head wc vctl
+UTILS := ls cat rm find mkdir touch cp mv echo pwd stat head wc vctl chmod chown whoami
 UTIL_BINS := $(addprefix bin/,$(UTILS))
 
 all: hello vortexgraph test_window vsh vwm vterm vdemo vfiles vuidemo vpanel vinit $(UTIL_BINS)

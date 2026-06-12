@@ -271,6 +271,9 @@ disk-with-apps: disk userspace
 	python3 tools/add_file.py build/disk.img userspace/bin/stat bin/stat
 	python3 tools/add_file.py build/disk.img userspace/bin/head bin/head
 	python3 tools/add_file.py build/disk.img userspace/bin/wc bin/wc
+	python3 tools/add_file.py build/disk.img userspace/bin/chmod bin/chmod
+	python3 tools/add_file.py build/disk.img userspace/bin/chown bin/chown
+	python3 tools/add_file.py build/disk.img userspace/bin/whoami bin/whoami
 	@echo "=== Creating FS hierarchy (/etc, /home, /tmp) ==="
 	python3 tools/add_file.py build/disk.img "Welcome to VortexOS!" etc/motd
 	python3 tools/add_file.py build/disk.img --mkdir home
@@ -311,6 +314,9 @@ vortexfs-with-apps: vortexfs-disk userspace
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/stat bin/stat
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/head bin/head
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/wc bin/wc
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/chmod bin/chmod
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/chown bin/chown
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/whoami bin/whoami
 	@echo "=== Creating FS hierarchy (/etc, /home, /tmp) ==="
 	python3 tools/add_vortexfs_file.py build/vortexfs.img "Welcome to VortexOS!" etc/motd
 	python3 tools/add_vortexfs_file.py build/vortexfs.img --mkdir home

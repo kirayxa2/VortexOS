@@ -99,8 +99,8 @@ def main():
     )
     # direct[0] = 1 (data block 1), direct[1..9] = 0
     direct = struct.pack('<' + 'I' * 10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-    # indirect = 0, _pad[2] = 0
-    tail = struct.pack('<III', 0, 0, 0)
+    # indirect = 0, dbl = 0, mode = 0755 (root:root), uid = gid = 0
+    tail = struct.pack('<II', 0, 0) + struct.pack('<HBB', 0o755, 0, 0)
     inode_data = root_inode + direct + tail
     assert len(inode_data) == INODE_SIZE
 

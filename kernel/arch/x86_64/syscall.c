@@ -298,6 +298,8 @@ static uint64_t sys_spawn(uint64_t user_path) {
     if (!t) { kfree(path); return (uint64_t)-1; }      /* был leak при отказе */
     t->userdata = path;
     task_track_alloc(t, path);   /* kfree при выходе задачи — путь больше не течёт */
+    task_t *self = sched_current();
+    if (self) { t->uid = self->uid; t->gid = self->gid; }  /* наследуем креды */
     return t->pid;
 }
 
@@ -447,6 +449,9 @@ static uint64_t sys_fs_unlink(uint64_t user_path) {
 typedef struct {
     uint32_t type;   /* 0 = файл, 1 = каталог */
     uint32_t size;   /* байты (для каталогов 0) */
+    uint32_t mode;   /* права rwxrwxrwx (07777) */
+    uint32_t uid;    /* владелец */
+    uint32_t gid;    /* группа   */
 } sys_stat_t;
 
 static uint64_t sys_fs_stat(uint64_t user_path, uint64_t user_out) {
@@ -458,7 +463,43 @@ static uint64_t sys_fs_stat(uint64_t user_path, uint64_t user_out) {
     sys_stat_t *out = (sys_stat_t *)user_out;
     out->type = (node->type == VFS_DIR) ? 1 : 0;
     out->size = (node->type == VFS_DIR) ? 0 : node->size;
+    out->mode = node->mode ? (node->mode & 07777)
+                           : ((node->type == VFS_DIR) ? 0755 : 0644);
+    out->uid  = node->uid;
+    out->gid  = node->gid;
     fs_node_put(node);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Права: SYS_FS_CHMOD / SYS_FS_CHOWN / SYS_GETUID / SYS_SETUID.
+ * Политика — в vfs_chmod/vfs_chown (владелец/root). setuid — только root,
+ * сбросить обратно нельзя (как настоящий drop privileges).
+ * ------------------------------------------------------------------------- */
+static uint64_t sys_fs_chmod(uint64_t user_path, uint64_t mode) {
+    char path[VFS_MAX_PATH];
+    if (fs_copy_path(user_path, path)) return (uint64_t)-1;
+    return (vfs_chmod(path, (uint32_t)mode) == 0) ? 0 : (uint64_t)-1;
+}
+
+static uint64_t sys_fs_chown(uint64_t user_path, uint64_t uid, uint64_t gid) {
+    char path[VFS_MAX_PATH];
+    if (fs_copy_path(user_path, path)) return (uint64_t)-1;
+    return (vfs_chown(path, (uint32_t)uid, (uint32_t)gid) == 0)
+             ? 0 : (uint64_t)-1;
+}
+
+static uint64_t sys_getuid(void) {
+    task_t *self = sched_current();
+    if (!self) return 0;
+    return ((uint64_t)self->gid << 32) | self->uid;   /* gid в верхних 32 битах */
+}
+
+static uint64_t sys_setuid(uint64_t uid, uint64_t gid) {
+    task_t *self = sched_current();
+    if (!self || self->uid != 0) return (uint64_t)-1;  /* только root */
+    self->uid = (uint32_t)uid;
+    self->gid = (uint32_t)gid;
     return 0;
 }
 
@@ -533,6 +574,8 @@ static uint64_t sys_spawn_ex(uint64_t user_cmdline, uint64_t flags) {
         }
         t->cwd[TASK_CWD_MAX - 1] = 0;
         if (flags & 1) t->stdout_pid = self->pid;
+        t->uid = self->uid;          /* креды наследуются (как cwd) */
+        t->gid = self->gid;
     }
     return t->pid;
 }
@@ -555,7 +598,7 @@ static uint64_t sys_chdir(uint64_t user_path) {
     vfs_node_t *node = vfs_open(path, 0);
     if (!node) return (uint64_t)-1;
     uint64_t ret = (uint64_t)-1;
-    if (node->type == VFS_DIR) {
+    if (node->type == VFS_DIR && vfs_access(node, VFS_PERM_X) == 0) {
         int i = 0;
         while (path[i] && i < TASK_CWD_MAX - 1) { self->cwd[i] = path[i]; i++; }
         self->cwd[i] = 0;
@@ -743,6 +786,12 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, 
         case 40: return virtio_gpu_active() ? 1 : 0;
 
         case 41: return sys_kill(a1);                  // SYS_KILL(pid) — см. выше
+
+        /* --- права --- */
+        case 42: return sys_fs_chmod(a1, a2);          // SYS_FS_CHMOD(path, mode)
+        case 43: return sys_fs_chown(a1, a2, a3);      // SYS_FS_CHOWN(path, uid, gid)
+        case 44: return sys_getuid();                  // SYS_GETUID() -> (gid<<32)|uid
+        case 45: return sys_setuid(a1, a2);            // SYS_SETUID(uid, gid) root only
         default: return (uint64_t)-1;
     }
 }

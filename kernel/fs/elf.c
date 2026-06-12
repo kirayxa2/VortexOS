@@ -34,6 +34,14 @@ static void serial_write(const char *s) {
  *   "/bin/vterm" → /bin/vterm, потом /vterm   (новый диск ↔ старый диск)
  * Пути с подкаталогами ("/etc/motd") идут как есть, без фоллбеков.
  * ----------------------------------------------------------------------------- */
+/* vfs_open + проверка «это файл и есть право X» (права VortexFS). */
+static vfs_node_t *open_if_exec(const char *p) {
+    vfs_node_t *n = vfs_open(p, 0);
+    if (!n) return 0;
+    if (n->type != VFS_FILE || vfs_access(n, VFS_PERM_X) != 0) return 0;
+    return n;
+}
+
 vfs_node_t *elf_open_exec(const char *path) {
     if (!path || !path[0]) return 0;
 
@@ -58,7 +66,7 @@ vfs_node_t *elf_open_exec(const char *path) {
                 if (!deeper) name = path + 5;
             }
         }
-        vfs_node_t *node = vfs_open(path, 0);      /* абсолютный путь — как есть */
+        vfs_node_t *node = open_if_exec(path);    /* абсолютный путь — как есть */
         if (node) return node;
     }
 
@@ -69,7 +77,7 @@ vfs_node_t *elf_open_exec(const char *path) {
     alt[n++] = '/'; alt[n++] = 'b'; alt[n++] = 'i'; alt[n++] = 'n'; alt[n++] = '/';
     for (int i = 0; name[i] && n < VFS_MAX_PATH - 1; i++) alt[n++] = name[i];
     alt[n] = 0;
-    vfs_node_t *node = vfs_open(alt, 0);
+    vfs_node_t *node = open_if_exec(alt);
     if (node) return node;
 
     /* /<name> — fallback для старых образов диска */
@@ -77,7 +85,7 @@ vfs_node_t *elf_open_exec(const char *path) {
     alt[n++] = '/';
     for (int i = 0; name[i] && n < VFS_MAX_PATH - 1; i++) alt[n++] = name[i];
     alt[n] = 0;
-    return vfs_open(alt, 0);
+    return open_if_exec(alt);
 }
 
 elf_load_result_t elf_load(const char *path) {

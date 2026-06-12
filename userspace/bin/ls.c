@@ -29,10 +29,25 @@ static int list_dir(const char *abs, int lflag, int aflag) {
     }
     if (lflag) {
         for (int i = 0; i < n; i++) {
-            if (ents[i].type == VOS_DT_DIR)
-                printf("d %10s  %s/\n", "-", ents[i].name);
-            else
-                printf("- %10u  %s\n", ents[i].size, ents[i].name);
+            /* права/владелец — через stat (в dirent их нет) */
+            char full[VU_PATH_MAX], m[11];
+            vu_join(abs, ents[i].name, full, sizeof(full));
+            vos_stat_t st;
+            if (vos_fs_stat(full, &st) == 0) {
+                vu_modestr(st.type == VOS_DT_DIR, st.mode, m);
+                if (st.type == VOS_DT_DIR)
+                    printf("%s %3u %3u %10s  %s/\n", m, st.uid, st.gid,
+                           "-", ents[i].name);
+                else
+                    printf("%s %3u %3u %10u  %s\n", m, st.uid, st.gid,
+                           st.size, ents[i].name);
+            } else if (ents[i].type == VOS_DT_DIR) {
+                printf("d????????? %3s %3s %10s  %s/\n", "?", "?", "-",
+                       ents[i].name);
+            } else {
+                printf("-????????? %3s %3s %10u  %s\n", "?", "?",
+                       ents[i].size, ents[i].name);
+            }
         }
     } else {
         int col = 0;
