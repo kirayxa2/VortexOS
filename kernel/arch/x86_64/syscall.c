@@ -308,6 +308,20 @@ static uint64_t sys_spawn(uint64_t user_path) {
  *
  * Структура должна побайтово совпадать с vos_dirent_t в userspace/vos_abi.h.
  * ------------------------------------------------------------------------- */
+extern vfs_node_t *vfs_root;
+
+/* Освободить ноду, полученную из vfs_open/vfs_finddir.
+ * VortexFS кэширует ноды (node_cache) и переиспользует их — kfree таких нод
+ * превращал кэш в use-after-free. Освобождаем только некэшированные
+ * (FAT32/ramfs делают чистый kmalloc на каждый finddir). */
+static void fs_node_put(vfs_node_t *n) {
+    extern void kfree(void *);
+    if (!n || n == vfs_root) return;
+    if (n->flags & VFS_FL_CACHED) return;
+    if (n->fs_data) kfree(n->fs_data);
+    kfree(n);
+}
+
 typedef struct {
     char     name[32];
     uint32_t type;    /* 0 = файл, 1 = каталог */
@@ -328,7 +342,7 @@ static uint64_t sys_fs_readdir(uint64_t user_path, uint64_t index, uint64_t user
 
     vfs_node_t *dir = vfs_open(path, 0);
     if (!dir || dir->type != VFS_DIR) {
-        if (dir && dir != vfs_root) { if (dir->fs_data) kfree(dir->fs_data); kfree(dir); }
+        fs_node_put(dir);
         return (uint64_t)-1;
     }
 
@@ -348,16 +362,12 @@ static uint64_t sys_fs_readdir(uint64_t user_path, uint64_t index, uint64_t user
             out->size = (child->type == VFS_DIR) ? 0 : (uint32_t)child->size;
             /* FAT32-ноды — чистый kmalloc (см. fat_make_vnode), освобождаем
              * сразу: иначе каждая запись листинга текла бы по ~100 байт.
-             * ramfs здесь не бывает: он монтируется только если FAT32 не
-             * поднялся — тогда и /bin/vfiles читать некому. */
-            if (child != vfs_root) {
-                if (child->fs_data) kfree(child->fs_data);
-                kfree(child);
-            }
+             * VortexFS-ноды кэшированы — fs_node_put их не трогает. */
+            fs_node_put(child);
         }
         ret = 0;
     }
-    if (dir != vfs_root) { if (dir->fs_data) kfree(dir->fs_data); kfree(dir); }
+    fs_node_put(dir);
     return ret;
 }
 
@@ -368,14 +378,7 @@ static uint64_t sys_fs_readdir(uint64_t user_path, uint64_t index, uint64_t user
  * своему cwd (SYS_GETCWD). Все ноды vfs_open — kmalloc, освобождаем как
  * в sys_fs_readdir.
  * ------------------------------------------------------------------------- */
-extern vfs_node_t *vfs_root;
-
-static void fs_node_put(vfs_node_t *n) {
-    extern void kfree(void *);
-    if (!n || n == vfs_root) return;
-    if (n->fs_data) kfree(n->fs_data);
-    kfree(n);
-}
+/* fs_node_put и extern vfs_root — выше, перед sys_fs_readdir. */
 
 /* Копия пути из userspace; 0 = ок (абсолютный, непустой). */
 static int fs_copy_path(uint64_t user_path, char *dst) {

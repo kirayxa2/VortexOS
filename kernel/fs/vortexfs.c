@@ -278,6 +278,7 @@ static vfs_node_t *node_make(uint32_t ino) {
     n->size    = di.size;
     n->ops     = &vtxfs_ops;
     n->fs_data = 0;
+    n->flags   = VFS_FL_CACHED;   /* нода в node_cache — kfree запрещён */
 
     if (node_cache_n < NODE_CACHE_MAX)
         node_cache[node_cache_n++] = n;

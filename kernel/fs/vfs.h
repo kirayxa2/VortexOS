@@ -14,6 +14,10 @@
 #define VFS_MAX_FDS   64
 #define VFS_MAX_MOUNTS 16
 
+/* Флаги vfs_node_t.flags */
+#define VFS_FL_CACHED 0x1   /* нода живёт в кэше своей ФС — НЕ kfree'ить
+                             * (vortexfs кэширует ноды; см. fs_node_put) */
+
 struct vfs_node;
 
 /* Таблица операций — каждая ФС заполняет свою */
