@@ -219,31 +219,38 @@ static void stream_putc(char c) {
     }
 }
 
+/* ---- цепочки `a && b && c`: сегменты выполняются последовательно,
+ * ненулевой exit-код обрывает остаток (как в настоящем sh) ---- */
+static char chain_pending[INPUT_MAX + 1];
+static void chain_continue(void);
+
 static void child_exited(uint64_t code) {
     if (outlen) { outbuf[outlen] = 0; sb_push_raw(outbuf); outlen = 0; }
     if (code) print_kv("exit code: ", code);
     child_pid = 0;
+    if (code) chain_pending[0] = 0;   /* a && b: ошибка — обрыв */
+    else chain_continue();
 }
 
-static void run_command(const char *line) {
+static int run_one(const char *line) {
     while (*line == ' ') line++;
-    if (line[0] == 0) return;
+    if (line[0] == 0) return 0;
 
-    if (s_eq(line, "help")) { cmd_help(); return; }
-    if (s_eq(line, "clear") || s_eq(line, "cls")) { sb_count = 0; sb_start = 0; return; }
+    if (s_eq(line, "help")) { cmd_help(); return 0; }
+    if (s_eq(line, "clear") || s_eq(line, "cls")) { sb_count = 0; sb_start = 0; return 0; }
     if (s_eq(line, "ver") || s_eq(line, "version")) {
         term_print("VortexOS - vterm 0.1 (userspace WM)");
-        return;
+        return 0;
     }
     if (s_eq(line, "about")) {
         term_print("vterm: terminal for the userspace window manager.");
         term_print("Draws itself into a shm surface, events via IPC.");
         term_print("The kernel never touches the pixels.");
-        return;
+        return 0;
     }
-    if (s_eq(line, "pid")) { print_kv("pid: ", syscall0(SYS_GETPID)); return; }
-    if (s_eq(line, "wm"))  { print_kv("wm pid: ", wm_pid); return; }
-    if (s_eq(line, "uptime")) { print_kv("uptime ticks: ", vos_uptime()); return; }
+    if (s_eq(line, "pid")) { print_kv("pid: ", syscall0(SYS_GETPID)); return 0; }
+    if (s_eq(line, "wm"))  { print_kv("wm pid: ", wm_pid); return 0; }
+    if (s_eq(line, "uptime")) { print_kv("uptime ticks: ", vos_uptime()); return 0; }
     if (s_eq(line, "fb")) {
         struct { uint64_t phys; uint32_t w, h, pitch, bpp; } info;
         syscall1(SYS_FB_INFO, (uint64_t)&info);
@@ -256,7 +263,7 @@ static void run_command(const char *line) {
         p = hbuf; while (*p) out[n++] = *p++;
         out[n] = 0;
         term_print(out);
-        return;
+        return 0;
     }
     if (s_eq(line, "cols")) {
         char cb[24], rb[24]; u_to_dec((uint64_t)cols, cb); u_to_dec((uint64_t)rows, rb);
@@ -266,29 +273,47 @@ static void run_command(const char *line) {
         p = rb; while (*p) out[n++] = *p++;
         out[n] = 0;
         term_print(out);
-        return;
+        return 0;
     }
     if (s_starts(line, "run ")) {
         const char *path = line + 4;
         while (*path == ' ') path++;
-        if (!*path) { term_print("run: usage: run <name|/path>"); return; }
+        if (!*path) { term_print("run: usage: run <name|/path>"); return 1; }
         /* без слэша ядро само ищет в /bin (elf_open_exec) — как $PATH */
         uint64_t pid = vos_spawn(path);
         if (pid == (uint64_t)-1) term_print("run: spawn failed");
         else print_kv("spawned pid: ", pid);
-        return;
+        return 0;
     }
-    if (s_eq(line, "pwd")) { term_print(cwd); return; }
+    if (s_eq(line, "pwd")) { term_print(cwd); return 0; }
     if (s_eq(line, "cd") || s_starts(line, "cd ")) {
         const char *arg = (line[2] == ' ') ? line + 3 : "";
         while (*arg == ' ') arg++;
         if (!*arg) arg = "/";
         char abs[256];
         vos_abspath(cwd, arg, abs, sizeof(abs));
-        if (vos_chdir(abs) != 0) { term_print("cd: no such directory"); return; }
+        if (vos_chdir(abs) != 0) { term_print("cd: no such directory"); return 1; }
         vos_getcwd(cwd, sizeof(cwd));
         prompt_rebuild();
-        return;
+        return 0;
+    }
+
+    /* ---- setuid <uid> [gid]: сбросить привилегии (назад нельзя) ---- */
+    if (s_starts(line, "setuid ")) {
+        const char *a = line + 7;
+        while (*a == ' ') a++;
+        uint32_t suid = 0, sgid = 0;
+        int ok = (*a >= '0' && *a <= '9');
+        while (*a >= '0' && *a <= '9') suid = suid * 10 + (uint32_t)(*a++ - '0');
+        while (*a == ' ') a++;
+        if (*a) {
+            ok = ok && (*a >= '0' && *a <= '9');
+            while (*a >= '0' && *a <= '9') sgid = sgid * 10 + (uint32_t)(*a++ - '0');
+        } else sgid = suid;
+        if (!ok) { term_print("usage: setuid <uid> [gid]"); return 1; }
+        if (vos_setuid(suid, sgid) != 0) { term_print("setuid: not root"); return 1; }
+        term_print("ok, privileges dropped");
+        return 0;
     }
 
     /* Всё остальное — внешняя команда: бинарь ищется в /bin (позже добавим
@@ -304,12 +329,51 @@ static void run_command(const char *line) {
         p = ": command not found"; while (*p && n < cols) out[n++] = *p++;
         out[n] = 0;
         term_print(out);
-        return;
+        return 1;
     }
     child_pid = (uint64_t)pid;
     outlen = 0;
+    return 2;
 }
 
+/* Продолжить цепочку && (вызывается после успешного завершения сегмента) */
+static void run_command(const char *line);
+static void chain_continue(void) {
+    char next[INPUT_MAX + 1];
+    int i = 0;
+    if (!chain_pending[0]) return;
+    while (chain_pending[i]) { next[i] = chain_pending[i]; i++; }
+    next[i] = 0;
+    chain_pending[0] = 0;
+    run_command(next);
+}
+
+/* Точка входа: отрезает первый сегмент до &&, остаток — в chain_pending.
+ * Сегмент исполняет run_one: 0 = ок, 1 = ошибка (обрыв цепочки),
+ * 2 = внешняя команда запущена (продолжение в child_exited). */
+static void run_command(const char *line) {
+    char seg[INPUT_MAX + 1];
+    int n = 0, rest = -1;
+    while (*line == ' ') line++;
+    for (int i = 0; line[i] && n < INPUT_MAX; i++) {
+        if (line[i] == '&' && line[i + 1] == '&') { rest = i + 2; break; }
+        seg[n++] = line[i];
+    }
+    seg[n] = 0;
+    while (n && seg[n - 1] == ' ') seg[--n] = 0;
+    if (rest >= 0) {
+        int j = 0;
+        while (line[rest] == ' ') rest++;
+        while (line[rest + j] && j < INPUT_MAX) {
+            chain_pending[j] = line[rest + j]; j++;
+        }
+        chain_pending[j] = 0;
+    }
+    int st = n ? run_one(seg) : 0;
+    if (st == 2) return;                              /* ждём ребёнка */
+    if (st != 0) { chain_pending[0] = 0; return; }    /* обрыв цепочки */
+    chain_continue();
+}
 static void echo_input_line(void) {
     char out[MAXCOLS + 1]; int n = 0;
     const char *p = prompt; while (*p && n < cols) out[n++] = *p++;
