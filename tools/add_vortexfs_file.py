@@ -52,17 +52,18 @@ class VortexFSImage:
         (self.magic, self.version, self.total_blocks, self.total_inodes,
          self.free_blocks, self.free_inodes,
          self.ibm_start, self.bbm_start, self.itb_start, self.dat_start,
-         self.root_inode) = struct.unpack_from('<IIIIIIIIIII', raw, 0)
-        if self.magic != VTXFS_MAGIC or self.version != VTXFS_VERSION:
+         self.root_inode, self.jrn_start, self.jrn_sectors) = \
+            struct.unpack_from('<IIIIIIIIIIIII', raw, 0)
+        if self.magic != VTXFS_MAGIC or self.version not in (1, 2):
             raise ValueError(f"Not a valid VortexFS image (magic=0x{self.magic:08X})")
 
     # --- Superblock I/O ---------------------------------------------------
     def _write_superblock(self):
-        sb = struct.pack('<IIIIIIIIIII',
+        sb = struct.pack('<IIIIIIIIIIIII',
             self.magic, self.version, self.total_blocks, self.total_inodes,
             self.free_blocks, self.free_inodes,
             self.ibm_start, self.bbm_start, self.itb_start, self.dat_start,
-            self.root_inode)
+            self.root_inode, self.jrn_start, self.jrn_sectors)
         sb = sb.ljust(SECTOR, b'\x00')
         self.f.seek(0)
         self.f.write(sb)

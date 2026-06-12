@@ -18,7 +18,7 @@
 #include "vfs.h"
 
 #define VTXFS_MAGIC             0x56545846  /* "VTXF" little-endian */
-#define VTXFS_VERSION           1
+#define VTXFS_VERSION           2   /* v2 = + журнал; v1 монтируется без него */
 #define VTXFS_BLOCK_SIZE        512
 
 #define VTXFS_MAX_INODES        4096
@@ -41,8 +41,31 @@ typedef struct __attribute__((packed)) {
     uint32_t inode_table_start;     /* LBA таблицы инодов (отн.)     */
     uint32_t data_start;            /* LBA первого блока данных (отн.) */
     uint32_t root_inode;            /* номер root inode (= 0)        */
-    uint8_t  _reserved[468];        /* до 512 байт                   */
+    /* v2: журнал (в v1 здесь нули → журнал выключен) */
+    uint32_t journal_start;         /* LBA журнала (отн.), 0 = нет   */
+    uint32_t journal_sectors;       /* размер журнала в секторах     */
+    uint8_t  _reserved[460];        /* до 512 байт                   */
 } vtxfs_super_t;
+
+/* === Журнал (metadata WAL, v2) ===========================================
+ * Область из VTXFS_JOURNAL_SECTORS секторов между inode table и данными.
+ * Транзакция: [hdr][payload × count][commit]. Заголовок хранит список LBA;
+ * commit-маркер пишется ПОСЛЕ payload — есть commit → txn полная, можно
+ * реиграть (идемпотентно); нет — отбрасываем. После применения заголовок
+ * обнуляется. Журналируются только метаданные (bitmaps, суперблок, иноды,
+ * каталоги); содержимое файлов пишется напрямую. */
+#define VTXFS_JOURNAL_SECTORS   64
+#define VTXFS_JRN_MAX_CAP       30          /* payload-секторов на txn      */
+#define VTXFS_JRN_HDR_MAGIC     0x4E524A56  /* "VJRN" little-endian         */
+#define VTXFS_JRN_CMT_MAGIC     0x544D4356  /* "VCMT" little-endian         */
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;                     /* VTXFS_JRN_HDR_MAGIC              */
+    uint32_t seq;                       /* номер транзакции                 */
+    uint32_t count;                     /* секторов в payload               */
+    uint32_t checksum;                  /* seq + count + сумма lba[]        */
+    uint32_t lba[VTXFS_JRN_MAX_CAP];    /* целевые сектора (отн. раздела)   */
+} vtxfs_jrn_hdr_t;
 
 /* === On-disk инод (64 байта) ============================================= */
 typedef struct __attribute__((packed)) {

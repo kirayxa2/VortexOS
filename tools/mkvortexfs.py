@@ -22,7 +22,8 @@ import os
 
 SECTOR = 512
 VTXFS_MAGIC   = 0x56545846   # "VTXF"
-VTXFS_VERSION = 1
+VTXFS_VERSION = 2   # v2: + журнал (metadata WAL)
+JOURNAL_SECTORS = 64
 MAX_INODES    = 4096
 INODE_SIZE    = 64
 
@@ -47,7 +48,8 @@ def main():
     ibm_start = 1
     bbm_start = ibm_start + ibm_sec
     itb_start = bbm_start + bbm_sec
-    dat_start = itb_start + itb_sec
+    jrn_start = itb_start + itb_sec          # v2: журнал перед данными
+    dat_start = jrn_start + JOURNAL_SECTORS
     data_blocks = total_sectors - dat_start
 
     print(f"VortexFS layout:")
@@ -55,13 +57,14 @@ def main():
     print(f"  Inode bitmap:      sector {ibm_start} ({ibm_sec} sectors)")
     print(f"  Block bitmap:      sector {bbm_start} ({bbm_sec} sectors)")
     print(f"  Inode table:       sector {itb_start} ({itb_sec} sectors)")
+    print(f"  Journal:           sector {jrn_start} ({JOURNAL_SECTORS} sectors)")
     print(f"  Data blocks:       sector {dat_start}+ ({data_blocks} blocks)")
 
     # --- Create image ---
     img = bytearray(total_sectors * SECTOR)
 
     # --- Superblock (sector 0) ---
-    sb = struct.pack('<IIIIIIIIIII',
+    sb = struct.pack('<IIIIIIIIIIIII',
         VTXFS_MAGIC,
         VTXFS_VERSION,
         data_blocks,        # total_blocks
@@ -73,6 +76,8 @@ def main():
         itb_start,
         dat_start,
         0,                  # root_inode = 0
+        jrn_start,
+        JOURNAL_SECTORS,
     )
     sb = sb.ljust(SECTOR, b'\x00')
     img[0:SECTOR] = sb

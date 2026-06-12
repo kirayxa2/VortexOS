@@ -39,10 +39,33 @@ static uint32_t    node_cache_n;
  *  Доступ к секторам (со смещением раздела)                                 *
  * ========================================================================= */
 
+/* --- состояние журнала (metadata WAL, см. vortexfs.h) --- */
+static uint8_t  g_jrn_on;        /* журнал включён (v2 + journal_start)      */
+static uint32_t g_jrn_depth;     /* вложенность транзакций                   */
+static uint32_t g_jrn_seq;       /* счётчик транзакций                       */
+static uint8_t  g_jrn_bypass;    /* пишем сам журнал — не перехватывать      */
+static uint32_t g_jrn_n;         /* захвачено секторов                       */
+static uint32_t g_jrn_lba[VTXFS_JRN_MAX_CAP];
+static uint8_t  g_jrn_buf[VTXFS_JRN_MAX_CAP][512];   /* 15 KiB BSS */
+
+static int jrn_capture(uint32_t rel, const void *buf);
+
 static int rd_sector(uint32_t rel, void *buf) {
+    /* read-your-writes: внутри txn захваченные сектора ещё не на диске */
+    if (g_jrn_on && g_jrn_depth && !g_jrn_bypass)
+        for (uint32_t i = 0; i < g_jrn_n; i++)
+            if (g_jrn_lba[i] == rel) {
+                const uint8_t *s = g_jrn_buf[i];
+                uint8_t *d = (uint8_t *)buf;
+                for (int k = 0; k < 512; k++) d[k] = s[k];
+                return 0;
+            }
     return ata_read_sector(g_slave, g_start_lba + rel, buf);
 }
 static int wr_sector(uint32_t rel, const void *buf) {
+    /* внутри txn запись откладывается в журнальный буфер до commit */
+    if (g_jrn_on && g_jrn_depth && !g_jrn_bypass)
+        return jrn_capture(rel, buf);
     return ata_write(g_slave, g_start_lba + rel, 1, (const uint16_t *)buf);
 }
 
@@ -52,9 +75,124 @@ static int wr_sector(uint32_t rel, const void *buf) {
 
 static int sb_read(void) {
     if (rd_sector(0, &g_sb) != 0) return -1;
-    return (g_sb.magic == VTXFS_MAGIC && g_sb.version == VTXFS_VERSION) ? 0 : -1;
+    /* v1 (без журнала) и v2 (с журналом) монтируются оба */
+    return (g_sb.magic == VTXFS_MAGIC &&
+            (g_sb.version == 1 || g_sb.version == VTXFS_VERSION)) ? 0 : -1;
 }
 static int sb_write(void) { return wr_sector(0, &g_sb); }
+
+/* ========================================================================= *
+ *  Журнал — write-ahead log для метаданных                                  *
+ * ========================================================================= */
+
+/* Сбросить накопленную транзакцию: журнал (hdr + payload + commit) →
+ * применение in-place → обнуление заголовка. WAL-порядок гарантирует:
+ * упали до commit-маркера — txn отброшена, после — реиграна при mount. */
+static uint8_t jrn_tmp[512];   /* свой буфер: sec_tmp2 может быть buf вызывающего */
+
+static int jrn_flush(void) {
+    if (!g_jrn_n) return 0;
+    uint32_t js = g_sb.journal_start;
+    g_jrn_bypass = 1;
+
+    vtxfs_jrn_hdr_t hdr;
+    uint8_t *p = (uint8_t *)&hdr;
+    for (uint32_t i = 0; i < sizeof(hdr); i++) p[i] = 0;
+    hdr.magic = VTXFS_JRN_HDR_MAGIC;
+    hdr.seq   = ++g_jrn_seq;
+    hdr.count = g_jrn_n;
+    hdr.checksum = hdr.seq + hdr.count;
+    for (uint32_t i = 0; i < g_jrn_n; i++) {
+        hdr.lba[i] = g_jrn_lba[i];
+        hdr.checksum += g_jrn_lba[i];
+    }
+    for (int i = 0; i < 512; i++) jrn_tmp[i] = 0;
+    uint8_t *h = (uint8_t *)&hdr;
+    for (uint32_t i = 0; i < sizeof(hdr); i++) jrn_tmp[i] = h[i];
+
+    int rc = wr_sector(js, jrn_tmp);                          /* 1. header  */
+    for (uint32_t i = 0; i < g_jrn_n && rc == 0; i++)          /* 2. payload */
+        rc = wr_sector(js + 1 + i, g_jrn_buf[i]);
+    if (rc == 0) {                                             /* 3. commit  */
+        for (int i = 0; i < 512; i++) jrn_tmp[i] = 0;
+        ((uint32_t *)jrn_tmp)[0] = VTXFS_JRN_CMT_MAGIC;
+        ((uint32_t *)jrn_tmp)[1] = g_jrn_seq;
+        rc = wr_sector(js + 1 + g_jrn_n, jrn_tmp);
+    }
+    for (uint32_t i = 0; i < g_jrn_n && rc == 0; i++)          /* 4. in-place */
+        rc = wr_sector(g_jrn_lba[i], g_jrn_buf[i]);
+    if (rc == 0) {                                             /* 5. done    */
+        for (int i = 0; i < 512; i++) jrn_tmp[i] = 0;
+        rc = wr_sector(js, jrn_tmp);
+    }
+
+    g_jrn_bypass = 0;
+    g_jrn_n = 0;
+    return rc;
+}
+
+/* Захватить сектор в текущую txn (дедуп по LBA). Переполнение буфера —
+ * chained flush: предыдущая пачка коммитится, txn продолжается новой. */
+static int jrn_capture(uint32_t rel, const void *buf) {
+    uint32_t slot = g_jrn_n;
+    for (uint32_t i = 0; i < g_jrn_n; i++)
+        if (g_jrn_lba[i] == rel) { slot = i; break; }
+    if (slot == g_jrn_n) {
+        if (g_jrn_n == VTXFS_JRN_MAX_CAP) {
+            if (jrn_flush() != 0) return -1;
+            slot = 0;
+        }
+        g_jrn_lba[slot] = rel;
+        g_jrn_n = slot + 1;
+    }
+    const uint8_t *s = (const uint8_t *)buf;
+    for (int k = 0; k < 512; k++) g_jrn_buf[slot][k] = s[k];
+    return 0;
+}
+
+/* Транзакции с вложенностью: реально сбрасывает только внешний commit. */
+static void jrn_begin(void) {
+    if (g_jrn_on) g_jrn_depth++;
+}
+static int jrn_commit(void) {
+    if (!g_jrn_on || !g_jrn_depth) return 0;
+    if (--g_jrn_depth == 0) return jrn_flush();
+    return 0;
+}
+
+/* Replay при mount: валидный header + commit-маркер той же seq → применяем
+ * payload (идемпотентно), затем стираем заголовок. Без commit — отбрасываем. */
+static void jrn_replay(void) {
+    uint32_t js = g_sb.journal_start;
+    vtxfs_jrn_hdr_t hdr;
+    if (rd_sector(js, sec_tmp) != 0) return;
+    uint8_t *h = (uint8_t *)&hdr;
+    for (uint32_t i = 0; i < sizeof(hdr); i++) h[i] = sec_tmp[i];
+    if (hdr.magic != VTXFS_JRN_HDR_MAGIC) return;
+
+    uint32_t sum = hdr.seq + hdr.count;
+    for (uint32_t i = 0; i < hdr.count && i < VTXFS_JRN_MAX_CAP; i++)
+        sum += hdr.lba[i];
+    int valid = (hdr.count > 0 && hdr.count <= VTXFS_JRN_MAX_CAP &&
+                 hdr.checksum == sum);
+
+    if (valid && rd_sector(js + 1 + hdr.count, sec_tmp) == 0 &&
+        ((uint32_t *)sec_tmp)[0] == VTXFS_JRN_CMT_MAGIC &&
+        ((uint32_t *)sec_tmp)[1] == hdr.seq) {
+        fb_puts("[VortexFS] journal: replaying committed txn\n");
+        for (uint32_t i = 0; i < hdr.count; i++) {
+            if (rd_sector(js + 1 + i, sec_tmp) != 0) return;
+            wr_sector(hdr.lba[i], sec_tmp);
+        }
+        /* суперблок могли реиграть — перечитаем кэш */
+        rd_sector(0, &g_sb);
+    } else if (valid) {
+        fb_puts("[VortexFS] journal: dropping uncommitted txn\n");
+    }
+    g_jrn_seq = hdr.seq;
+    for (int i = 0; i < 512; i++) sec_tmp[i] = 0;
+    wr_sector(js, sec_tmp);
+}
 
 /* ========================================================================= *
  *  Bitmap-операции                                                          *
@@ -125,15 +263,19 @@ static int ino_write(uint32_t ino, const vtxfs_inode_t *in) {
 }
 
 static int ino_alloc(void) {
+    jrn_begin();   /* bitmap + суперблок — одной транзакцией */
     int n = bm_alloc(g_sb.inode_bitmap_start, g_sb.total_inodes);
     if (n >= 0) { g_sb.free_inodes--; sb_write(); }
+    jrn_commit();
     return n;
 }
 
 static void ino_free(uint32_t ino) {
+    jrn_begin();
     bm_set(g_sb.inode_bitmap_start, ino, 0);
     g_sb.free_inodes++;
     sb_write();
+    jrn_commit();
 }
 
 /* ========================================================================= *
@@ -141,6 +283,7 @@ static void ino_free(uint32_t ino) {
  * ========================================================================= */
 
 static int blk_alloc(void) {
+    jrn_begin();
     int n = bm_alloc(g_sb.block_bitmap_start, g_sb.total_blocks);
     if (n >= 0) {
         g_sb.free_blocks--;
@@ -149,13 +292,16 @@ static int blk_alloc(void) {
         for (int i = 0; i < 512; i++) sec_tmp2[i] = 0;
         wr_sector(g_sb.data_start + (uint32_t)n, sec_tmp2);
     }
+    jrn_commit();
     return n;
 }
 
 static void blk_free(uint32_t blk) {
+    jrn_begin();
     bm_set(g_sb.block_bitmap_start, blk, 0);
     g_sb.free_blocks++;
     sb_write();
+    jrn_commit();
 }
 
 static int blk_read(uint32_t blk, void *buf) {
@@ -538,7 +684,7 @@ static const char *vtxfs_readdir_cb(vfs_node_t *vn, uint32_t index) {
 }
 
 /* --- mkdir -------------------------------------------------------------- */
-static int vtxfs_mkdir_cb(vfs_node_t *vn, const char *name) {
+static int vtxfs_mkdir_inner(vfs_node_t *vn, const char *name) {
     if (!vn || vn->type != VFS_DIR) return -1;
     if (vtxfs_finddir_cb(vn, name)) return -1; /* уже есть */
 
@@ -564,7 +710,7 @@ static int vtxfs_mkdir_cb(vfs_node_t *vn, const char *name) {
 }
 
 /* --- create (файл) ------------------------------------------------------ */
-static int vtxfs_create_cb(vfs_node_t *vn, const char *name) {
+static int vtxfs_create_inner(vfs_node_t *vn, const char *name) {
     if (!vn || vn->type != VFS_DIR) return -1;
     if (vtxfs_finddir_cb(vn, name)) return -1;
 
@@ -631,7 +777,7 @@ static void free_all_blocks(vtxfs_inode_t *di) {
     }
 }
 
-static int vtxfs_unlink_cb(vfs_node_t *vn, const char *name) {
+static int vtxfs_unlink_inner(vfs_node_t *vn, const char *name) {
     if (!vn || vn->type != VFS_DIR) return -1;
 
     vfs_node_t *child = vtxfs_finddir_cb(vn, name);
@@ -660,7 +806,7 @@ static int vtxfs_unlink_cb(vfs_node_t *vn, const char *name) {
 /* --- chmod / chown -------------------------------------------------------
  * Политика (владелец/root) проверена в vfs_chmod/vfs_chown — здесь только
  * запись инода + обновление кэшированной ноды. */
-static int vtxfs_chmod_cb(vfs_node_t *vn, uint32_t mode) {
+static int vtxfs_chmod_inner(vfs_node_t *vn, uint32_t mode) {
     if (!vn) return -1;
     vtxfs_inode_t di;
     if (ino_read(vn->inode, &di) != 0) return -1;
@@ -670,7 +816,7 @@ static int vtxfs_chmod_cb(vfs_node_t *vn, uint32_t mode) {
     return 0;
 }
 
-static int vtxfs_chown_cb(vfs_node_t *vn, uint32_t uid, uint32_t gid) {
+static int vtxfs_chown_inner(vfs_node_t *vn, uint32_t uid, uint32_t gid) {
     if (!vn || uid > 255 || gid > 255) return -1;  /* в иноде по байту */
     vtxfs_inode_t di;
     if (ino_read(vn->inode, &di) != 0) return -1;
@@ -681,6 +827,25 @@ static int vtxfs_chown_cb(vfs_node_t *vn, uint32_t uid, uint32_t gid) {
     vn->gid = gid;
     return 0;
 }
+
+
+/* ========================================================================= *
+ *  Транзакционные обёртки: вся структурная операция — одна journal-txn      *
+ * ========================================================================= */
+#define VTXFS_TXN_CB(rtype, op, sig, callargs)            \
+    static rtype vtxfs_##op##_cb sig {                    \
+        jrn_begin();                                      \
+        rtype r = vtxfs_##op##_inner callargs;            \
+        if (jrn_commit() != 0) r = -1;                    \
+        return r;                                         \
+    }
+
+VTXFS_TXN_CB(int, mkdir,  (vfs_node_t *vn, const char *name), (vn, name))
+VTXFS_TXN_CB(int, create, (vfs_node_t *vn, const char *name), (vn, name))
+VTXFS_TXN_CB(int, unlink, (vfs_node_t *vn, const char *name), (vn, name))
+VTXFS_TXN_CB(int, chmod,  (vfs_node_t *vn, uint32_t mode),    (vn, mode))
+VTXFS_TXN_CB(int, chown,  (vfs_node_t *vn, uint32_t uid, uint32_t gid),
+                          (vn, uid, gid))
 
 /* ========================================================================= *
  *  mkfs — форматирование раздела                                           *
@@ -701,7 +866,8 @@ int vortexfs_mkfs(uint8_t ata_slave, uint32_t start_lba,
     uint32_t ibm_start = 1;
     uint32_t bbm_start = ibm_start + ibm_sec;
     uint32_t itb_start = bbm_start + bbm_sec;
-    uint32_t dat_start = itb_start + itb_sec;
+    uint32_t jrn_start = itb_start + itb_sec;   /* v2: журнал перед данными */
+    uint32_t dat_start = jrn_start + VTXFS_JOURNAL_SECTORS;
 
     if (dat_start >= total_sectors) return -1;
 
@@ -722,6 +888,10 @@ int vortexfs_mkfs(uint8_t ata_slave, uint32_t start_lba,
     g_sb.inode_table_start  = itb_start;
     g_sb.data_start         = dat_start;
     g_sb.root_inode         = 0;
+    g_sb.journal_start      = jrn_start;
+    g_sb.journal_sectors    = VTXFS_JOURNAL_SECTORS;
+
+    g_jrn_on = 0;   /* во время mkfs журнал выключен — пишем напрямую */
 
     if (sb_write() != 0) return -1;
 
@@ -777,6 +947,17 @@ int vortexfs_init(uint8_t ata_slave, uint32_t start_lba) {
     if (sb_read() != 0) {
         fb_puts("[VortexFS] No valid superblock\n");
         return -1;
+    }
+
+    /* Журнал: только v2 с валидной областью. Сначала replay (вдруг упали
+     * посреди транзакции в прошлой сессии), потом включаем перехват. */
+    g_jrn_on = 0; g_jrn_depth = 0; g_jrn_n = 0;
+    g_jrn_bypass = 0; g_jrn_seq = 0;
+    if (g_sb.version >= 2 && g_sb.journal_start &&
+        g_sb.journal_sectors >= VTXFS_JRN_MAX_CAP + 2) {
+        jrn_replay();
+        g_jrn_on = 1;
+        fb_puts("[VortexFS] journal enabled\n");
     }
 
     /* Заполняем таблицу VFS операций */
