@@ -14,7 +14,7 @@ LIBC_HDRS   := $(wildcard libc/include/*.h) syscalls.h vos_abi.h
 UTILS := ls cat rm find mkdir touch cp mv echo pwd stat head wc vctl chmod chown whoami
 UTIL_BINS := $(addprefix bin/,$(UTILS))
 
-all: hello vortexgraph test_window vsh vwm vterm vdemo vfiles vuidemo vpanel vinit $(UTIL_BINS)
+all: hello vortexgraph test_window vsh vwm vterm vdemo vfiles vuidemo vsettings vpanel vinit $(UTIL_BINS)
 
 libc/%.o: libc/src/%.c $(LIBC_HDRS)
 	$(CC) $(LIBC_CFLAGS) -c $< -o $@
@@ -24,6 +24,9 @@ libvui/vui.o: libvui/vui.c libvui/vui.h font8x16.h $(LIBC_HDRS)
 
 vuidemo: vuidemo.c $(LIBC_OBJS) libvui/vui.o linker.ld
 	$(CC) $(LIBC_CFLAGS) $(LDFLAGS) vuidemo.c $(LIBC_OBJS) libvui/vui.o -o vuidemo
+
+vsettings: vsettings.c $(LIBC_OBJS) libvui/vui.o linker.ld
+	$(CC) $(LIBC_CFLAGS) $(LDFLAGS) vsettings.c $(LIBC_OBJS) libvui/vui.o -o vsettings
 
 vinit: vinit.c $(LIBC_OBJS) linker.ld
 	$(CC) $(LIBC_CFLAGS) $(LDFLAGS) vinit.c $(LIBC_OBJS) -o vinit
@@ -59,7 +62,7 @@ bin/%: bin/%.c bin/vutil.h $(LIBC_OBJS) linker.ld
 	$(CC) $(LIBC_CFLAGS) $(LDFLAGS) $< $(LIBC_OBJS) -o $@
 
 clean:
-	rm -f hello vortexgraph test_window vsh vwm vterm vdemo vfiles vuidemo vpanel vinit
+	rm -f hello vortexgraph test_window vsh vwm vterm vdemo vfiles vuidemo vsettings vpanel vinit
 	rm -f $(UTIL_BINS)
 	rm -f libc/*.o libvui/*.o
 

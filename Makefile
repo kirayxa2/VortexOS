@@ -254,6 +254,7 @@ disk-with-apps: disk userspace
 	python3 tools/add_file.py build/disk.img userspace/vdemo bin/vdemo
 	python3 tools/add_file.py build/disk.img userspace/vfiles bin/vfiles
 	python3 tools/add_file.py build/disk.img userspace/vuidemo bin/vuidemo
+	python3 tools/add_file.py build/disk.img userspace/vsettings bin/vsettings
 	python3 tools/add_file.py build/disk.img userspace/vpanel bin/vpanel
 	python3 tools/add_file.py build/disk.img userspace/vinit bin/vinit
 	@echo "=== Adding /bin utilities (ls, cat, rm, find, ...) ==="
@@ -297,6 +298,7 @@ vortexfs-with-apps: vortexfs-disk userspace
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vdemo bin/vdemo
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vfiles bin/vfiles
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vuidemo bin/vuidemo
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vsettings bin/vsettings
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vpanel bin/vpanel
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vinit bin/vinit
 	@echo "=== Adding /bin utilities (ls, cat, rm, find, ...) ==="

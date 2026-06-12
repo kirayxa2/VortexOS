@@ -66,6 +66,9 @@ typedef long int64_t;
 #define SYS_FS_CHOWN      43   /* (path*, uid, gid) только root -> 0 / -1      */
 #define SYS_GETUID        44   /* () -> (gid<<32)|uid                          */
 #define SYS_SETUID        45   /* (uid, gid) только root; назад нельзя -> 0/-1 */
+#define SYS_DISPLAY_SET_MODE 46 /* (w, h) сменить разрешение; только virtio-gpu
+                                  (make run-gpu). 0 = ok (WM получит VIN_DISPLAY),
+                                  -1 = нельзя (Limine fb / режим не влез)       */
 
 #define VOS_SVC_WM        0    /* service id window manager'а */
 #define VOS_SVC_INIT      1    /* service id init-системы /bin/vinit */
@@ -121,6 +124,7 @@ typedef struct {
 /* --- Ввод ядро -> WM (после SYS_INPUT_GRAB) --- */
 #define VIN_MOUSE         100  /* w1=dx(int64) w2=dy(int64) w3=buttons w4=btn_changed */
 #define VIN_KEY           101  /* w1=ascii w2=pressed */
+#define VIN_DISPLAY       102  /* w1=width w2=height — ядро сменило видеорежим */
 
 /* --- Клиент -> WM --- */
 #define VWM_CREATE        1    /* w1=(width<<32)|height, w2=shm_id, w3..w6=title (31 байт + 0) */
@@ -151,12 +155,15 @@ typedef struct {
                                 * count=0 -> одно msg с w1=0. */
 #define VWM_PANEL_CLICK    44  /* wm->клиент: w1=x, w2=y, w3=buttons */
 #define VWM_PANEL_ACTIVATE 45  /* клиент->wm: w1=win_id (restore+focus+raise) */
+#define VWM_PANEL_REATTACH 46 /* wm->клиент: разрешение сменилось, панель
+                                  должна пересоздать shm под новую ширину и
+                                  заново прислать VWM_PANEL_ATTACH */
 #define VWM_PANEL_H        28  /* высота панели (= PANEL_H в vwm) */
 
 /* Максимум пикселей содержимого окна (как MAX_WINDOW_PIXELS в ядре).
  * Буфер окна всегда выделяется под максимум — resize не требует переалокации,
  * меняется только логический stride (= текущая ширина окна). */
-#define VWM_MAX_PIXELS    (1024 * 768)
+#define VWM_MAX_PIXELS    (1920 * 1080)
 #define VWM_SURFACE_BYTES (VWM_MAX_PIXELS * 4)
 
 /* ------------------------- обёртки syscall'ов ---------------------------- */
@@ -187,6 +194,9 @@ static inline uint64_t vos_uptime(void)               { return syscall0(SYS_UPTI
 static inline void     vos_rtc(uint32_t hms[3])       { syscall1(SYS_RTC, (uint64_t)hms); }
 static inline void     vos_vsync(void)                { syscall0(SYS_VSYNC); }
 static inline uint64_t vos_fb_caps(void)              { return syscall0(SYS_FB_CAPS); }
+static inline int64_t  vos_display_set_mode(uint64_t w, uint64_t h) {
+    return (int64_t)syscall3(SYS_DISPLAY_SET_MODE, w, h, 0);
+}
 static inline void     vos_fb_present(int x, int y, int w, int h) {
     syscall6(SYS_FB_PRESENT, (uint64_t)(int64_t)x, (uint64_t)(int64_t)y,
              (uint64_t)(int64_t)w, (uint64_t)(int64_t)h, 0, 0);

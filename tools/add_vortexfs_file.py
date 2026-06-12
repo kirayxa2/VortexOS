@@ -2,6 +2,9 @@
 """
 add_vortexfs_file.py — добавляет файл (или директорию) в VortexFS образ диска.
 
+Понимает v1/v2 (блок 512, инод 64 байта) и v3 (блок 4096, инод 128 байт,
+triple indirect) — параметры берутся из суперблока образа.
+
 Поддерживает подкаталоги:
     python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vwm bin/vwm
         → создаст /bin (если нет) и положит файл vwm
@@ -10,14 +13,8 @@ add_vortexfs_file.py — добавляет файл (или директори�
     add_vortexfs_file.py <img> <source_file|text> <dest_path>   — записать файл
     add_vortexfs_file.py <img> --mkdir <dir_path>               — создать каталог
 
-On-disk layout (must match kernel/fs/vortexfs.h):
-    Sector 0:           Superblock
-    Sectors 1..1:       Inode bitmap     (4096 inodes max)
-    Sectors 2..9:       Block bitmap     (up to 32768 blocks)
-    Sectors 10..521:    Inode table      (4096 × 64 bytes)
-    Sectors 522+:       Data blocks
-
 Block 0 is reserved as sentinel. Valid blocks start at 1.
+Должно 1:1 совпадать с kernel/fs/vortexfs.{h,c}.
 """
 
 import struct
@@ -26,12 +23,8 @@ import os
 
 SECTOR       = 512
 VTXFS_MAGIC  = 0x56545846   # "VTXF"
-VTXFS_VERSION = 1
-MAX_INODES   = 4096
-INODE_SIZE   = 64
 NAME_MAX     = 59
 DIRENT_SIZE  = 64
-DIRENTS_PER_BLOCK = SECTOR // DIRENT_SIZE  # 8
 MAX_DIRECT   = 10
 
 # VFS types (must match vfs.h)
@@ -40,7 +33,7 @@ VFS_DIR  = 0x02
 
 
 class VortexFSImage:
-    """Read/write access to a VortexFS disk image."""
+    """Read/write access to a VortexFS disk image (v1/v2/v3)."""
 
     def __init__(self, path):
         self.f = open(path, 'r+b')
@@ -52,18 +45,32 @@ class VortexFSImage:
         (self.magic, self.version, self.total_blocks, self.total_inodes,
          self.free_blocks, self.free_inodes,
          self.ibm_start, self.bbm_start, self.itb_start, self.dat_start,
-         self.root_inode, self.jrn_start, self.jrn_sectors) = \
-            struct.unpack_from('<IIIIIIIIIIIII', raw, 0)
-        if self.magic != VTXFS_MAGIC or self.version not in (1, 2):
+         self.root_inode, self.jrn_start, self.jrn_sectors,
+         self.block_size) = struct.unpack_from('<' + 'I' * 14, raw, 0)
+        if self.magic != VTXFS_MAGIC or self.version not in (1, 2, 3):
             raise ValueError(f"Not a valid VortexFS image (magic=0x{self.magic:08X})")
+        if self.version < 3:
+            self.block_size = SECTOR
+            self.inode_size = 64
+        else:
+            if self.block_size != 4096:
+                raise ValueError(f"v3 image with bad block_size={self.block_size}")
+            self.inode_size = 128
+        # runtime params (как g_bs/g_spb/g_ppb/g_dpb в ядре)
+        self.BS  = self.block_size
+        self.SPB = self.BS // SECTOR             # секторов в блоке
+        self.PPB = self.BS // 4                  # указателей в блоке
+        self.DPB = self.BS // DIRENT_SIZE        # dirent'ов в блоке
+        self.IPS = SECTOR // self.inode_size     # инодов в секторе
 
     # --- Superblock I/O ---------------------------------------------------
     def _write_superblock(self):
-        sb = struct.pack('<IIIIIIIIIIIII',
+        sb = struct.pack('<' + 'I' * 14,
             self.magic, self.version, self.total_blocks, self.total_inodes,
             self.free_blocks, self.free_inodes,
             self.ibm_start, self.bbm_start, self.itb_start, self.dat_start,
-            self.root_inode, self.jrn_start, self.jrn_sectors)
+            self.root_inode, self.jrn_start, self.jrn_sectors,
+            self.block_size if self.version >= 3 else 0)
         sb = sb.ljust(SECTOR, b'\x00')
         self.f.seek(0)
         self.f.write(sb)
@@ -79,13 +86,6 @@ class VortexFSImage:
         self.f.write(data)
 
     # --- Bitmap operations ------------------------------------------------
-    def _bm_get(self, bm_start, idx):
-        sec = bm_start + (idx // 8) // SECTOR
-        off = (idx // 8) % SECTOR
-        bit = idx % 8
-        data = self._read_sector(sec)
-        return (data[off] >> bit) & 1
-
     def _bm_set(self, bm_start, idx, val):
         sec = bm_start + (idx // 8) // SECTOR
         off = (idx // 8) % SECTOR
@@ -123,17 +123,17 @@ class VortexFSImage:
 
     # --- Inode I/O --------------------------------------------------------
     def _ino_read(self, ino):
-        sec = self.itb_start + ino // 8
-        off = (ino % 8) * INODE_SIZE
+        sec = self.itb_start + ino // self.IPS
+        off = (ino % self.IPS) * self.inode_size
         data = self._read_sector(sec)
-        return data[off:off + INODE_SIZE]
+        return data[off:off + self.inode_size]
 
     def _ino_write(self, ino, inode_data):
-        assert len(inode_data) == INODE_SIZE
-        sec = self.itb_start + ino // 8
-        off = (ino % 8) * INODE_SIZE
+        assert len(inode_data) == self.inode_size
+        sec = self.itb_start + ino // self.IPS
+        off = (ino % self.IPS) * self.inode_size
         data = self._read_sector(sec)
-        data[off:off + INODE_SIZE] = inode_data
+        data[off:off + self.inode_size] = inode_data
         self._write_sector(sec, data)
 
     def _ino_alloc(self):
@@ -144,130 +144,169 @@ class VortexFSImage:
         return n
 
     # --- Inode parsing helpers --------------------------------------------
-    @staticmethod
-    def _parse_inode(raw):
-        """Parse 64-byte inode into dict."""
-        typ, size, blocks = struct.unpack_from('<III', raw, 0)
-        direct = list(struct.unpack_from('<' + 'I' * MAX_DIRECT, raw, 12))
-        indirect = struct.unpack_from('<I', raw, 12 + MAX_DIRECT * 4)[0]
-        dbl_indirect = struct.unpack_from('<I', raw, 12 + MAX_DIRECT * 4 + 4)[0]
-        mode, uid, gid = struct.unpack_from('<HBB', raw, 12 + MAX_DIRECT * 4 + 8)
+    def _parse_inode(self, raw):
+        if self.version >= 3:
+            typ, blocks = struct.unpack_from('<II', raw, 0)
+            size = struct.unpack_from('<Q', raw, 8)[0]
+            direct = list(struct.unpack_from('<' + 'I' * MAX_DIRECT, raw, 16))
+            indirect, dbl, trpl = struct.unpack_from('<III', raw, 16 + MAX_DIRECT * 4)
+            mode, uid, gid = struct.unpack_from('<HBB', raw, 28 + MAX_DIRECT * 4)
+            nlinks = struct.unpack_from('<I', raw, 32 + MAX_DIRECT * 4)[0]
+        else:
+            typ, size, blocks = struct.unpack_from('<III', raw, 0)
+            direct = list(struct.unpack_from('<' + 'I' * MAX_DIRECT, raw, 12))
+            indirect, dbl = struct.unpack_from('<II', raw, 12 + MAX_DIRECT * 4)
+            mode, uid, gid = struct.unpack_from('<HBB', raw, 20 + MAX_DIRECT * 4)
+            trpl, nlinks = 0, 1
         return {
-            'type': typ,
-            'size': size,
-            'blocks': blocks,
-            'direct': direct,
-            'indirect': indirect,
-            'dbl_indirect': dbl_indirect,
-            'mode': mode,
-            'uid': uid,
-            'gid': gid,
+            'type': typ, 'size': size, 'blocks': blocks, 'direct': direct,
+            'indirect': indirect, 'dbl_indirect': dbl, 'trpl_indirect': trpl,
+            'mode': mode, 'uid': uid, 'gid': gid, 'nlinks': nlinks,
         }
 
-    @staticmethod
-    def _pack_inode(ino_dict):
-        """Pack inode dict back to 64 bytes."""
-        raw = struct.pack('<III', ino_dict['type'], ino_dict['size'], ino_dict['blocks'])
-        raw += struct.pack('<' + 'I' * MAX_DIRECT, *ino_dict['direct'])
-        raw += struct.pack('<I', ino_dict['indirect'])
-        raw += struct.pack('<I', ino_dict.get('dbl_indirect', 0))
-        raw += struct.pack('<HBB', ino_dict.get('mode', 0),
-                           ino_dict.get('uid', 0), ino_dict.get('gid', 0))
-        assert len(raw) == INODE_SIZE
+    def _pack_inode(self, d):
+        if self.version >= 3:
+            raw  = struct.pack('<II', d['type'], d['blocks'])
+            raw += struct.pack('<Q', d['size'])
+            raw += struct.pack('<' + 'I' * MAX_DIRECT, *d['direct'])
+            raw += struct.pack('<III', d['indirect'],
+                               d.get('dbl_indirect', 0), d.get('trpl_indirect', 0))
+            raw += struct.pack('<HBB', d.get('mode', 0), d.get('uid', 0), d.get('gid', 0))
+            raw += struct.pack('<I', d.get('nlinks', 1))
+            raw += b'\x00' * 52
+        else:
+            raw  = struct.pack('<III', d['type'], d['size'], d['blocks'])
+            raw += struct.pack('<' + 'I' * MAX_DIRECT, *d['direct'])
+            raw += struct.pack('<II', d['indirect'], d.get('dbl_indirect', 0))
+            raw += struct.pack('<HBB', d.get('mode', 0), d.get('uid', 0), d.get('gid', 0))
+        assert len(raw) == self.inode_size
         return raw
 
-    # --- Data block I/O ---------------------------------------------------
+    # --- Data block I/O (логический блок = SPB секторов) --------------------
     def _blk_read(self, blk):
-        return self._read_sector(self.dat_start + blk)
+        out = bytearray()
+        for s in range(self.SPB):
+            out += self._read_sector(self.dat_start + blk * self.SPB + s)
+        return out
 
     def _blk_write(self, blk, data):
-        self._write_sector(self.dat_start + blk, data)
+        assert len(data) == self.BS
+        for s in range(self.SPB):
+            self._write_sector(self.dat_start + blk * self.SPB + s,
+                               data[s * SECTOR:(s + 1) * SECTOR])
 
     def _blk_alloc(self):
         n = self._bm_alloc(self.bbm_start, self.total_blocks)
         if n >= 0:
             self.free_blocks -= 1
             self._write_superblock()
-            # Zero out the new block
-            self._blk_write(n, bytearray(SECTOR))
+            self._blk_write(n, bytearray(self.BS))  # zero out
         return n
 
-    # --- Block mapping (direct + indirect) --------------------------------
-    def _inode_get_blk(self, ino_dict, idx):
+    # --- Block mapping (direct + indirect + double + triple[v3]) ------------
+    def _read_ptr(self, blk, slot):
+        buf = self._blk_read(blk)
+        return struct.unpack_from('<I', buf, slot * 4)[0]
+
+    def _inode_get_blk(self, d, idx):
+        P = self.PPB
         if idx < MAX_DIRECT:
-            return ino_dict['direct'][idx]
+            return d['direct'][idx]
         off = idx - MAX_DIRECT
 
-        # Single indirect (128 pointers)
-        if off < 128:
-            if ino_dict['indirect'] == 0:
+        if off < P:                                       # single indirect
+            if d['indirect'] == 0:
                 return 0
-            ibuf = self._blk_read(ino_dict['indirect'])
-            return struct.unpack_from('<I', ibuf, off * 4)[0]
+            return self._read_ptr(d['indirect'], off)
+        off -= P
 
-        # Double indirect (128 × 128 pointers)
-        off -= 128
-        dbl = ino_dict.get('dbl_indirect', 0)
-        if dbl == 0 or off >= 128 * 128:
+        if off < P * P:                                   # double indirect
+            if d.get('dbl_indirect', 0) == 0:
+                return 0
+            ptr = self._read_ptr(d['dbl_indirect'], off // P)
+            if ptr == 0:
+                return 0
+            return self._read_ptr(ptr, off % P)
+        off -= P * P
+
+        if self.version < 3 or d.get('trpl_indirect', 0) == 0:  # triple (v3)
             return 0
-        d1 = self._blk_read(dbl)
-        slot = off // 128
-        ptr = struct.unpack_from('<I', d1, slot * 4)[0]
+        t2 = self._read_ptr(d['trpl_indirect'], off // (P * P))
+        if t2 == 0:
+            return 0
+        rem = off % (P * P)
+        t3 = self._read_ptr(t2, rem // P)
+        if t3 == 0:
+            return 0
+        return self._read_ptr(t3, rem % P)
+
+    def _set_ptr(self, blk, slot, val):
+        buf = self._blk_read(blk)
+        struct.pack_into('<I', buf, slot * 4, val)
+        self._blk_write(blk, buf)
+
+    def _ensure_ptr(self, blk, slot):
+        """Вернуть указатель из таблицы, выделив новый блок при нуле."""
+        ptr = self._read_ptr(blk, slot)
         if ptr == 0:
-            return 0
-        d2 = self._blk_read(ptr)
-        return struct.unpack_from('<I', d2, (off % 128) * 4)[0]
+            nb = self._blk_alloc()
+            if nb < 0:
+                return -1
+            self._set_ptr(blk, slot, nb)
+            ptr = nb
+        return ptr
 
-    def _inode_set_blk(self, ino_dict, idx, blk):
+    def _inode_set_blk(self, d, idx, blk):
+        P = self.PPB
         if idx < MAX_DIRECT:
-            ino_dict['direct'][idx] = blk
+            d['direct'][idx] = blk
             return 0
         off = idx - MAX_DIRECT
 
-        # Single indirect
-        if off < 128:
-            if ino_dict['indirect'] == 0:
+        if off < P:                                       # single indirect
+            if d['indirect'] == 0:
                 ib = self._blk_alloc()
                 if ib < 0:
                     return -1
-                ino_dict['indirect'] = ib
-            ibuf = self._blk_read(ino_dict['indirect'])
-            struct.pack_into('<I', ibuf, off * 4, blk)
-            self._blk_write(ino_dict['indirect'], ibuf)
+                d['indirect'] = ib
+            self._set_ptr(d['indirect'], off, blk)
             return 0
+        off -= P
 
-        # Double indirect
-        off -= 128
-        if off >= 128 * 128:
+        if off < P * P:                                   # double indirect
+            if d.get('dbl_indirect', 0) == 0:
+                db = self._blk_alloc()
+                if db < 0:
+                    return -1
+                d['dbl_indirect'] = db
+            ptr = self._ensure_ptr(d['dbl_indirect'], off // P)
+            if ptr < 0:
+                return -1
+            self._set_ptr(ptr, off % P, blk)
+            return 0
+        off -= P * P
+
+        if self.version < 3 or off >= P * P * P:          # triple (v3)
             return -1
-
-        if ino_dict.get('dbl_indirect', 0) == 0:
-            db = self._blk_alloc()
-            if db < 0:
+        if d.get('trpl_indirect', 0) == 0:
+            tb = self._blk_alloc()
+            if tb < 0:
                 return -1
-            ino_dict['dbl_indirect'] = db
-
-        d1 = self._blk_read(ino_dict['dbl_indirect'])
-        slot = off // 128
-        ptr = struct.unpack_from('<I', d1, slot * 4)[0]
-        if ptr == 0:
-            sb = self._blk_alloc()
-            if sb < 0:
-                return -1
-            struct.pack_into('<I', d1, slot * 4, sb)
-            self._blk_write(ino_dict['dbl_indirect'], d1)
-            ptr = sb
-
-        d2 = self._blk_read(ptr)
-        struct.pack_into('<I', d2, (off % 128) * 4, blk)
-        self._blk_write(ptr, d2)
+            d['trpl_indirect'] = tb
+        t2 = self._ensure_ptr(d['trpl_indirect'], off // (P * P))
+        if t2 < 0:
+            return -1
+        rem = off % (P * P)
+        t3 = self._ensure_ptr(t2, rem // P)
+        if t3 < 0:
+            return -1
+        self._set_ptr(t3, rem % P, blk)
         return 0
 
     # --- Directory operations ---------------------------------------------
     def _dir_find(self, dir_ino, name):
-        """Find entry by name in directory. Returns (inode_num, dirent_type) or None."""
-        raw = self._ino_read(dir_ino)
-        di = self._parse_inode(raw)
+        """Find entry by name in directory. Returns (inode_num, type) or None."""
+        di = self._parse_inode(self._ino_read(dir_ino))
         name_bytes = name.encode('utf-8')[:NAME_MAX]
 
         for bi in range(di['blocks']):
@@ -275,10 +314,9 @@ class VortexFSImage:
             if b == 0:
                 continue
             blk_data = self._blk_read(b)
-            for e in range(DIRENTS_PER_BLOCK):
+            for e in range(self.DPB):
                 off = e * DIRENT_SIZE
                 ent_name = blk_data[off:off + NAME_MAX + 1]
-                # Null-terminated name
                 null_pos = ent_name.find(b'\x00')
                 if null_pos >= 0:
                     ent_name = ent_name[:null_pos]
@@ -286,16 +324,13 @@ class VortexFSImage:
                     continue
                 ent_ino = struct.unpack_from('<I', blk_data, off + NAME_MAX + 1)[0]
                 if ent_name == name_bytes:
-                    # Read the inode to get its type
-                    child_raw = self._ino_read(ent_ino)
-                    child = self._parse_inode(child_raw)
+                    child = self._parse_inode(self._ino_read(ent_ino))
                     return ent_ino, child['type']
         return None
 
     def _dir_add(self, dir_ino, name, child_ino):
         """Add a directory entry (name → child_ino) to directory dir_ino."""
-        raw = self._ino_read(dir_ino)
-        di = self._parse_inode(raw)
+        di = self._parse_inode(self._ino_read(dir_ino))
         name_bytes = name.encode('utf-8')[:NAME_MAX]
 
         # Look for a free slot in existing blocks
@@ -304,10 +339,9 @@ class VortexFSImage:
             if b == 0:
                 continue
             blk_data = self._blk_read(b)
-            for e in range(DIRENTS_PER_BLOCK):
+            for e in range(self.DPB):
                 off = e * DIRENT_SIZE
                 if blk_data[off] == 0:  # empty slot
-                    # Write entry
                     blk_data[off:off + NAME_MAX + 1] = name_bytes.ljust(NAME_MAX + 1, b'\x00')
                     struct.pack_into('<I', blk_data, off + NAME_MAX + 1, child_ino)
                     self._blk_write(b, blk_data)
@@ -323,7 +357,7 @@ class VortexFSImage:
             return -1
         di['blocks'] += 1
 
-        blk_data = bytearray(SECTOR)
+        blk_data = bytearray(self.BS)
         blk_data[0:NAME_MAX + 1] = name_bytes.ljust(NAME_MAX + 1, b'\x00')
         struct.pack_into('<I', blk_data, NAME_MAX + 1, child_ino)
         self._blk_write(nb, blk_data)
@@ -332,9 +366,16 @@ class VortexFSImage:
         self._ino_write(dir_ino, self._pack_inode(di))
         return 0
 
+    def _new_inode(self, typ, size=0, mode=0):
+        return {
+            'type': typ, 'size': size, 'blocks': 0,
+            'direct': [0] * MAX_DIRECT,
+            'indirect': 0, 'dbl_indirect': 0, 'trpl_indirect': 0,
+            'mode': mode, 'uid': 0, 'gid': 0, 'nlinks': 1,
+        }
+
     def mkdir(self, dir_ino, name):
         """Create a subdirectory under dir_ino. Returns new inode number."""
-        # Check if already exists
         found = self._dir_find(dir_ino, name)
         if found:
             ino, typ = found
@@ -346,20 +387,10 @@ class VortexFSImage:
         if ino < 0:
             raise RuntimeError("No free inodes")
 
-        new_inode = {
-            'type': VFS_DIR,
-            'size': 0,
-            'blocks': 0,
-            'direct': [0] * MAX_DIRECT,
-            'indirect': 0,
-            'dbl_indirect': 0,
-            'mode': 0o755,   # root:root rwxr-xr-x
-        }
-        self._ino_write(ino, self._pack_inode(new_inode))
+        self._ino_write(ino, self._pack_inode(self._new_inode(VFS_DIR, mode=0o755)))
 
         if self._dir_add(dir_ino, name, ino) != 0:
             raise RuntimeError("Failed to add directory entry")
-
         return ino
 
     def walk_dirs(self, components):
@@ -376,41 +407,30 @@ class VortexFSImage:
             raise ValueError("empty destination path")
         filename, dirs = parts[-1], parts[:-1]
 
-        # Navigate/create parent directories
         dir_ino = self.walk_dirs(dirs) if dirs else self.root_inode
 
-        # Check for existing file — remove it (simple overwrite)
         found = self._dir_find(dir_ino, filename)
         if found:
             ino, typ = found
             if typ == VFS_DIR:
                 raise RuntimeError(f"'{dest_path}' already exists as a directory")
-            # For simplicity, we don't free old blocks/inode — just overwrite
-            # In a production FS we'd need proper unlink+free
-            # For build tooling this is fine since we format fresh each time
+            # For build tooling we don't free old blocks — образ собирается
+            # с нуля при каждом make, утечка не накапливается.
 
-        # Allocate inode
         ino = self._ino_alloc()
         if ino < 0:
             raise RuntimeError("No free inodes")
 
-        new_inode = {
-            'type': VFS_FILE,
-            'size': len(content),
-            'blocks': 0,
-            'direct': [0] * MAX_DIRECT,
-            'indirect': 0,
-            'dbl_indirect': 0,
-            # /bin/* — исполняемые (0755), остальное — данные (0644)
-            'mode': mode if mode is not None
-                    else (0o755 if dest_path.strip('/').startswith('bin/')
-                          else 0o644),
-        }
+        # /bin/* — исполняемые (0755), остальное — данные (0644)
+        new_inode = self._new_inode(
+            VFS_FILE, size=len(content),
+            mode=mode if mode is not None
+                 else (0o755 if dest_path.strip('/').startswith('bin/') else 0o644))
 
         # Write data blocks
         offset = 0
         while offset < len(content):
-            chunk = content[offset:offset + SECTOR]
+            chunk = content[offset:offset + self.BS]
             blk = self._blk_alloc()
             if blk < 0:
                 raise RuntimeError("No free data blocks")
@@ -418,16 +438,14 @@ class VortexFSImage:
             if self._inode_set_blk(new_inode, bi, blk) != 0:
                 raise RuntimeError("Failed to set block pointer")
             new_inode['blocks'] += 1
-            # Pad chunk to sector size
-            padded = bytearray(SECTOR)
+            padded = bytearray(self.BS)
             padded[:len(chunk)] = chunk
             self._blk_write(blk, padded)
-            offset += SECTOR
+            offset += self.BS
 
         # Handle empty file (0 bytes, 0 blocks)
         self._ino_write(ino, self._pack_inode(new_inode))
 
-        # Add directory entry
         if self._dir_add(dir_ino, filename, ino) != 0:
             raise RuntimeError("Failed to add directory entry")
 

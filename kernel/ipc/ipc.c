@@ -302,6 +302,21 @@ void ipc_input_push_mouse(int dx, int dy, uint8_t buttons, int btn_changed) {
     mailbox_push(mb, msg, 0);
 }
 
+/* Уведомление о смене видеорежима (из sys_display_set_mode, НЕ из IRQ).
+ * Идёт в тот же mailbox ввода: WM обрабатывает его в своём event loop'е. */
+void ipc_input_push_display(uint32_t w, uint32_t h) {
+    if (!input_grabber_mb) return;
+    uint64_t msg[IPC_MSG_WORDS] = {0};
+    msg[0] = IPC_MSG_DISPLAY;
+    msg[1] = w;
+    msg[2] = h;
+    /* мы в syscall-контексте (не IRQ) — от IRQ-пушей защищаемся cli/sti,
+     * ровно как ipc_sys_send */
+    __asm__ volatile("cli");
+    mailbox_push(input_grabber_mb, msg, 0);
+    __asm__ volatile("sti");
+}
+
 /* -------------------------------------------------------------------------
  * Shared memory
  *

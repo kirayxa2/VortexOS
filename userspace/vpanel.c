@@ -27,6 +27,7 @@
 #define MAX_WINS      16
 
 static uint32_t *surf = 0;
+static uint64_t g_shm = (uint64_t)-1;   /* наш shm: пересоздаётся при смене разрешения */
 static int W = 0, H = 0;
 static uint64_t wm_pid = 0;
 
@@ -204,38 +205,49 @@ static void on_click(int mx, int my, int buttons) {
         }
 }
 
-/* --------------------- main --------------------- */
-void _start(void) {
+/* (Пере)создать поверхность под текущую ширину экрана и приаттачиться к vwm.
+ * Вызывается при старте и по VWM_PANEL_REATTACH (смена разрешения):
+ * старый shm освобождаем, новый — fbw x PANEL_H. 0 = ok. */
+static int panel_attach(void) {
     struct { uint64_t phys; uint32_t w, h, pitch, bpp; } info;
     syscall1(SYS_FB_INFO, (uint64_t)&info);
-    if (!info.w) { puts("vpanel: no framebuffer\n"); exit(1); }
+    if (!info.w) return -1;
+
+    if (surf && g_shm != (uint64_t)-1) {
+        vos_shm_release(g_shm);
+        surf = 0; g_shm = (uint64_t)-1;
+    }
     W = (int)info.w;
     H = VWM_PANEL_H;
-
-    uint64_t shm = vos_shm_create((uint64_t)W * H * 4);
-    if (shm == (uint64_t)-1) { puts("vpanel: shm_create failed\n"); exit(1); }
-    surf = (uint32_t *)vos_shm_map(shm);
-    if (!surf) { puts("vpanel: shm_map failed\n"); exit(1); }
-
-    wm_pid = vwm_wait_for_wm();
+    g_shm = vos_shm_create((uint64_t)W * H * 4);
+    if (g_shm == (uint64_t)-1) return -1;
+    surf = (uint32_t *)vos_shm_map(g_shm);
+    if (!surf) { vos_shm_release(g_shm); g_shm = (uint64_t)-1; return -1; }
 
     vos_msg_t m;
     for (int i = 0; i < 8; i++) m.w[i] = 0;
     m.w[0] = VWM_PANEL_ATTACH;
-    m.w[2] = shm;
+    m.w[2] = g_shm;
     vos_ipc_send(wm_pid, &m);
 
     /* ждём подтверждение (vwm замапил поверхность) */
     for (;;) {
         if (!vos_ipc_recv(&m, VOS_IPC_FOREVER)) continue;
         if (m.w[0] == VWM_PANEL_OK) {
-            if (!m.w[1]) { puts("vpanel: wm refused\n"); exit(1); }
+            if (!m.w[1]) return -1;
             W = (int)(m.w[1] >> 32);
             H = (int)(m.w[1] & 0xFFFFFFFFu);
-            break;
+            return 0;
         }
         if (m.w[0] == VWM_PANEL_WINS) on_wins_msg(&m);
     }
+}
+
+/* --------------------- main --------------------- */
+void _start(void) {
+    wm_pid = vwm_wait_for_wm();
+    if (panel_attach() != 0) { puts("vpanel: attach failed\n"); exit(1); }
+    vos_msg_t m;
 
     compose();
     commit_all();
@@ -252,6 +264,11 @@ void _start(void) {
                 break;
             case VWM_PANEL_CLICK:
                 on_click((int)m.w[1], (int)m.w[2], (int)m.w[3]);
+                break;
+            case VWM_PANEL_REATTACH:
+                /* разрешение сменилось: новая ширина -> новый shm + ATTACH */
+                if (panel_attach() != 0) { puts("vpanel: reattach failed\n"); exit(1); }
+                dirty = 1;
                 break;
             default:
                 break;

@@ -35,6 +35,7 @@
 /* Типы сообщений ввода ядро -> input grabber (userspace WM) */
 #define IPC_MSG_INPUT_MOUSE  100   /* w1=dx(int64) w2=dy(int64) w3=buttons w4=btn_changed */
 #define IPC_MSG_INPUT_KEY    101   /* w1=ascii w2=pressed */
+#define IPC_MSG_DISPLAY      102   /* w1=width w2=height (смена видеорежима) */
 
 /* Shared memory: фиксированная схема адресов.
  * Каждому сегменту id выделяется слот 16MB:
@@ -72,6 +73,7 @@ uint64_t ipc_kernel_send(uint32_t dst_pid, const uint64_t *msg8, uint32_t sender
 int  ipc_input_grabbed(void);                       /* 1 = ввод забрал userspace WM */
 void ipc_input_push_key(char ascii, int pressed);
 void ipc_input_push_mouse(int dx, int dy, uint8_t buttons, int btn_changed);
+void ipc_input_push_display(uint32_t w, uint32_t h);
 
 /* Зовётся из PIT IRQ0: будит ipc_sys_recv, у которых истёк timeout. */
 void ipc_tick(void);

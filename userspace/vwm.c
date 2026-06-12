@@ -492,6 +492,8 @@ static void dmg_cursor(void) {
  * копирование строк, т.е. так же дёшево, как старый fill_rect одним цветом.
  * ------------------------------------------------------------------------- */
 static uint32_t *wall;   /* 0 => обои не выделились, fallback DESK_BG */
+static uint64_t  wall_shm = (uint64_t)-1;   /* shm id обоев (пересоздаётся при
+                                               смене разрешения) */
 
 static const uint8_t bayer4[4][4] = {
     {  0,  8,  2, 10 },
@@ -569,6 +571,7 @@ static const dock_item_t dock_items[] = {
     { "/bin/vterm",  "Terminal", 0 },
     { "/bin/vfiles", "Files",    1 },
     { "/bin/vdemo",  "Window",   2 },
+    { "/bin/vsettings", "Settings", 3 },
 };
 #define DOCK_NITEMS ((int)(sizeof(dock_items) / sizeof(dock_items[0])))
 
@@ -649,13 +652,27 @@ static void dock_draw_tile(int kind, int x, int y, int s, int pressed) {
         fill_rect(x + 8,  y + 14, 14, 5,  fold);    /* язычок */
         fill_rect(x + 8,  y + 18, 32, 18, fold);    /* корпус */
         fill_rect(x + 8,  y + 18, 32, 3,  foldhi);  /* блик   */
-    } else {                               /* Window: демо-окно */
+    } else if (kind == 2) {                /* Window: демо-окно */
         fill_round(x, y, s, s, 11, 0xFFEAEAF0, 255);
         fill_rect(x + 8,  y + 10, 32, 28, 0xFFFFFFFF);
         fill_rect(x + 8,  y + 10, 32, 7,  0xFF3D6FB5);
         fill_rect(x + 12, y + 22, 24, 2,  0xFFB8C2D0);
         fill_rect(x + 12, y + 27, 24, 2,  0xFFB8C2D0);
         fill_rect(x + 12, y + 32, 16, 2,  0xFFB8C2D0);
+    } else {                               /* Settings: шестерёнка */
+        fill_round(x, y, s, s, 11, 0xFF2A2A36, 255);
+        for (int i = 3; i < s - 3; i++) dock_put_blend(x + i, y + 2, 0xFFFFFFFF, 16);
+        uint32_t gear = 0xFFB9C0CE;
+        int cx = x + s / 2, cy = y + s / 2;
+        /* зубцы: 4 прямых + 4 диагональных «лопасти» */
+        fill_rect(cx - 2,  cy - 14, 4, 28, gear);
+        fill_rect(cx - 14, cy - 2,  28, 4, gear);
+        for (int t = -1; t <= 1; t++) {
+            draw_line(cx - 9 + t, cy - 9, cx + 9 + t, cy + 9, gear);
+            draw_line(cx - 9 + t, cy + 9, cx + 9 + t, cy - 9, gear);
+        }
+        fill_circle(cx, cy, 8, gear);
+        fill_circle(cx, cy, 4, 0xFF2A2A36);   /* отверстие */
     }
 }
 static void draw_dock(void) {
@@ -1774,6 +1791,73 @@ static void on_panel_attach(vos_msg_t *m) {
     panel_dirty = 1;
 }
 
+/* ---------------------------------------------------------------------------
+ * Ядро сменило видеорежим (SYS_DISPLAY_SET_MODE из «Настроек» -> VIN_DISPLAY).
+ * sys_fb_map отдаёт маппинг на ВЕСЬ backing (под максимальный режим), так что
+ * указатель fb остаётся валидным — меняется только геометрия. VIN_DISPLAY
+ * приходит только на virtio-gpu, а там bb == fb (direct compose).
+ * ------------------------------------------------------------------------- */
+static void on_display_change(uint32_t nw, uint32_t nh) {
+    if (!nw || !nh || (nw == fbw && nh == fbh)) return;
+    if (bb != fb) return;   /* не direct compose — событие не для нас */
+
+    fbw = nw; fbh = nh; fb_stride = nw;   /* virtio: pitch всегда = w*4 */
+
+    /* Обои: площадь сменилась — пересоздаём shm и рендерим заново */
+    if (wall) {
+        vos_shm_release(wall_shm);
+        wall = 0; wall_shm = (uint64_t)-1;
+    }
+    wall_shm = vos_shm_create((uint64_t)fbw * fbh * 4);
+    if (wall_shm != (uint64_t)-1) {
+        wall = (uint32_t *)vos_shm_map(wall_shm);
+        if (wall) wall_render();
+        else { vos_shm_release(wall_shm); wall_shm = (uint64_t)-1; }
+    }
+
+    /* Мышь — в пределах нового экрана */
+    if (mouse_x >= (int)fbw) mouse_x = (int)fbw - 1;
+    if (mouse_y >= (int)fbh) mouse_y = (int)fbh - 1;
+
+    /* Окна: развёрнутые подгоняем под новый стол, обычные клампим внутрь.
+     * Любое изменение РАЗМЕРА идёт через win_apply_geometry — оно чистит
+     * поверхность и шлёт клиенту EV_RESIZE (новый stride!). */
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        vwin_t *win = &windows[i];
+        if (!win->id) continue;
+        if (win->maximized) {
+            int mw = (int)fbw;
+            int mh = (int)fbh - PANEL_H - TITLEBAR_H;
+            if (mw * mh > VWM_MAX_PIXELS) mh = VWM_MAX_PIXELS / mw;
+            win_apply_geometry(win, 0, PANEL_H, mw, mh);
+        } else {
+            int x = win->x, y = win->y, w = win->w, h = win->h;
+            int maxh = (int)fbh - PANEL_H - TITLEBAR_H;
+            if (w > (int)fbw) w = (int)fbw;
+            if (h > maxh)     h = maxh;
+            if (x + w > (int)fbw)               x = (int)fbw - w;
+            if (y + h + TITLEBAR_H > (int)fbh)  y = (int)fbh - h - TITLEBAR_H;
+            if (x < 0)            x = 0;
+            if (y < PANEL_H)      y = PANEL_H;
+            if (x != win->x || y != win->y || w != win->w || h != win->h)
+                win_apply_geometry(win, x, y, w, h);
+        }
+    }
+
+    /* Панель: её поверхность fbw x PANEL_H — stride устарел. Отцепляем и
+     * просим vpanel пересоздать shm и заново прислать ATTACH. */
+    if (panel_pid) {
+        if (panel_surf && panel_shm != (uint64_t)-1)
+            vos_shm_release(panel_shm);
+        panel_surf = 0;
+        panel_shm = (uint64_t)-1;
+        send_event(panel_pid, VWM_PANEL_REATTACH,
+                   (uint64_t)fbw, (uint64_t)fbh, 0);
+    }
+
+    needs_redraw = 1;
+}
+
 static void handle_msg(vos_msg_t *m) {
     switch (m->w[0]) {
     case VIN_MOUSE: {
@@ -1787,6 +1871,9 @@ static void handle_msg(vos_msg_t *m) {
     }
     case VIN_KEY:
         on_key((char)m->w[1], (int)m->w[2]);
+        break;
+    case VIN_DISPLAY:
+        on_display_change((uint32_t)m->w[1], (uint32_t)m->w[2]);
         break;
     case VWM_CREATE:
         on_create(m);
@@ -1875,7 +1962,7 @@ void _start(void) {
 
     /* 2b. Обои: ещё один shm-сегмент, рендерим один раз. Не выделились —
      * не страшно: fill_wall откатится на плоский DESK_BG. */
-    uint64_t wall_shm = vos_shm_create((uint64_t)fbw * fbh * 4);
+    wall_shm = vos_shm_create((uint64_t)fbw * fbh * 4);
     if (wall_shm != (uint64_t)-1) {
         wall = (uint32_t *)vos_shm_map(wall_shm);
         if (wall) wall_render();

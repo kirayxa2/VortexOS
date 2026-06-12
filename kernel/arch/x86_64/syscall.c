@@ -214,7 +214,10 @@ static uint64_t sys_fb_map(void) {
     int contiguous;
     if (virtio_gpu_active()) {
         base_virt  = (uint64_t)virtio_gpu_framebuffer();
-        fb_size    = (uint64_t)virtio_gpu_height() * virtio_gpu_pitch();
+        /* Мапим ВЕСЬ backing (под максимальный режим), а не только текущий
+         * видимый кусок: после смены разрешения mapping остаётся валидным,
+         * userspace просто перечитывает геометрию через SYS_FB_INFO. */
+        fb_size    = virtio_gpu_backing_bytes();
         contiguous = 0;
     } else {
         base_virt  = (uint64_t)fb_addr;
@@ -269,8 +272,30 @@ static uint64_t sys_fb_map(void) {
                 page_phys,
                 VMM_PRESENT | VMM_WRITABLE | VMM_USER);
     }
-    
+
+    /* TLB flush: маппинг менялся в ТЕКУЩЕМ адресном пространстве */
+    {
+        uint64_t cr3v;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3v));
+        __asm__ volatile("mov %0, %%cr3" :: "r"(cr3v) : "memory");
+    }
+
     return user_fb_vaddr;
+}
+
+/* -------------------------------------------------------------------------
+ * SYS_DISPLAY_SET_MODE(w, h) — сменить разрешение экрана на лету.
+ * Работает ТОЛЬКО при активном virtio-gpu (-vga virtio / make run-gpu):
+ * на голом Limine-фреймбуфере режим прошит загрузчиком и не меняется.
+ * После успешной смены WM получает IPC_MSG_DISPLAY (w,h) в mailbox ввода
+ * и сам перестраивает рабочий стол. Возврат: 0 = ok, -1 = нельзя.
+ * ------------------------------------------------------------------------- */
+static uint64_t sys_display_set_mode(uint64_t w, uint64_t h) {
+    if (!virtio_gpu_active()) return (uint64_t)-1;
+    if (!w || !h || w > 4096 || h > 4096) return (uint64_t)-1;
+    if (virtio_gpu_set_mode((uint32_t)w, (uint32_t)h) != 0) return (uint64_t)-1;
+    ipc_input_push_display((uint32_t)w, (uint32_t)h);
+    return 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -792,6 +817,7 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, 
         case 43: return sys_fs_chown(a1, a2, a3);      // SYS_FS_CHOWN(path, uid, gid)
         case 44: return sys_getuid();                  // SYS_GETUID() -> (gid<<32)|uid
         case 45: return sys_setuid(a1, a2);            // SYS_SETUID(uid, gid) root only
+        case 46: return sys_display_set_mode(a1, a2);  // SYS_DISPLAY_SET_MODE(w, h)
         default: return (uint64_t)-1;
     }
 }

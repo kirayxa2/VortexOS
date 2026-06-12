@@ -3,10 +3,18 @@
  * VortexFS — нативная файловая система VortexOS.
  *
  * Работает поверх ATA PIO. Поддерживает файлы, каталоги, mkdir, create,
- * unlink, read, write, finddir, readdir.
+ * unlink, read, write, finddir, readdir, права, журнал метаданных.
+ *
+ * v3: логический блок 4096 байт (8 секторов), инод 128 байт (size 64 бит,
+ * triple indirect) — файлы до ~4 ТБ. v1/v2 (блок 512, инод 64 байта)
+ * монтируются как раньше: все параметры выбираются при mount по version.
  *
  * Блок 0 зарезервирован как sentinel — в direct[]/indirect значение 0
  * означает «блок не выделен».
+ *
+ * ВНИМАНИЕ (как и раньше): код НЕ реентерабелен — статические буферы
+ * (g_dirbuf/g_datbuf/g_ind*) общие. Все вызовы идут под глобальной
+ * последовательностью VFS, параллельных обращений нет.
  * ============================================================================= */
 
 #include "vortexfs.h"
@@ -23,12 +31,30 @@ static uint32_t      g_start_lba;      /* LBA начала раздела       
 static vtxfs_super_t g_sb;             /* кэшированный суперблок           */
 static uint8_t       g_mounted;        /* флаг: смонтирована?              */
 
+/* --- параметры формата (заполняются при mount/mkfs по version) --- */
+static uint32_t g_ver;     /* версия ФС (1/2/3)                             */
+static uint32_t g_bs;      /* размер логического блока (512 или 4096)       */
+static uint32_t g_spb;     /* секторов в блоке (1 или 8)                    */
+static uint32_t g_ppb;     /* указателей (uint32) в блоке (128 или 1024)    */
+static uint32_t g_dpb;     /* dirent'ов в блоке (8 или 64)                  */
+static uint32_t g_ino_sz;  /* размер инода на диске (64 или 128)            */
+
 static vfs_ops_t     vtxfs_ops;        /* единая таблица VFS-операций      */
 static vfs_node_t   *g_root;           /* корневая VFS нода                */
 
-/* Статические буферы (512 байт) — не на стеке, экономим kernel stack */
-static uint8_t sec_tmp[512];
-static uint8_t sec_tmp2[512];
+/* Статические буферы — не на стеке, экономим kernel stack.
+ * sec_tmp/sec_tmp2 — метаданные посекторно (bitmap, иноды, суперблок).
+ * g_dirbuf — блоки каталогов, g_datbuf — блоки данных файлов,
+ * g_ind1..3 — таблицы указателей (3 уровня могут быть нужны одновременно),
+ * g_zero — вечно нулевой блок (BSS) для зануления свежих блоков. */
+static uint8_t  sec_tmp[512];
+static uint8_t  sec_tmp2[512];
+static uint8_t  g_dirbuf[VTXFS_BS_MAX];
+static uint8_t  g_datbuf[VTXFS_BS_MAX];
+static uint32_t g_ind1[VTXFS_PPB_MAX];
+static uint32_t g_ind2[VTXFS_PPB_MAX];
+static uint32_t g_ind3[VTXFS_PPB_MAX];
+static const uint8_t g_zero[VTXFS_BS_MAX]; /* BSS → нули, никогда не пишем */
 
 /* Простой кэш VFS-нод (чтобы finddir не плодил дубликаты) */
 #define NODE_CACHE_MAX 256
@@ -40,7 +66,7 @@ static uint32_t    node_cache_n;
  * ========================================================================= */
 
 /* --- состояние журнала (metadata WAL, см. vortexfs.h) --- */
-static uint8_t  g_jrn_on;        /* журнал включён (v2 + journal_start)      */
+static uint8_t  g_jrn_on;        /* журнал включён (v2+ и journal_start)     */
 static uint32_t g_jrn_depth;     /* вложенность транзакций                   */
 static uint32_t g_jrn_seq;       /* счётчик транзакций                       */
 static uint8_t  g_jrn_bypass;    /* пишем сам журнал — не перехватывать      */
@@ -75,11 +101,29 @@ static int wr_sector(uint32_t rel, const void *buf) {
 
 static int sb_read(void) {
     if (rd_sector(0, &g_sb) != 0) return -1;
-    /* v1 (без журнала) и v2 (с журналом) монтируются оба */
+    /* v1 (без журнала), v2 (журнал) и v3 (4К блоки) монтируются все */
     return (g_sb.magic == VTXFS_MAGIC &&
-            (g_sb.version == 1 || g_sb.version == VTXFS_VERSION)) ? 0 : -1;
+            g_sb.version >= 1 && g_sb.version <= VTXFS_VERSION) ? 0 : -1;
 }
 static int sb_write(void) { return wr_sector(0, &g_sb); }
+
+/* Выставить рантайм-параметры формата по версии суперблока. 0 = ok. */
+static int fmt_params_set(void) {
+    g_ver = g_sb.version;
+    if (g_ver <= 2) {
+        g_bs = VTXFS_BS_V2;
+        g_ino_sz = VTXFS_INO_SZ_V2;
+    } else {
+        /* v3: размер блока из суперблока (валидируем жёстко) */
+        if (g_sb.block_size != VTXFS_BS_V3) return -1;
+        g_bs = VTXFS_BS_V3;
+        g_ino_sz = VTXFS_INO_SZ_V3;
+    }
+    g_spb = g_bs / 512;
+    g_ppb = g_bs / 4;
+    g_dpb = g_bs / VTXFS_DIRENT_SIZE;
+    return 0;
+}
 
 /* ========================================================================= *
  *  Журнал — write-ahead log для метаданных                                  *
@@ -195,16 +239,8 @@ static void jrn_replay(void) {
 }
 
 /* ========================================================================= *
- *  Bitmap-операции                                                          *
+ *  Bitmap-операции (гранулярность — сектор, формат одинаков для всех версий)*
  * ========================================================================= */
-
-static int bm_get(uint32_t bm_start, uint32_t idx) {
-    uint32_t sec = bm_start + (idx / 8) / 512;
-    uint32_t off = (idx / 8) % 512;
-    uint32_t bit = idx % 8;
-    if (rd_sector(sec, sec_tmp) != 0) return -1;
-    return (sec_tmp[off] >> bit) & 1;
-}
 
 static int bm_set(uint32_t bm_start, uint32_t idx, int val) {
     uint32_t sec = bm_start + (idx / 8) / 512;
@@ -239,26 +275,71 @@ static int bm_alloc(uint32_t bm_start, uint32_t max) {
 }
 
 /* ========================================================================= *
- *  Inode I/O  (8 инодов на сектор: 512 / 64 = 8)                           *
+ *  Inode I/O — v3: 4 инода/сектор (128 байт), v1/v2: 8 инодов/сектор (64)  *
+ *  In-memory формат един (= v3 on-disk); v1/v2 конвертируются на границе.  *
  * ========================================================================= */
 
 static int ino_read(uint32_t ino, vtxfs_inode_t *out) {
-    uint32_t sec = g_sb.inode_table_start + ino / 8;
-    uint32_t off = (ino % 8) * VTXFS_INODE_SIZE;
+    uint32_t per = 512 / g_ino_sz;
+    uint32_t sec = g_sb.inode_table_start + ino / per;
+    uint32_t off = (ino % per) * g_ino_sz;
     if (rd_sector(sec, sec_tmp) != 0) return -1;
-    const uint8_t *s = sec_tmp + off;
+
     uint8_t *d = (uint8_t *)out;
-    for (int i = 0; i < VTXFS_INODE_SIZE; i++) d[i] = s[i];
+    for (uint32_t i = 0; i < sizeof(*out); i++) d[i] = 0;
+
+    if (g_ver >= 3) {
+        const uint8_t *s = sec_tmp + off;
+        for (uint32_t i = 0; i < VTXFS_INO_SZ_V3; i++) d[i] = s[i];
+    } else {
+        /* legacy 64-байтный инод → in-memory */
+        vtxfs_inode_v2_t L;
+        const uint8_t *s = sec_tmp + off;
+        uint8_t *ld = (uint8_t *)&L;
+        for (uint32_t i = 0; i < VTXFS_INO_SZ_V2; i++) ld[i] = s[i];
+        out->type   = L.type;
+        out->blocks = L.blocks;
+        out->size   = L.size;
+        for (int i = 0; i < VTXFS_MAX_DIRECT; i++) out->direct[i] = L.direct[i];
+        out->indirect      = L.indirect;
+        out->dbl_indirect  = L.dbl_indirect;
+        out->trpl_indirect = 0;
+        out->mode = L.mode;
+        out->uid  = L.uid;
+        out->gid  = L.gid;
+        out->nlinks = 1;
+    }
     return 0;
 }
 
 static int ino_write(uint32_t ino, const vtxfs_inode_t *in) {
-    uint32_t sec = g_sb.inode_table_start + ino / 8;
-    uint32_t off = (ino % 8) * VTXFS_INODE_SIZE;
+    uint32_t per = 512 / g_ino_sz;
+    uint32_t sec = g_sb.inode_table_start + ino / per;
+    uint32_t off = (ino % per) * g_ino_sz;
     if (rd_sector(sec, sec_tmp) != 0) return -1;
-    uint8_t *d = sec_tmp + off;
-    const uint8_t *s = (const uint8_t *)in;
-    for (int i = 0; i < VTXFS_INODE_SIZE; i++) d[i] = s[i];
+
+    if (g_ver >= 3) {
+        uint8_t *d = sec_tmp + off;
+        const uint8_t *s = (const uint8_t *)in;
+        for (uint32_t i = 0; i < VTXFS_INO_SZ_V3; i++) d[i] = s[i];
+    } else {
+        /* in-memory → legacy (size усечётся до 32 бит, trpl потеряется —
+         * на v1/v2 они и не используются: set_blk не даёт уйти в triple) */
+        vtxfs_inode_v2_t L;
+        uint8_t *lp = (uint8_t *)&L;
+        for (uint32_t i = 0; i < sizeof(L); i++) lp[i] = 0;
+        L.type   = in->type;
+        L.size   = (uint32_t)in->size;
+        L.blocks = in->blocks;
+        for (int i = 0; i < VTXFS_MAX_DIRECT; i++) L.direct[i] = in->direct[i];
+        L.indirect     = in->indirect;
+        L.dbl_indirect = in->dbl_indirect;
+        L.mode = in->mode;
+        L.uid  = in->uid;
+        L.gid  = in->gid;
+        uint8_t *d = sec_tmp + off;
+        for (uint32_t i = 0; i < VTXFS_INO_SZ_V2; i++) d[i] = lp[i];
+    }
     return wr_sector(sec, sec_tmp);
 }
 
@@ -279,8 +360,23 @@ static void ino_free(uint32_t ino) {
 }
 
 /* ========================================================================= *
- *  Блоки данных                                                             *
+ *  Блоки данных (логический блок = g_spb секторов)                          *
  * ========================================================================= */
+
+static int blk_read(uint32_t blk, void *buf) {
+    uint8_t *d = (uint8_t *)buf;
+    for (uint32_t s = 0; s < g_spb; s++)
+        if (rd_sector(g_sb.data_start + blk * g_spb + s, d + s * 512) != 0)
+            return -1;
+    return 0;
+}
+static int blk_write(uint32_t blk, const void *buf) {
+    const uint8_t *s8 = (const uint8_t *)buf;
+    for (uint32_t s = 0; s < g_spb; s++)
+        if (wr_sector(g_sb.data_start + blk * g_spb + s, s8 + s * 512) != 0)
+            return -1;
+    return 0;
+}
 
 static int blk_alloc(void) {
     jrn_begin();
@@ -288,9 +384,8 @@ static int blk_alloc(void) {
     if (n >= 0) {
         g_sb.free_blocks--;
         sb_write();
-        /* Обнуляем свежий блок */
-        for (int i = 0; i < 512; i++) sec_tmp2[i] = 0;
-        wr_sector(g_sb.data_start + (uint32_t)n, sec_tmp2);
+        /* Обнуляем свежий блок (g_zero — вечно нулевой BSS-буфер) */
+        blk_write((uint32_t)n, g_zero);
     }
     jrn_commit();
     return n;
@@ -304,48 +399,56 @@ static void blk_free(uint32_t blk) {
     jrn_commit();
 }
 
-static int blk_read(uint32_t blk, void *buf) {
-    return rd_sector(g_sb.data_start + blk, buf);
-}
-static int blk_write(uint32_t blk, const void *buf) {
-    return wr_sector(g_sb.data_start + blk, buf);
-}
-
 /* Получить номер блока по логическому индексу внутри файла.
  * 0 = «не выделен» (sentinel).
  *
- * Уровни:
- *   [0 .. MAX_DIRECT-1]               — direct
- *   [MAX_DIRECT .. MAX_DIRECT+127]    — indirect  (128 ptr)
- *   [MAX_DIRECT+128 .. MAX_DIRECT+128+128*128-1] — double-indirect */
+ * Уровни (P = g_ppb: 128 на v1/v2, 1024 на v3):
+ *   [0 .. 9]                — direct
+ *   [10 .. 10+P-1]          — indirect
+ *   [.. +P^2]               — double-indirect
+ *   [.. +P^3]               — triple-indirect (только v3)                   */
 static uint32_t inode_get_blk(vtxfs_inode_t *di, uint32_t idx) {
     if (idx < VTXFS_MAX_DIRECT)
         return di->direct[idx];
 
     uint32_t off = idx - VTXFS_MAX_DIRECT;
+    uint32_t P = g_ppb;
 
     /* Single indirect */
-    if (off < 128) {
+    if (off < P) {
         if (di->indirect == 0) return 0;
-        uint32_t ibuf[128];
-        if (blk_read(di->indirect, ibuf) != 0) return 0;
-        return ibuf[off];
+        if (blk_read(di->indirect, g_ind1) != 0) return 0;
+        return g_ind1[off];
     }
+    off -= P;
 
     /* Double indirect */
-    off -= 128;
-    if (di->dbl_indirect == 0 || off >= 128 * 128) return 0;
-    uint32_t d1[128];
-    if (blk_read(di->dbl_indirect, d1) != 0) return 0;
-    uint32_t slot = off / 128;
-    if (d1[slot] == 0) return 0;
-    uint32_t d2[128];
-    if (blk_read(d1[slot], d2) != 0) return 0;
-    return d2[off % 128];
+    if (off < P * P) {
+        if (di->dbl_indirect == 0) return 0;
+        if (blk_read(di->dbl_indirect, g_ind1) != 0) return 0;
+        uint32_t slot = off / P;
+        if (g_ind1[slot] == 0) return 0;
+        if (blk_read(g_ind1[slot], g_ind2) != 0) return 0;
+        return g_ind2[off % P];
+    }
+    off -= P * P;
+
+    /* Triple indirect (v3) */
+    if (g_ver < 3 || di->trpl_indirect == 0) return 0;
+    /* off < P^3 гарантировано вызывающим (P^3 = 2^30 при P=1024) */
+    if (blk_read(di->trpl_indirect, g_ind1) != 0) return 0;
+    uint32_t s1  = off / (P * P);
+    uint32_t rem = off % (P * P);
+    if (s1 >= P || g_ind1[s1] == 0) return 0;
+    if (blk_read(g_ind1[s1], g_ind2) != 0) return 0;
+    uint32_t s2 = rem / P;
+    if (g_ind2[s2] == 0) return 0;
+    if (blk_read(g_ind2[s2], g_ind3) != 0) return 0;
+    return g_ind3[rem % P];
 }
 
 /* Установить блок по логическому индексу, при необходимости выделяя
- * indirect / double-indirect блоки. */
+ * indirect / double / triple блоки-указатели. */
 static int inode_set_blk(vtxfs_inode_t *di, uint32_t idx, uint32_t blk) {
     if (idx < VTXFS_MAX_DIRECT) {
         di->direct[idx] = blk;
@@ -353,45 +456,78 @@ static int inode_set_blk(vtxfs_inode_t *di, uint32_t idx, uint32_t blk) {
     }
 
     uint32_t off = idx - VTXFS_MAX_DIRECT;
+    uint32_t P = g_ppb;
 
     /* Single indirect */
-    if (off < 128) {
+    if (off < P) {
         if (di->indirect == 0) {
             int ib = blk_alloc();
             if (ib < 0) return -1;
             di->indirect = (uint32_t)ib;
         }
-        uint32_t ibuf[128];
-        if (blk_read(di->indirect, ibuf) != 0) return -1;
-        ibuf[off] = blk;
-        return blk_write(di->indirect, ibuf);
+        if (blk_read(di->indirect, g_ind1) != 0) return -1;
+        g_ind1[off] = blk;
+        return blk_write(di->indirect, g_ind1);
     }
+    off -= P;
 
     /* Double indirect */
-    off -= 128;
-    if (off >= 128 * 128) return -1;
-
-    /* Allocate top-level double-indirect block if needed */
-    if (di->dbl_indirect == 0) {
-        int db = blk_alloc();
-        if (db < 0) return -1;
-        di->dbl_indirect = (uint32_t)db;
+    if (off < P * P) {
+        if (di->dbl_indirect == 0) {
+            int db = blk_alloc();
+            if (db < 0) return -1;
+            di->dbl_indirect = (uint32_t)db;
+        }
+        if (blk_read(di->dbl_indirect, g_ind1) != 0) return -1;
+        uint32_t slot = off / P;
+        if (g_ind1[slot] == 0) {
+            int nb = blk_alloc();
+            if (nb < 0) return -1;
+            /* blk_alloc мог переписать g_ind1? Нет: он пишет только g_zero,
+             * bitmap (sec_tmp) и суперблок. Перечитаем на всякий случай —
+             * дёшево и убирает класс ошибок при будущих правках. */
+            if (blk_read(di->dbl_indirect, g_ind1) != 0) return -1;
+            g_ind1[slot] = (uint32_t)nb;
+            if (blk_write(di->dbl_indirect, g_ind1) != 0) return -1;
+        }
+        if (blk_read(g_ind1[slot], g_ind2) != 0) return -1;
+        g_ind2[off % P] = blk;
+        return blk_write(g_ind1[slot], g_ind2);
     }
-    uint32_t d1[128];
-    if (blk_read(di->dbl_indirect, d1) != 0) return -1;
+    off -= P * P;
 
-    uint32_t slot = off / 128;
-    /* Allocate second-level indirect block if needed */
-    if (d1[slot] == 0) {
-        int sb = blk_alloc();
-        if (sb < 0) return -1;
-        d1[slot] = (uint32_t)sb;
-        if (blk_write(di->dbl_indirect, d1) != 0) return -1;
+    /* Triple indirect — только v3 (v1/v2 формат его не хранит) */
+    if (g_ver < 3) return -1;
+    if (off >= 0x40000000u) return -1;   /* P^3 при P=1024 */
+
+    if (di->trpl_indirect == 0) {
+        int tb = blk_alloc();
+        if (tb < 0) return -1;
+        di->trpl_indirect = (uint32_t)tb;
     }
-    uint32_t d2[128];
-    if (blk_read(d1[slot], d2) != 0) return -1;
-    d2[off % 128] = blk;
-    return blk_write(d1[slot], d2);
+    if (blk_read(di->trpl_indirect, g_ind1) != 0) return -1;
+    uint32_t s1  = off / (P * P);
+    uint32_t rem = off % (P * P);
+    if (s1 >= P) return -1;
+    if (g_ind1[s1] == 0) {
+        int nb = blk_alloc();
+        if (nb < 0) return -1;
+        if (blk_read(di->trpl_indirect, g_ind1) != 0) return -1;
+        g_ind1[s1] = (uint32_t)nb;
+        if (blk_write(di->trpl_indirect, g_ind1) != 0) return -1;
+    }
+    if (blk_read(g_ind1[s1], g_ind2) != 0) return -1;
+    uint32_t s2 = rem / P;
+    if (g_ind2[s2] == 0) {
+        int nb = blk_alloc();
+        if (nb < 0) return -1;
+        if (blk_read(g_ind1[s1], g_ind2) != 0) return -1;
+        g_ind2[s2] = (uint32_t)nb;
+        if (blk_write(g_ind1[s1], g_ind2) != 0) return -1;
+    }
+    if (blk_read(g_ind2[s2], g_ind3) != 0) return -1;
+    g_ind3[rem % P] = blk;
+    return blk_write(g_ind2[s2], g_ind3);
 }
 
 /* ========================================================================= *
@@ -421,7 +557,7 @@ static vfs_node_t *node_make(uint32_t ino) {
 
     n->inode   = ino;
     n->type    = di.type;
-    n->size    = di.size;
+    n->size    = (uint32_t)di.size;   /* VFS пока 32-битный по размеру */
     n->ops     = &vtxfs_ops;
     n->fs_data = 0;
     n->flags   = VFS_FL_CACHED;   /* нода в node_cache — kfree запрещён */
@@ -476,15 +612,14 @@ static int dir_add(uint32_t dir_ino, const char *name, uint32_t child_ino) {
         uint32_t b = inode_get_blk(&di, bi);
         if (b == 0) continue;
 
-        uint8_t buf[512];
-        if (blk_read(b, buf) != 0) continue;
+        if (blk_read(b, g_dirbuf) != 0) continue;
 
-        vtxfs_dirent_t *ent = (vtxfs_dirent_t *)buf;
-        for (int e = 0; e < VTXFS_DIRENTS_PER_BLOCK; e++) {
+        vtxfs_dirent_t *ent = (vtxfs_dirent_t *)g_dirbuf;
+        for (uint32_t e = 0; e < g_dpb; e++) {
             if (ent[e].name[0] == 0) {
                 str_copy(ent[e].name, name, VTXFS_NAME_MAX + 1);
                 ent[e].inode = child_ino;
-                blk_write(b, buf);
+                blk_write(b, g_dirbuf);
                 di.size += VTXFS_DIRENT_SIZE;
                 ino_write(dir_ino, &di);
                 return 0;
@@ -498,13 +633,11 @@ static int dir_add(uint32_t dir_ino, const char *name, uint32_t child_ino) {
     if (inode_set_blk(&di, di.blocks, (uint32_t)nb) != 0) return -1;
     di.blocks++;
 
-    uint8_t buf[512];
-    for (int i = 0; i < 512; i++) buf[i] = 0;
-
-    vtxfs_dirent_t *ent = (vtxfs_dirent_t *)buf;
+    for (uint32_t i = 0; i < g_bs; i++) g_dirbuf[i] = 0;
+    vtxfs_dirent_t *ent = (vtxfs_dirent_t *)g_dirbuf;
     str_copy(ent[0].name, name, VTXFS_NAME_MAX + 1);
     ent[0].inode = child_ino;
-    blk_write((uint32_t)nb, buf);
+    blk_write((uint32_t)nb, g_dirbuf);
 
     di.size += VTXFS_DIRENT_SIZE;
     ino_write(dir_ino, &di);
@@ -520,15 +653,14 @@ static int dir_remove(uint32_t dir_ino, const char *name) {
         uint32_t b = inode_get_blk(&di, bi);
         if (b == 0) continue;
 
-        uint8_t buf[512];
-        if (blk_read(b, buf) != 0) continue;
+        if (blk_read(b, g_dirbuf) != 0) continue;
 
-        vtxfs_dirent_t *ent = (vtxfs_dirent_t *)buf;
-        for (int e = 0; e < VTXFS_DIRENTS_PER_BLOCK; e++) {
+        vtxfs_dirent_t *ent = (vtxfs_dirent_t *)g_dirbuf;
+        for (uint32_t e = 0; e < g_dpb; e++) {
             if (ent[e].name[0] && str_eq(ent[e].name, name)) {
                 ent[e].name[0] = 0;
                 ent[e].inode   = 0;
-                blk_write(b, buf);
+                blk_write(b, g_dirbuf);
                 di.size -= VTXFS_DIRENT_SIZE;
                 ino_write(dir_ino, &di);
                 return 0;
@@ -557,24 +689,23 @@ static int32_t vtxfs_read_cb(vfs_node_t *vn, uint32_t off, uint32_t sz,
     vtxfs_inode_t di;
     if (ino_read(vn->inode, &di) != 0) return -1;
 
-    if (off >= di.size) return 0;
-    if (off + sz > di.size) sz = di.size - off;
+    if ((uint64_t)off >= di.size) return 0;
+    if ((uint64_t)off + sz > di.size) sz = (uint32_t)(di.size - off);
 
     uint32_t done = 0;
     while (done < sz) {
         uint32_t cur   = off + done;
-        uint32_t bi    = cur / VTXFS_BLOCK_SIZE;
-        uint32_t boff  = cur % VTXFS_BLOCK_SIZE;
-        uint32_t chunk = VTXFS_BLOCK_SIZE - boff;
+        uint32_t bi    = cur / g_bs;
+        uint32_t boff  = cur % g_bs;
+        uint32_t chunk = g_bs - boff;
         if (chunk > sz - done) chunk = sz - done;
 
         if (bi >= di.blocks) break;
         uint32_t b = inode_get_blk(&di, bi);
         if (b == 0) break;
 
-        uint8_t bb[512];
-        if (blk_read(b, bb) != 0) break;
-        for (uint32_t i = 0; i < chunk; i++) buf[done + i] = bb[boff + i];
+        if (blk_read(b, g_datbuf) != 0) break;
+        for (uint32_t i = 0; i < chunk; i++) buf[done + i] = g_datbuf[boff + i];
         done += chunk;
     }
     return (int32_t)done;
@@ -591,9 +722,9 @@ static int32_t vtxfs_write_cb(vfs_node_t *vn, uint32_t off, uint32_t sz,
     uint32_t done = 0;
     while (done < sz) {
         uint32_t cur   = off + done;
-        uint32_t bi    = cur / VTXFS_BLOCK_SIZE;
-        uint32_t boff  = cur % VTXFS_BLOCK_SIZE;
-        uint32_t chunk = VTXFS_BLOCK_SIZE - boff;
+        uint32_t bi    = cur / g_bs;
+        uint32_t boff  = cur % g_bs;
+        uint32_t chunk = g_bs - boff;
         if (chunk > sz - done) chunk = sz - done;
 
         uint32_t b = (bi < di.blocks) ? inode_get_blk(&di, bi) : 0;
@@ -610,20 +741,19 @@ static int32_t vtxfs_write_cb(vfs_node_t *vn, uint32_t off, uint32_t sz,
             if (b == 0) goto out;
         }
 
-        uint8_t bb[512];
-        if (boff > 0 || chunk < VTXFS_BLOCK_SIZE)
-            blk_read(b, bb);                 /* частичная запись → читаем */
+        if (boff > 0 || chunk < g_bs)
+            blk_read(b, g_datbuf);           /* частичная запись → читаем */
 
-        for (uint32_t i = 0; i < chunk; i++) bb[boff + i] = buf[done + i];
-        if (blk_write(b, bb) != 0) break;
+        for (uint32_t i = 0; i < chunk; i++) g_datbuf[boff + i] = buf[done + i];
+        if (blk_write(b, g_datbuf) != 0) break;
         done += chunk;
     }
 out:
     {
-        uint32_t end = off + done;
+        uint64_t end = (uint64_t)off + done;
         if (end > di.size) di.size = end;
         ino_write(vn->inode, &di);
-        vn->size = di.size;
+        vn->size = (uint32_t)di.size;
     }
     return (int32_t)done;
 }
@@ -638,11 +768,10 @@ static vfs_node_t *vtxfs_finddir_cb(vfs_node_t *vn, const char *name) {
         uint32_t b = inode_get_blk(&di, bi);
         if (b == 0) continue;
 
-        uint8_t bb[512];
-        if (blk_read(b, bb) != 0) continue;
+        if (blk_read(b, g_dirbuf) != 0) continue;
 
-        vtxfs_dirent_t *ent = (vtxfs_dirent_t *)bb;
-        for (int e = 0; e < VTXFS_DIRENTS_PER_BLOCK; e++) {
+        vtxfs_dirent_t *ent = (vtxfs_dirent_t *)g_dirbuf;
+        for (uint32_t e = 0; e < g_dpb; e++) {
             if (ent[e].name[0] && str_eq(ent[e].name, name)) {
                 vfs_node_t *child = node_make(ent[e].inode);
                 if (child)
@@ -667,11 +796,10 @@ static const char *vtxfs_readdir_cb(vfs_node_t *vn, uint32_t index) {
         uint32_t b = inode_get_blk(&di, bi);
         if (b == 0) continue;
 
-        uint8_t bb[512];
-        if (blk_read(b, bb) != 0) continue;
+        if (blk_read(b, g_dirbuf) != 0) continue;
 
-        vtxfs_dirent_t *ent = (vtxfs_dirent_t *)bb;
-        for (int e = 0; e < VTXFS_DIRENTS_PER_BLOCK; e++) {
+        vtxfs_dirent_t *ent = (vtxfs_dirent_t *)g_dirbuf;
+        for (uint32_t e = 0; e < g_dpb; e++) {
             if (ent[e].name[0] == 0) continue;
             if (cnt == index) {
                 str_copy(rbuf, ent[e].name, VTXFS_NAME_MAX + 1);
@@ -693,13 +821,14 @@ static int vtxfs_mkdir_inner(vfs_node_t *vn, const char *name) {
 
     vtxfs_inode_t di;
     uint8_t *p = (uint8_t *)&di;
-    for (int i = 0; i < VTXFS_INODE_SIZE; i++) p[i] = 0;
+    for (uint32_t i = 0; i < sizeof(di); i++) p[i] = 0;
     di.type   = VFS_DIR;
     di.size   = 0;
     di.blocks = 0;
     di.mode   = VTXFS_DEF_DIR_MODE;
     di.uid    = (uint8_t)vfs_cur_uid();
     di.gid    = (uint8_t)vfs_cur_gid();
+    di.nlinks = 1;
     ino_write((uint32_t)ino, &di);
 
     if (dir_add(vn->inode, name, (uint32_t)ino) != 0) {
@@ -719,13 +848,14 @@ static int vtxfs_create_inner(vfs_node_t *vn, const char *name) {
 
     vtxfs_inode_t di;
     uint8_t *p = (uint8_t *)&di;
-    for (int i = 0; i < VTXFS_INODE_SIZE; i++) p[i] = 0;
+    for (uint32_t i = 0; i < sizeof(di); i++) p[i] = 0;
     di.type   = VFS_FILE;
     di.size   = 0;
     di.blocks = 0;
     di.mode   = VTXFS_DEF_FILE_MODE;
     di.uid    = (uint8_t)vfs_cur_uid();
     di.gid    = (uint8_t)vfs_cur_gid();
+    di.nlinks = 1;
     ino_write((uint32_t)ino, &di);
 
     if (dir_add(vn->inode, name, (uint32_t)ino) != 0) {
@@ -737,43 +867,72 @@ static int vtxfs_create_inner(vfs_node_t *vn, const char *name) {
 
 /* --- unlink ------------------------------------------------------------- */
 static void free_all_blocks(vtxfs_inode_t *di) {
+    uint32_t P = g_ppb;
+
     /* Direct blocks */
     for (uint32_t i = 0; i < di->blocks && i < VTXFS_MAX_DIRECT; i++)
         if (di->direct[i]) blk_free(di->direct[i]);
 
     /* Single indirect */
     if (di->indirect) {
-        uint32_t ibuf[128];
-        if (blk_read(di->indirect, ibuf) == 0) {
+        if (blk_read(di->indirect, g_ind1) == 0) {
             uint32_t cnt = (di->blocks > VTXFS_MAX_DIRECT)
                              ? di->blocks - VTXFS_MAX_DIRECT : 0;
-            if (cnt > 128) cnt = 128;
+            if (cnt > P) cnt = P;
             for (uint32_t i = 0; i < cnt; i++)
-                if (ibuf[i]) blk_free(ibuf[i]);
+                if (g_ind1[i]) blk_free(g_ind1[i]);
         }
         blk_free(di->indirect);
     }
 
     /* Double indirect */
     if (di->dbl_indirect) {
-        uint32_t d1[128];
-        if (blk_read(di->dbl_indirect, d1) == 0) {
-            /* Remaining blocks after direct + single indirect */
-            uint32_t used = (di->blocks > VTXFS_MAX_DIRECT + 128)
-                             ? di->blocks - VTXFS_MAX_DIRECT - 128 : 0;
-            for (uint32_t s = 0; s < 128 && used > 0; s++) {
-                if (d1[s] == 0) break;
-                uint32_t d2[128];
-                if (blk_read(d1[s], d2) == 0) {
-                    uint32_t n = (used > 128) ? 128 : used;
+        if (blk_read(di->dbl_indirect, g_ind1) == 0) {
+            uint32_t used = (di->blocks > VTXFS_MAX_DIRECT + P)
+                             ? di->blocks - VTXFS_MAX_DIRECT - P : 0;
+            if (used > P * P) used = P * P;
+            for (uint32_t s = 0; s < P && used > 0; s++) {
+                if (g_ind1[s] == 0) break;
+                if (blk_read(g_ind1[s], g_ind2) == 0) {
+                    uint32_t n = (used > P) ? P : used;
                     for (uint32_t j = 0; j < n; j++)
-                        if (d2[j]) blk_free(d2[j]);
-                    used -= n;
+                        if (g_ind2[j]) blk_free(g_ind2[j]);
+                    used -= (used > P) ? P : used;
+                } else {
+                    used -= (used > P) ? P : used;
                 }
-                blk_free(d1[s]);
+                blk_free(g_ind1[s]);
             }
         }
         blk_free(di->dbl_indirect);
+    }
+
+    /* Triple indirect (v3). g_ind1 = таблица 1-го уровня, перечитывается
+     * на каждый внешний слот, т.к. вложенные уровни используют g_ind2/g_ind3. */
+    if (g_ver >= 3 && di->trpl_indirect) {
+        uint32_t used = (di->blocks > VTXFS_MAX_DIRECT + P + P * P)
+                         ? di->blocks - VTXFS_MAX_DIRECT - P - P * P : 0;
+        for (uint32_t s1 = 0; s1 < P && used > 0; s1++) {
+            if (blk_read(di->trpl_indirect, g_ind1) != 0) break;
+            uint32_t t2 = g_ind1[s1];
+            if (t2 == 0) break;
+            for (uint32_t s2 = 0; s2 < P && used > 0; s2++) {
+                if (blk_read(t2, g_ind2) != 0) break;
+                uint32_t t3 = g_ind2[s2];
+                if (t3 == 0) break;
+                if (blk_read(t3, g_ind3) == 0) {
+                    uint32_t n = (used > P) ? P : used;
+                    for (uint32_t j = 0; j < n; j++)
+                        if (g_ind3[j]) blk_free(g_ind3[j]);
+                    used -= n;
+                } else {
+                    used -= (used > P) ? P : used;
+                }
+                blk_free(t3);
+            }
+            blk_free(t2);
+        }
+        blk_free(di->trpl_indirect);
     }
 }
 
@@ -848,7 +1007,7 @@ VTXFS_TXN_CB(int, chown,  (vfs_node_t *vn, uint32_t uid, uint32_t gid),
                           (vn, uid, gid))
 
 /* ========================================================================= *
- *  mkfs — форматирование раздела                                           *
+ *  mkfs — форматирование раздела (всегда v3: 4К блоки)                      *
  * ========================================================================= */
 
 int vortexfs_mkfs(uint8_t ata_slave, uint32_t start_lba,
@@ -857,21 +1016,30 @@ int vortexfs_mkfs(uint8_t ata_slave, uint32_t start_lba,
     g_slave     = ata_slave;
     g_start_lba = start_lba;
 
-    /* Вычисляем layout */
-    uint32_t ibm_sec = (VTXFS_MAX_INODES / 8 + 511) / 512;    /* 1  */
-    uint32_t bbm_sec = (total_sectors    / 8 + 511) / 512;     /* ~8 */
+    /* Параметры v3 нужны уже при форматировании */
+    g_ver    = VTXFS_VERSION;
+    g_bs     = VTXFS_BS_V3;
+    g_spb    = g_bs / 512;
+    g_ppb    = g_bs / 4;
+    g_dpb    = g_bs / VTXFS_DIRENT_SIZE;
+    g_ino_sz = VTXFS_INO_SZ_V3;
+
+    /* Вычисляем layout (метаданные — посекторно, данные — блоками) */
+    uint32_t max_blocks = total_sectors / g_spb;                /* верхняя оценка */
+    uint32_t ibm_sec = (VTXFS_MAX_INODES / 8 + 511) / 512;      /* 1    */
+    uint32_t bbm_sec = (max_blocks / 8 + 511) / 512;
     uint32_t itb_sec = ((uint32_t)VTXFS_MAX_INODES
-                         * VTXFS_INODE_SIZE + 511) / 512;       /* 512 */
+                         * VTXFS_INO_SZ_V3 + 511) / 512;        /* 1024 */
 
     uint32_t ibm_start = 1;
     uint32_t bbm_start = ibm_start + ibm_sec;
     uint32_t itb_start = bbm_start + bbm_sec;
-    uint32_t jrn_start = itb_start + itb_sec;   /* v2: журнал перед данными */
+    uint32_t jrn_start = itb_start + itb_sec;   /* журнал перед данными */
     uint32_t dat_start = jrn_start + VTXFS_JOURNAL_SECTORS;
 
-    if (dat_start >= total_sectors) return -1;
+    if (dat_start + 2 * g_spb >= total_sectors) return -1;
 
-    uint32_t data_blocks = total_sectors - dat_start;
+    uint32_t data_blocks = (total_sectors - dat_start) / g_spb;
 
     /* --- Суперблок --- */
     uint8_t *p = (uint8_t *)&g_sb;
@@ -890,8 +1058,10 @@ int vortexfs_mkfs(uint8_t ata_slave, uint32_t start_lba,
     g_sb.root_inode         = 0;
     g_sb.journal_start      = jrn_start;
     g_sb.journal_sectors    = VTXFS_JOURNAL_SECTORS;
+    g_sb.block_size         = g_bs;
 
     g_jrn_on = 0;   /* во время mkfs журнал выключен — пишем напрямую */
+    node_cache_n = 0;
 
     if (sb_write() != 0) return -1;
 
@@ -912,24 +1082,25 @@ int vortexfs_mkfs(uint8_t ata_slave, uint32_t start_lba,
 
     vtxfs_inode_t root;
     p = (uint8_t *)&root;
-    for (int i = 0; i < VTXFS_INODE_SIZE; i++) p[i] = 0;
+    for (uint32_t i = 0; i < sizeof(root); i++) p[i] = 0;
     root.type      = VFS_DIR;
     root.size      = 0;
     root.blocks    = 1;
     root.direct[0] = 1;  /* data block 1 */
     root.mode      = VTXFS_DEF_DIR_MODE;   /* root:root rwxr-xr-x */
+    root.nlinks    = 1;
     ino_write(0, &root);
 
-    /* Обнуляем первый блок данных root-каталога */
-    wr_sector(g_sb.data_start + 1, zero);
+    /* Обнуляем блок данных root-каталога (все g_spb секторов) */
+    blk_write(1, g_zero);
 
-    fb_puts("[VortexFS] mkfs OK (");
+    fb_puts("[VortexFS] mkfs v3 OK (");
     uint32_t n = g_sb.free_blocks;
     char nbuf[12]; int i = 10; nbuf[11] = 0;
     if (!n) nbuf[i--] = '0';
     else while (n) { nbuf[i--] = '0' + n%10; n /= 10; }
     fb_puts(&nbuf[i+1]);
-    fb_puts(" blocks free)\n");
+    fb_puts(" x 4K blocks free)\n");
 
     return 0;
 }
@@ -948,8 +1119,12 @@ int vortexfs_init(uint8_t ata_slave, uint32_t start_lba) {
         fb_puts("[VortexFS] No valid superblock\n");
         return -1;
     }
+    if (fmt_params_set() != 0) {
+        fb_puts("[VortexFS] Bad block_size in superblock\n");
+        return -1;
+    }
 
-    /* Журнал: только v2 с валидной областью. Сначала replay (вдруг упали
+    /* Журнал: только v2+ с валидной областью. Сначала replay (вдруг упали
      * посреди транзакции в прошлой сессии), потом включаем перехват. */
     g_jrn_on = 0; g_jrn_depth = 0; g_jrn_n = 0;
     g_jrn_bypass = 0; g_jrn_seq = 0;
@@ -982,7 +1157,10 @@ int vortexfs_init(uint8_t ata_slave, uint32_t start_lba) {
     g_root->name[1] = 0;
     g_mounted = 1;
 
-    fb_puts("[VortexFS] Mounted (");
+    fb_puts("[VortexFS] Mounted v");
+    char vbuf[2] = { (char)('0' + g_ver), 0 };
+    fb_puts(vbuf);
+    fb_puts(" (");
     uint32_t n = g_sb.free_blocks;
     char nbuf[12]; int i = 10; nbuf[11] = 0;
     if (!n) nbuf[i--] = '0';

@@ -42,3 +42,13 @@ uint32_t  virtio_gpu_pitch(void);   /* в байтах */
 void virtio_gpu_flush(int x, int y, int w, int h);
 
 #endif /* VOS_VIRTIO_GPU_H */
+
+/* Сменить видеорежим на лету (создаёт новый GPU-ресурс на том же backing).
+ * 0 = ok, -1 = нельзя (драйвер неактивен / режим больше максимума).
+ * Допустимые режимы: от 320x200 до 1920x1200 (формат всегда XRGB32). */
+int virtio_gpu_set_mode(uint32_t w, uint32_t h);
+
+/* Полный размер backing-буфера (под максимальный режим) в байтах.
+ * sys_fb_map должен мапить юзеру именно столько, чтобы mapping переживал
+ * любые смены разрешения. */
+uint64_t virtio_gpu_backing_bytes(void);
