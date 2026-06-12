@@ -10,6 +10,7 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "types.h"
+#include "serial.h"
 
 /* Заголовок блока */
 typedef struct heap_block {
@@ -45,14 +46,47 @@ void heap_init(uint64_t virt_start, uint64_t size) {
     heap_head->next  = 0;
 }
 
+/* Диагностика порчи кучи (черный экран virtio 2026-06-12: фолт внутри kmalloc
+ * при загрузке ELF). Любой указатель free-list ОБЯЗАН лежать внутри heap и
+ * быть 8-байт выровнен. Битый указатель = кто-то записал за границы своего
+ * блока и затёр заголовок. Вместо разыменования мусора (#PF с бессмысленным
+ * RIP) — громкий лог в COM1 с адресом: видно, ЧЕЙ заголовок затёрт. */
+static int heap_ptr_valid(heap_block_t *b) {
+    uint64_t a = (uint64_t)b;
+    if (a < heap_virt || a + BLOCK_HDR > heap_virt + heap_size) return 0;
+    if (a & 7) return 0;
+    return 1;
+}
+
+static void heap_report_corrupt(const char *where, heap_block_t *prev, heap_block_t *bad) {
+    serial_puts("[HEAP] CORRUPT free-list in ");
+    serial_puts(where);
+    serial_puts(": block ");
+    serial_puts("0x");
+    char buf[17]; buf[16] = 0;
+    uint64_t v = (uint64_t)bad;
+    for (int i = 15; i >= 0; i--) { uint8_t n = v & 0xF; buf[i] = n < 10 ? '0'+n : 'a'+n-10; v >>= 4; }
+    serial_puts(buf);
+    serial_puts(" (prev hdr 0x");
+    v = (uint64_t)prev;
+    for (int i = 15; i >= 0; i--) { uint8_t n = v & 0xF; buf[i] = n < 10 ? '0'+n : 'a'+n-10; v >>= 4; }
+    serial_puts(buf);
+    serial_puts(") — overflow затёр заголовок?\n");
+}
+
 void *kmalloc(uint64_t size) {
     if (!size || !heap_head) return 0;
 
     /* Выравниваем до 8 байт */
     size = (size + 7) & ~7ULL;
 
+    heap_block_t *prev = 0;
     heap_block_t *cur = heap_head;
     while (cur) {
+        if (!heap_ptr_valid(cur)) {
+            heap_report_corrupt("kmalloc", prev, cur);
+            return 0;   /* не разыменовываем мусор — лучше OOM, чем #PF */
+        }
         if (cur->free && cur->size >= size) {
             /* Можно ли разбить блок? */
             if (cur->size >= size + BLOCK_HDR + MIN_SPLIT) {
@@ -66,6 +100,7 @@ void *kmalloc(uint64_t size) {
             cur->free = 0;
             return (void *)((uint8_t *)cur + BLOCK_HDR);
         }
+        prev = cur;
         cur = cur->next;
     }
     return 0; /* OOM */
@@ -92,11 +127,20 @@ void *kmalloc_aligned(uint64_t size, uint64_t align) {
 void kfree(void *ptr) {
     if (!ptr) return;
     heap_block_t *block = (heap_block_t *)((uint8_t *)ptr - BLOCK_HDR);
+    if (!heap_ptr_valid(block)) {
+        heap_report_corrupt("kfree", 0, block);
+        return;   /* чужой/битый указатель — не трогаем кучу */
+    }
     block->free = 1;
 
     /* Объединяем соседние свободные блоки (coalescing) */
     heap_block_t *cur = heap_head;
     while (cur && cur->next) {
+        if (!heap_ptr_valid(cur->next)) {
+            heap_report_corrupt("kfree-coalesce", cur, cur->next);
+            cur->next = 0;   /* обрезаем хвост: теряем память, но живём */
+            return;
+        }
         if (cur->free && cur->next->free) {
             cur->size += BLOCK_HDR + cur->next->size;
             cur->next  = cur->next->next;

@@ -9,6 +9,7 @@
 #include "fb.h"
 #include "types.h"
 #include "sched.h"
+#include "serial.h"
 
 #define KERNEL_CS 0x08
 #define IDT_ENTRIES 256
@@ -82,6 +83,61 @@ static void print_hex(uint64_t v) {
     fb_puts(buf);
 }
 
+/* serial-only hex: НИКОГДА не трогает framebuffer — безопасно в panic-пути,
+ * даже если активный CR3 вообще не содержит маппинга fb. */
+static void serial_hex(uint64_t v) {
+    serial_puts("0x");
+    char buf[17]; buf[16] = 0;
+    for (int i = 15; i >= 0; i--) {
+        uint8_t n = v & 0xF;
+        buf[i] = n < 10 ? '0'+n : 'a'+n-10;
+        v >>= 4;
+    }
+    serial_puts(buf);
+}
+
+/* Полный дамп исключения ТОЛЬКО в COM1 (port I/O, не может сфолтить).
+ * Урок чёрного экрана 2026-06-12: старый обработчик начинал с fb_puts,
+ * fb-запись фолтила (CR3 без маппинга fb / битые таблицы) → вложенный #PF →
+ * снова fb_puts → бесконечный поток "[" в serial и ноль информации. */
+static void serial_dump_exception(interrupt_frame_t *frame) {
+    uint64_t vec = frame->int_no;
+    uint64_t cr2, cr3;
+    __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+
+    serial_puts("\n[EXCEPTION] vec=");
+    serial_hex(vec);
+    serial_puts(" ");
+    if (vec < 22) serial_puts(exception_names[vec]);
+    else          serial_puts("Reserved");
+    serial_puts("\n  err="); serial_hex(frame->err_code);
+    serial_puts(" rip=");    serial_hex(frame->rip);
+    serial_puts(" cs=");     serial_hex(frame->cs);
+    serial_puts("\n  rsp="); serial_hex(frame->rsp);
+    serial_puts(" rflags="); serial_hex(frame->rflags);
+    serial_puts("\n  cr2="); serial_hex(cr2);
+    serial_puts(" cr3=");    serial_hex(cr3);
+    serial_puts("\n  rax="); serial_hex(frame->rax);
+    serial_puts(" rbx=");    serial_hex(frame->rbx);
+    serial_puts(" rcx=");    serial_hex(frame->rcx);
+    serial_puts("\n  rdx="); serial_hex(frame->rdx);
+    serial_puts(" rsi=");    serial_hex(frame->rsi);
+    serial_puts(" rdi=");    serial_hex(frame->rdi);
+    serial_puts("\n  rbp="); serial_hex(frame->rbp);
+    serial_puts(" r8=");     serial_hex(frame->r8);
+    serial_puts(" r9=");     serial_hex(frame->r9);
+
+    task_t *t = sched_current();
+    if (t) {
+        serial_puts("\n  task pid=");
+        serial_hex(t->pid);
+        serial_puts(" name=");
+        serial_puts(t->name);
+    }
+    serial_puts("\n");
+}
+
 /*
  * interrupt_handler — вызывается из isr_common в ASM.
  * Принимает: rdi = rsp (указатель на interrupt_frame_t, включая fxsave).
@@ -93,7 +149,45 @@ uint64_t interrupt_handler(interrupt_frame_t *frame) {
     uint64_t vec = frame->int_no;
 
     if (vec < 32) {
-        /* Исключение */
+        /* Исключение.
+         * ПОРЯДОК КРИТИЧЕН: сначала ВЕСЬ дамп в COM1 (только port I/O — не
+         * может сфолтить), и только потом попытка вывода на экран. Старый
+         * код начинал с fb_puts: если fb-запись фолтит, обработчик
+         * рекурсивно падал на 2-м символе → бесконечные "[" в serial. */
+        static volatile int in_exception = 0;
+
+        if (in_exception) {
+            /* Вложенный фолт = упал сам panic-путь (почти наверняка fb).
+             * Минимальный serial-дамп и стоп — без рекурсии. */
+            uint64_t cr2n;
+            __asm__ volatile("mov %%cr2, %0" : "=r"(cr2n));
+            serial_puts("\n[EXCEPTION-NESTED] vec=");
+            serial_hex(vec);
+            serial_puts(" rip="); serial_hex(frame->rip);
+            serial_puts(" cr2="); serial_hex(cr2n);
+            serial_puts(" — panic path faulted (fb unmapped in this CR3?), halting\n");
+            __asm__ volatile("cli");
+            for (;;) __asm__ volatile("hlt");
+        }
+        in_exception = 1;
+
+        serial_dump_exception(frame);
+
+        /* Фолт из ring3: убиваем ТОЛЬКО этот процесс, а не всю машину.
+         * Мы на kernel-стеке этой задачи (TSS.RSP0) — ровно тот же контекст,
+         * из которого sys_exit зовёт task_exit, так что это безопасно.
+         * vinit увидит CHILD_EXIT и (для сервисов с restart=yes) перезапустит. */
+        if ((frame->cs & 3) == 3) {
+            task_t *t = sched_current();
+            serial_puts("[EXCEPTION] user-mode fault -> killing task\n");
+            if (t) t->exit_code = 128 + (uint64_t)vec;
+            in_exception = 0;
+            task_exit();              /* не возвращается */
+        }
+
+        /* Фолт в ядре — фатально. Пробуем продублировать на экран (может и
+         * сфолтить — тогда сработает ветка in_exception выше, но полный дамп
+         * уже ушёл в COM1). */
         fb_puts("\n[EXCEPTION] ");
         if (vec < 22) fb_puts(exception_names[vec]);
         else fb_puts("Reserved");
