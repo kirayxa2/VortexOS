@@ -255,6 +255,9 @@ static vfs_node_t *fat_make_vnode(const fat32_dirent_t *e,
     vnode->size    = e->size;
     vnode->type    = (e->attr & FAT32_ATTR_DIR) ? VFS_DIR : VFS_FILE;
     vnode->flags   = 0;
+    vnode->mode    = 0;  /* FAT32 без прав: 0 = «всем 0755» (см. vfs_access) */
+    vnode->uid     = 0;
+    vnode->gid     = 0;
     vnode->ops     = &fat32_ops;
     vnode->mount   = 0;
     priv->parent_cluster = parent_cluster;
@@ -327,6 +330,9 @@ void fat32_mount(void) {
     root->size    = 0;
     root->type    = VFS_DIR;
     root->flags   = 0;
+    root->mode    = 0;   /* без прав — дефолт */
+    root->uid     = 0;
+    root->gid     = 0;
     root->name[0] = '/';
     root->name[1] = 0;
     root->ops     = &fat32_ops;
