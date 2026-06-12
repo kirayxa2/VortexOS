@@ -168,7 +168,7 @@ const uint8_t font[128][16] = {
 
 void fb_scroll(void) {
     if (!fb_addr) return;
-    uint32_t rows      = 768 / FONT_H;
+    uint32_t rows      = fb_height / FONT_H;
     uint32_t row_px    = FONT_H * (fb_pitch / 4);
     for (uint32_t i = 0; i < (rows - 1) * row_px; i++)
         fb_addr[i] = fb_addr[i + row_px];
@@ -179,25 +179,48 @@ void fb_scroll(void) {
 void fb_putchar(char c) {
     serial_putchar(c);   /* зеркало в COM1 (-serial stdio) — видно при чёрном экране */
     if (!fb_addr) return;
-    if (c == '\n') {
-        cur_x = 0; cur_y++;
-        if (cur_y >= 768 / FONT_H) { fb_scroll(); cur_y--; }
+
+    /* cur_x/cur_y — общие для всех задач и IRQ-путей. Без атомарности
+     * scheduler мог преемптнуть между cur_y++ и проверкой скролла: другая
+     * задача видела cur_y == rows и рисовала глиф НИЖЕ конца framebuffer
+     * (fb + 0x300000 при 1024x768) → #PF на немапленной странице.
+     * Лечение: весь вывод символа под cli + клампим ПЕРЕД рисованием. */
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+
+    uint32_t cols = fb_width  / FONT_W;
+    uint32_t rows = fb_height / FONT_H;
+    if (!cols || !rows) {
+        __asm__ volatile("push %0; popfq" :: "r"(rflags) : "memory", "cc");
         return;
     }
-    uint8_t idx = (uint8_t)c;
-    if (idx >= 128) idx = '?';
-    const uint8_t *glyph = font[idx];
-    uint32_t px = cur_x * FONT_W;
-    uint32_t py = cur_y * FONT_H;
-    for (uint32_t row = 0; row < FONT_H; row++) {
-        uint8_t bits = glyph[row];
-        for (uint32_t col = 0; col < FONT_W; col++)
-            fb_addr[(py + row) * (fb_pitch / 4) + px + col] =
-                (bits & (0x80 >> col)) ? FG : BG;
+
+    if (c == '\n') {
+        cur_x = 0; cur_y++;
+        while (cur_y >= rows) { fb_scroll(); cur_y--; }
+    } else {
+        uint8_t idx = (uint8_t)c;
+        if (idx >= 128) idx = '?';
+
+        /* Кламп до рисования — даже если состояние было битое, в fb не выйдем */
+        if (cur_x >= cols) { cur_x = 0; cur_y++; }
+        while (cur_y >= rows) { fb_scroll(); cur_y--; }
+
+        const uint8_t *glyph = font[idx];
+        uint32_t px = cur_x * FONT_W;
+        uint32_t py = cur_y * FONT_H;
+        for (uint32_t row = 0; row < FONT_H; row++) {
+            uint8_t bits = glyph[row];
+            for (uint32_t col = 0; col < FONT_W; col++)
+                fb_addr[(py + row) * (fb_pitch / 4) + px + col] =
+                    (bits & (0x80 >> col)) ? FG : BG;
+        }
+        cur_x++;
+        if (cur_x >= cols) { cur_x = 0; cur_y++; }
+        while (cur_y >= rows) { fb_scroll(); cur_y--; }
     }
-    cur_x++;
-    if (cur_x >= 1024 / FONT_W) { cur_x = 0; cur_y++; }
-    if (cur_y >= 768 / FONT_H)  { fb_scroll(); cur_y--; }
+
+    __asm__ volatile("push %0; popfq" :: "r"(rflags) : "memory", "cc");
 }
 
 void fb_puts(const char *s) {
