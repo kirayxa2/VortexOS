@@ -170,7 +170,13 @@ static int vq_submit(vq_seg_t *segs, int n) {
     /* ждём used */
     uint64_t guard = 200000000ULL;
     while (vq_used->idx == used_seen && --guard) { __asm__ volatile("pause"); }
-    if (!guard) return -2;            /* таймаут */
+    if (!guard) {
+        /* Диагностика: молчаливый таймаут = чёрный экран без единого следа.
+         * Печатаем только первые случаи, чтобы не зафлудить serial. */
+        static int timeouts = 0;
+        if (timeouts < 8) { timeouts++; fb_puts("[virtio-gpu] vq_submit TIMEOUT (device not responding)\n"); }
+        return -2;
+    }
     used_seen = vq_used->idx;
     return 0;
 }

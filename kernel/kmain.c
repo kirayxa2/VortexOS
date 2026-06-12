@@ -17,6 +17,7 @@
 #include "sched.h"
 #include "pci.h"
 #include "virtio_gpu.h"
+#include "serial.h"
 #include "ata.h"
 #include "syscall.h"
 #include "vfs.h"
@@ -176,6 +177,7 @@ void fb_scroll(void) {
 }
 
 void fb_putchar(char c) {
+    serial_putchar(c);   /* зеркало в COM1 (-serial stdio) — видно при чёрном экране */
     if (!fb_addr) return;
     if (c == '\n') {
         cur_x = 0; cur_y++;
@@ -419,6 +421,10 @@ void dock_launcher_task(void) {
 void kmain(void) {
     extern void enter_usermode(uint64_t entry_point, uint64_t user_stack);
     extern void *kmalloc_aligned(uint64_t size, uint64_t align);
+
+    /* COM1 как можно раньше: fb_putchar зеркалит ВСЁ в serial. С -vga virtio
+     * после SET_SCANOUT Limine fb не виден — без serial чёрный экран немой. */
+    serial_init();
     
     /* Включаем SSE/FPU — нужно для fxsave/fxrstor в обработчиках прерываний */
     uint64_t cr0, cr4;

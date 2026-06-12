@@ -295,8 +295,15 @@ int main(int argc, char **argv) {
         case VOS_MSG_CHILD_EXIT:
             svc_on_exit((uint32_t)m.w[7], m.w[1]);
             break;
-        case VOS_MSG_STDOUT:
-            break;   /* stdout сервисов глотаем: GUI уже владеет экраном */
+        case VOS_MSG_STDOUT: {
+            /* На экран нельзя (GUI владеет картинкой), но в COM1 — можно:
+             * fd 3 = serial-only (-serial stdio в терминале хоста). Так логи
+             * vwm/vpanel видны даже при полностью чёрном экране. */
+            int len = (int)m.w[1];
+            if (len > 40) len = 40;
+            if (len > 0) vos_write(3, &m.w[2], (uint64_t)len);
+            break;
+        }
         case VINIT_CMD_STATUS:
         case VINIT_CMD_START:
         case VINIT_CMD_STOP:

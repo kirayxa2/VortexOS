@@ -68,6 +68,7 @@ C_SRCS := \
     kernel/drivers/pit.c               \
     kernel/drivers/pci.c               \
     kernel/drivers/virtio_gpu.c        \
+    kernel/drivers/serial.c            \
     kernel/drivers/ata.c               \
     kernel/drivers/compositor.c        \
     kernel/drivers/simple_wm.c         \

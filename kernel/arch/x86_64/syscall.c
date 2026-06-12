@@ -47,6 +47,16 @@ extern uint64_t syscall_kernel_stack; /* kernel stack для syscall handler */
 static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
     const char *s = (const char *)buf;
 
+    /* fd 3 = ТОЛЬКО serial (COM1, -serial stdio): отладочный вывод, который
+     * нельзя рисовать поверх GUI-экрана. Используется vinit'ом для форварда
+     * stdout сервисов — иначе логи vwm/vpanel глотались и при чёрном экране
+     * диагностики не было вообще. */
+    if (fd == 3) {
+        extern void serial_putchar(char c);
+        for (uint64_t i = 0; i < len; i++) serial_putchar(s[i]);
+        return len;
+    }
+
     /* stdout-пайп: если у процесса задан stdout_pid (его запустил шелл через
      * SYS_SPAWN_EX с флагом pipe), fd=1 уходит шеллу IPC-сообщениями
      * IPC_MSG_STDOUT чанками по 40 байт (w1=len, данные в w2..w6) — и НЕ
@@ -243,7 +253,16 @@ static uint64_t sys_fb_map(void) {
             page_phys = fb_phys + i * 4096;
         } else {
             page_phys = vmm_virt_to_phys(vmm_kernel_pml4, base_virt + i * 4096);
-            if (!page_phys) return 0;
+            if (!page_phys) {
+                /* Диагностика чёрного экрана: vwm получит fb=0 и выйдет —
+                 * без этого лога причина не видна вообще. */
+                fb_puts("[FB] sys_fb_map: page walk FAILED at page ");
+                fb_puthex(i);
+                fb_puts(" of ");
+                fb_puthex(num_pages);
+                fb_putchar('\n');
+                return 0;
+            }
         }
         vmm_map(user_pml4,
                 user_fb_vaddr + i * 4096,
