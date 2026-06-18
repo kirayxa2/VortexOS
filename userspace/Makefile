@@ -14,7 +14,7 @@ LIBC_HDRS   := $(wildcard libc/include/*.h) syscalls.h vos_abi.h
 UTILS := ls cat rm find mkdir touch cp mv echo pwd stat head wc vctl chmod chown whoami
 UTIL_BINS := $(addprefix bin/,$(UTILS))
 
-all: vwm vterm vfiles vsettings vpanel vinit vlogin vcalc vedit $(UTIL_BINS)
+all: vwm vterm vfiles vsettings vpanel vinit vlogin vcalc vedit vmenu $(UTIL_BINS)
 
 libc/%.o: libc/src/%.c $(LIBC_HDRS)
 	$(CC) $(LIBC_CFLAGS) -c $< -o $@
@@ -31,6 +31,9 @@ vcalc: vcalc.c $(LIBC_OBJS) libvui/vui.o linker.ld
 
 vedit: vedit.c $(LIBC_OBJS) libvui/vui.o linker.ld
 	$(CC) $(LIBC_CFLAGS) $(LDFLAGS) vedit.c $(LIBC_OBJS) libvui/vui.o -o vedit
+
+vmenu: vmenu.c $(LIBC_OBJS) libvui/vui.o linker.ld
+	$(CC) $(LIBC_CFLAGS) $(LDFLAGS) vmenu.c $(LIBC_OBJS) libvui/vui.o -o vmenu
 
 vinit: vinit.c $(LIBC_OBJS) linker.ld
 	$(CC) $(LIBC_CFLAGS) $(LDFLAGS) vinit.c $(LIBC_OBJS) -o vinit
@@ -55,7 +58,7 @@ bin/%: bin/%.c bin/vutil.h $(LIBC_OBJS) linker.ld
 	$(CC) $(LIBC_CFLAGS) $(LDFLAGS) $< $(LIBC_OBJS) -o $@
 
 clean:
-	rm -f vwm vterm vfiles vsettings vpanel vinit vlogin vcalc vedit
+	rm -f vwm vterm vfiles vsettings vpanel vinit vlogin vcalc vedit vmenu
 	rm -f $(UTIL_BINS)
 	rm -f libc/*.o libvui/*.o
 

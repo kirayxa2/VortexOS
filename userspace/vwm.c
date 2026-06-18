@@ -137,6 +137,15 @@ static uint64_t focused_id = 0;
  * /остальные окна СКРЫТЫ. Используется vlogin'ом. UNLOCK -> 0. */
 static uint64_t g_lock_win = 0;
 
+/* Лаунчер (/bin/vmenu): спавнится по VWM_LAUNCHER_TOGGLE от vpanel (клик по лого
+ * V). g_vmenu_pid — pid спавненного процесса (запоминаем при spawn), g_vmenu_id —
+ * id его окна (фиксируем в on_create при совпадении owner_pid). Toggle закрывает
+ * окно через close_window (graceful: win_drop + VWM_EV_CLOSE), а не kill, т.к.
+ * vwm не реагирует на смерть процесса сам. Обе переменные сбрасываются в win_drop
+ * (само-закрытие после выбора приложения) и при повторном toggle. */
+static uint64_t g_vmenu_pid = 0;
+static uint64_t g_vmenu_id  = 0;
+
 /* drag / resize — порт состояний из kernel simple_wm */
 static struct {
     int active; uint64_t win_id;
@@ -2140,6 +2149,7 @@ static uint64_t mouse_press_win = 0;
  * страницы реально освобождаются, когда отпустят оба. После release пиксели
  * трогать нельзя — маппинг снят. */
 static void win_drop(vwin_t *win) {
+    if (g_vmenu_id == win->id) { g_vmenu_id = 0; g_vmenu_pid = 0; }
     if (focused_id == win->id) focused_id = 0;
     if (drag.active && drag.win_id == win->id) drag.active = 0;
     if (rz.active && rz.win_id == win->id) rz.active = 0;
@@ -2691,6 +2701,13 @@ static void on_create(vos_msg_t *m) {
         if (win->y + win->h + TITLEBAR_H > (int)fbh)
             win->y = imax(PANEL_H, (int)fbh - win->h - TITLEBAR_H - 8);
     }
+    /* Лаунчер: запоминаем id его окна и заякориваем под лого V (слева, под
+     * панелью) — так popup появляется рядом с кнопкой V, как задумано. */
+    if (sender == g_vmenu_pid && g_vmenu_pid) {
+        g_vmenu_id = win->id;
+        win->x = 8;
+        win->y = PANEL_H + 6;
+    }
     const char *t = (const char *)&m->w[3];
     int i = 0;
     while (t[i] && i < 31) { win->title[i] = t[i]; i++; }
@@ -2880,6 +2897,20 @@ static void handle_msg(vos_msg_t *m) {
                     raise_window(win->id);   /* win невалиден дальше */
                     panel_send_wins();
                 }
+            }
+        }
+        break;
+    case VWM_LAUNCHER_TOGGLE:
+        /* Клик по лого V в панели. Открыт -> закрыть (graceful close_window:
+         * win_drop + VWM_EV_CLOSE, vmenu сам выйдет). Закрыт -> спавнить. */
+        if (m->w[7] == panel_pid) {
+            vwin_t *mw = g_vmenu_id ? find_window(g_vmenu_id) : 0;
+            if (mw) {
+                close_window(mw);          /* win_drop сбросит g_vmenu_id/pid */
+            } else {
+                g_vmenu_id = 0; g_vmenu_pid = 0;   /* окно умерло без DESTROY */
+                int64_t pid = (int64_t)vos_spawn("/bin/vmenu");
+                if (pid > 0) g_vmenu_pid = (uint64_t)pid;
             }
         }
         break;
