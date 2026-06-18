@@ -355,45 +355,10 @@ void userspace_elf_loader_task(void) {
     fb_puthex(expected_cr3);
     fb_puts("\n");
     
-    // DEBUG: Проверяем что entry point замаплен в user PML4
-    fb_puts("[TASK] Verifying entry point mapping in user PML4...\n");
-    uint64_t entry_phys = vmm_virt_to_phys((pte_t*)elf_result.user_pml4, elf_result.entry_point);
-    if (!entry_phys) {
-        fb_puts("[TASK] ERROR: Entry point ");
-        fb_puthex(elf_result.entry_point);
-        fb_puts(" NOT MAPPED in user PML4!\n");
-        task_exit();
-        return;
-    }
-    fb_puts("[TASK] Entry point maps to phys ");
-    fb_puthex(entry_phys);
-    fb_puts("\n");
-    
-    fb_puts("[TASK] Entering usermode...\n");
-    fb_puts("[TASK] User stack top: ");
-    fb_puthex(user_stack_top);
-    fb_puts("\n[TASK] Entry point: ");
-    fb_puthex(elf_result.entry_point);
-    fb_putchar('\n');
-    
-    /* Попробуем прочитать первые байты entry point через физический адрес */
-    fb_puts("[TASK] Reading first bytes at entry point...\n");
-    uint8_t *entry_code = (uint8_t *)(entry_phys + hhdm_off);
-    fb_puts("[TASK] First 16 bytes: ");
-    for (int i = 0; i < 16; i++) {
-        uint8_t b = entry_code[i];
-        char hex[3];
-        hex[0] = (b >> 4) < 10 ? '0' + (b >> 4) : 'a' + (b >> 4) - 10;
-        hex[1] = (b & 0xF) < 10 ? '0' + (b & 0xF) : 'a' + (b & 0xF) - 10;
-        hex[2] = ' ';
-        fb_putchar(hex[0]);
-        fb_putchar(hex[1]);
-        fb_putchar(hex[2]);
-    }
-    fb_putchar('\n');
-    
-    fb_puts("[TASK] About to call enter_usermode...\n");
-    
+    /* Demand paging: entry-страница ещё НЕ замаплена в user PML4. Первый
+     * запуск инструкции по entry_point сфолтит, idt.c позовёт pf_demand_load,
+     * страница подгрузится с диска, инструкция перезапустится. Любая
+     * eager-проверка маппинга здесь обречена — её и не делаем. */
     enter_usermode(elf_result.entry_point, user_stack_top);
     
     // Should not return

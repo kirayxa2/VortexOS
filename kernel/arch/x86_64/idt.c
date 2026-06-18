@@ -10,6 +10,7 @@
 #include "types.h"
 #include "sched.h"
 #include "serial.h"
+#include "elf.h"        /* pf_demand_load — demand paging для PT_LOAD сегментов */
 
 #define KERNEL_CS 0x08
 #define IDT_ENTRIES 256
@@ -147,6 +148,19 @@ static void serial_dump_exception(interrupt_frame_t *frame) {
  */
 uint64_t interrupt_handler(interrupt_frame_t *frame) {
     uint64_t vec = frame->int_no;
+
+    /* Demand paging: #PF, в т.ч. из kernel context при copy_to_user внутри
+     * syscall'а (например, getcwd пишет в user-буфер, страница которого ещё
+     * не подгружена). pf_demand_load сам проверяет, попадает ли cr2 в VMA
+     * текущей задачи; не наш фолт — возвращает -1, и мы падаем в общий
+     * exception-блок. */
+    if (vec == 14) {
+        uint64_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        task_t *t = sched_current();
+        if (pf_demand_load(t, cr2, frame->err_code) == 0)
+            return (uint64_t)frame;
+    }
 
     if (vec < 32) {
         /* Исключение.

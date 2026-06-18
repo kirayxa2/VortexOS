@@ -9,21 +9,27 @@
 
 #include "vos_abi.h"
 #include "font8x16.h"
+#include "vfont.h"
+
+#define FONT_PATH  "/etc/fonts/AdwaitaMono-Regular.ttf"
+#define FONT_PX    18.0f
 
 /* ---- Геометрия (стартовая; окно можно ресайзить — сетка пересчитается) ---- */
-#define START_W    720
-#define START_H    432
-#define CH_W       8
-#define CH_H       16
+#define START_W    740
+#define START_H    460
+#define PADDING    12   /* внутренние отступы контента */
+#define CH_W_DEFAULT  8
+#define CH_H_DEFAULT  16
 #define MAXCOLS    128               /* максимум при resize (1024/8) */
 #define MAXLINES   256               /* глубина scrollback */
 #define INPUT_MAX  255
 
-/* ---- Цвета (ARGB 0xFF......) ---- */
-#define COL_BG     0xFF12121C
-#define COL_FG     0xFFD8D8E0
-#define COL_PROMPT 0xFF5EE6A0
-#define COL_CURSOR 0xFFD8D8E0
+/* ---- Цвета в стиле GNOME Terminal (ARGB 0xFF......) ---- */
+#define COL_BG     0xFF1E1E2E   /* тёмно-синий фон как GNOME Terminal        */
+#define COL_FG     0xFFCDD6F4   /* мягкий белый текст (Catppuccin Mocha)     */
+#define COL_PROMPT 0xFFA6E3A1   /* зелёный промпт как в GNOME по умолчанию  */
+#define COL_CURSOR 0xFFCDD6F4   /* курсор — цвет текста                      */
+#define COL_BORDER 0xFF313244   /* цвет рамки контентной зоны               */
 
 /* ---- Окно ---- */
 static uint64_t  wm_pid = 0;
@@ -31,6 +37,11 @@ static uint64_t  win_id = 0;
 static uint32_t *surf = 0;           /* shm-поверхность, stride = win_w */
 static int win_w = START_W, win_h = START_H;
 static int cols, rows;
+
+/* ---- Рендер шрифта: TTF (JetBrains Mono) или fallback на встроенный bitmap ---- */
+static vfont_t *ttf = 0;             /* 0 = не загружен, рисуем font8x16 */
+static int CH_W = CH_W_DEFAULT;
+static int CH_H = CH_H_DEFAULT;
 
 /* ---- Состояние терминала ---- */
 static char sb[MAXLINES][MAXCOLS + 1];
@@ -73,6 +84,10 @@ static void u_to_dec(uint64_t v, char *out) {
     while (i) out[j++] = tmp[--i];
     out[j] = 0;
 }
+static void i_to_dec(int v, char *out) {
+    if (v < 0) { *out++ = '-'; v = -v; }
+    u_to_dec((uint64_t)v, out);
+}
 
 /* --------------------- локальное рисование в shm --------------------- */
 static void draw_rect(int x, int y, int w, int h, uint32_t c) {
@@ -87,6 +102,15 @@ static void draw_rect(int x, int y, int w, int h, uint32_t c) {
     }
 }
 static void draw_text(int x, int y, const char *s, uint32_t fg) {
+    if (ttf) {
+        /* TTF-рендер целой строкой: для моноспейса xadvance == CH_W, так что
+         * vfont_draw сам выстраивает сетку. Раньше тут был цикл с per-char
+         * вызовом — это давало 80+ вызовов vfont_draw на строку и убивало
+         * FPS до 20. bg=0 -> прозрачный фон. */
+        vfont_draw(surf, win_w, win_h, x, y, s, fg, 0, ttf);
+        return;
+    }
+    /* --- fallback: встроенный bitmap-шрифт font8x16 (с bold-эффектом) --- */
     int cx = x;
     while (*s) {
         uint8_t idx = (uint8_t)*s;
@@ -99,8 +123,11 @@ static void draw_text(int x, int y, const char *s, uint32_t fg) {
             for (int col = 0; col < 8; col++) {
                 if (!(bits & (0x80 >> col))) continue;
                 int px = cx + col;
-                if (px < 0 || px >= win_w) continue;
-                surf[(uint32_t)py * win_w + px] = fg;
+                if (px >= 0 && px < win_w)
+                    surf[(uint32_t)py * win_w + px] = fg;
+                int px2 = px + 1;
+                if (px2 >= 0 && px2 < win_w)
+                    surf[(uint32_t)py * win_w + px2] = fg;
             }
         }
         cx += CH_W;
@@ -138,8 +165,18 @@ static void term_print(const char *s) {
 }
 
 /* --------------------- отрисовка --------------------- */
-static void term_render(void) {
+/* Где сейчас рисуется input-строка (или output текущая) — её Y в окне.
+ * Обновляется внутри term_render_body. */
+static int last_input_y = 0;
+
+/* Перерисовать ВСЁ содержимое окна (scrollback + input). Используется на
+ * старте, при resize, при появлении новой строки stdout. */
+static void term_render_body(void) {
     draw_rect(0, 0, win_w, win_h, COL_BG);
+
+    /* Тонкая рамка контентной зоны в стиле GNOME */
+    draw_rect(0, 0, win_w, 1, COL_BORDER);
+    draw_rect(0, win_h - 1, win_w, 1, COL_BORDER);
 
     /* Промпт идёт сразу под выводом; при переполнении показываем хвост. */
     int total = sb_count + 1;
@@ -148,18 +185,18 @@ static void term_render(void) {
     int row = 0;
     for (int idx = first; idx < sb_count; idx++, row++) {
         int slot = (sb_start + idx) % MAXLINES;
-        draw_text(0, row * CH_H, sb[slot], COL_FG);
+        draw_text(PADDING, row * CH_H + PADDING, sb[slot], COL_FG);
     }
 
-    int iy = row * CH_H;
+    int iy = row * CH_H + PADDING;
+    last_input_y = iy;
     if (child_pid) {
-        /* Утилита работает: вместо промпта — её недопечатанная строка. */
         outbuf[outlen] = 0;
-        draw_text(0, iy, outbuf, COL_FG);
-        draw_rect(outlen * CH_W, iy, CH_W, CH_H, COL_CURSOR);
+        draw_text(PADDING, iy, outbuf, COL_FG);
+        draw_rect(PADDING + outlen * CH_W, iy, CH_W, CH_H, COL_CURSOR);
     } else {
-        draw_text(0, iy, prompt, COL_PROMPT);
-        int px = prompt_len * CH_W;
+        draw_text(PADDING, iy, prompt, COL_PROMPT);
+        int px = PADDING + prompt_len * CH_W;
         int maxin = cols - prompt_len - 1;
         if (maxin < 1) maxin = 1;
         int off = (inlen > maxin) ? inlen - maxin : 0;
@@ -168,10 +205,26 @@ static void term_render(void) {
         for (int i = off; i < inlen; i++) ib[k++] = input[i];
         ib[k] = 0;
         draw_text(px, iy, ib, COL_FG);
-        draw_rect(px + k * CH_W, iy, CH_W, CH_H, COL_CURSOR);
+        draw_rect(px + k * CH_W, iy, 2, CH_H, COL_CURSOR);
     }
+}
 
+/* Полная перерисовка + COMMIT всего shm. */
+static void term_render(void) {
+    term_render_body();
     vwm_commit(wm_pid, win_id, 0, 0, win_w, win_h);
+}
+
+/* Узкий COMMIT только нижней (input/output) строки. Используется на
+ * keystroke — 95% работы кадра. Перерисовываем body как есть, но шлём
+ * vwm один rect высотой CH_H. */
+static void term_render_input_line(void) {
+    term_render_body();
+    int y = last_input_y;
+    int h = CH_H;
+    if (y < 0) y = 0;
+    if (y + h > win_h) h = win_h - y;
+    vwm_commit(wm_pid, win_id, 0, y, win_w, h);
 }
 
 /* --------------------- команды --------------------- */
@@ -413,8 +466,20 @@ void _start(void) {
         puts("vterm: failed to create window\n");
         exit(1);
     }
-    cols = win_w / CH_W;
-    rows = win_h / CH_H;
+
+    /* Пытаемся загрузить TTF; при неудаче остаётся встроенный font8x16 (8x16). */
+    ttf = vfont_load(FONT_PATH, FONT_PX);
+    if (ttf) {
+        CH_W = ttf->ch_w;
+        CH_H = ttf->ch_h;
+    } else {
+        CH_W = CH_W_DEFAULT;
+        CH_H = CH_H_DEFAULT;
+        puts("vterm: TTF load FAILED, using font8x16\n");
+    }
+
+    cols = (win_w - 2 * PADDING) / CH_W;
+    rows = (win_h - 2 * PADDING) / CH_H;
 
     if (vos_getcwd(cwd, sizeof(cwd)) <= 0) { cwd[0] = '/'; cwd[1] = 0; }
     prompt_rebuild();
@@ -427,14 +492,15 @@ void _start(void) {
     vos_msg_t m;
     for (;;) {
         if (!vos_ipc_recv(&m, VOS_IPC_FOREVER)) continue;
-        int dirty = 0;
+        int dirty = 0;           /* нужно перерисовать */
+        int full_redraw = 0;     /* COMMIT всего shm (resize/stdout с переносом) */
         for (;;) {
             switch (m.w[0]) {
             case VWM_EV_KEY:
                 /* пока работает утилита — ввод игнорируем (нет stdin v1) */
                 if (m.w[1] == win_id && m.w[3] && !child_pid) {
                     on_char((char)(m.w[2] & 0xFF));
-                    dirty = 1;
+                    dirty = 1;   /* keystroke — узкий COMMIT нижней строки */
                 }
                 break;
             case VOS_MSG_STDOUT:
@@ -443,23 +509,23 @@ void _start(void) {
                     int len = (int)m.w[1];
                     if (len > VOS_STDOUT_CHUNK) len = VOS_STDOUT_CHUNK;
                     for (int i = 0; i < len; i++) stream_putc(d[i]);
-                    dirty = 1;
+                    dirty = 1; full_redraw = 1;   /* возможны новые строки */
                 }
                 break;
             case VOS_MSG_CHILD_EXIT:
                 if (child_pid && m.w[7] == child_pid) {
                     child_exited(m.w[1]);
-                    dirty = 1;
+                    dirty = 1; full_redraw = 1;
                 }
                 break;
             case VWM_EV_RESIZE:
                 if (m.w[1] == win_id) {
                     win_w = (int)m.w[2];
                     win_h = (int)m.w[3];
-                    cols = win_w / CH_W;
+                    cols = (win_w - 2 * PADDING) / CH_W;
                     if (cols > MAXCOLS) cols = MAXCOLS;
-                    rows = win_h / CH_H;
-                    dirty = 1;
+                    rows = (win_h - 2 * PADDING) / CH_H;
+                    dirty = 1; full_redraw = 1;
                 }
                 break;
             case VWM_EV_CLOSE:
@@ -470,6 +536,9 @@ void _start(void) {
             }
             if (!vos_ipc_recv(&m, VOS_IPC_NOWAIT)) break;  /* выгребли всё */
         }
-        if (dirty) term_render();
+        if (dirty) {
+            if (full_redraw) term_render();
+            else             term_render_input_line();
+        }
     }
 }

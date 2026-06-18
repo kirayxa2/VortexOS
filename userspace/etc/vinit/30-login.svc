@@ -1,0 +1,6 @@
+# Lock screen / login. vlogin сам решает — пароль из /etc/shadow или
+# свободный вход. По «успешному входу» завершает сам процесс — поэтому
+# restart=no, иначе после каждого unlock'а перезапускался бы заново.
+name=vlogin
+exec=/bin/vlogin
+restart=no

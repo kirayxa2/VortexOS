@@ -15,6 +15,19 @@
 #define TASK_CMDLINE_MAX 128  /* полная командная строка spawn_ex ("ls -l /bin") */
 #define TASK_CWD_MAX     64   /* текущий каталог процесса (наследуется при spawn) */
 
+/* Demand paging: дескриптор PT_LOAD сегмента ELF. Заполняется elf_load и
+ * читается обработчиком #PF (pf_demand_load). Реальные физические страницы
+ * выделяются лениво при первом обращении. */
+typedef struct {
+    uint64_t vaddr_start;     /* page-aligned, inclusive */
+    uint64_t vaddr_end;       /* page-aligned, exclusive */
+    uint64_t file_offset;     /* off для page va: file_offset + (va - vaddr_start) */
+    uint64_t file_end_vaddr;  /* конец «файловой» части; всё после — BSS (zero) */
+    uint64_t flags;           /* VMM_PRESENT | VMM_WRITABLE | VMM_USER */
+} elf_vma_t;
+
+#define TASK_MAX_VMAS 8
+
 typedef struct task {
     uint32_t        pid;
     uint8_t         state;
@@ -46,6 +59,12 @@ typedef struct task {
     /* --- права (VortexFS / VFS) --- */
     uint32_t        uid;        /* пользователь; 0 = root. Наследуется при spawn */
     uint32_t        gid;        /* группа; SYS_SETUID меняет (только root) */
+
+    /* --- demand paging ELF --- */
+    void           *elf_node;   /* vfs_node_t* открытого исполняемого файла;
+                                 * vfs_close в task_exit. 0 = нет (loader-фейл) */
+    elf_vma_t       vmas[TASK_MAX_VMAS];
+    uint8_t         n_vmas;
 } task_t;
 
 void    sched_init(void);

@@ -69,6 +69,9 @@ typedef long int64_t;
 #define SYS_DISPLAY_SET_MODE 46 /* (w, h) сменить разрешение; только virtio-gpu
                                   (make run-gpu). 0 = ok (WM получит VIN_DISPLAY),
                                   -1 = нельзя (Limine fb / режим не влез)       */
+#define SYS_CURSOR_SET    47    /* (sprite_64x64_bgra*, hot_x, hot_y)  ->
+                                   0 = аппаратный курсор активирован, -1 = no  */
+#define SYS_CURSOR_MOVE   48    /* (x, y) переместить hardware cursor -> 0/-1  */
 
 #define VOS_SVC_WM        0    /* service id window manager'а */
 #define VOS_SVC_INIT      1    /* service id init-системы /bin/vinit */
@@ -160,6 +163,13 @@ typedef struct {
                                   заново прислать VWM_PANEL_ATTACH */
 #define VWM_PANEL_H        28  /* высота панели (= PANEL_H в vwm) */
 
+/* --- Lock screen ---------------------------------------------------------
+ * vlogin: при старте шлёт LOCK -> vwm прячет панель/док/обои и рисует только
+ * lock-окно (его создатель). На «вход» шлёт UNLOCK + DESTROY и сцена живёт
+ * как раньше. */
+#define VWM_LOCK           50  /* w1=win_id — это окно становится lock-owner */
+#define VWM_UNLOCK         51  /* () — разблокировать сцену */
+
 /* Максимум пикселей содержимого окна (как MAX_WINDOW_PIXELS в ядре).
  * Буфер окна всегда выделяется под максимум — resize не требует переалокации,
  * меняется только логический stride (= текущая ширина окна). */
@@ -200,6 +210,18 @@ static inline int64_t  vos_display_set_mode(uint64_t w, uint64_t h) {
 static inline void     vos_fb_present(int x, int y, int w, int h) {
     syscall6(SYS_FB_PRESENT, (uint64_t)(int64_t)x, (uint64_t)(int64_t)y,
              (uint64_t)(int64_t)w, (uint64_t)(int64_t)h, 0, 0);
+}
+/* HW-курсор: спрайт 64×64 BGRA, hot_x/hot_y — горячая точка.
+ * vos_cursor_set возвращает 0 если активировался — vwm перестаёт рисовать
+ * sprite в bb. -1 = нет cursorq (Limine fb), идём по старому пути. */
+static inline int64_t  vos_cursor_set(const void *sprite_bgra_64x64,
+                                      int hot_x, int hot_y) {
+    return (int64_t)syscall3(SYS_CURSOR_SET, (uint64_t)sprite_bgra_64x64,
+                             (uint64_t)hot_x, (uint64_t)hot_y);
+}
+static inline int64_t  vos_cursor_move(int x, int y) {
+    return (int64_t)syscall3(SYS_CURSOR_MOVE,
+                             (uint64_t)(int64_t)x, (uint64_t)(int64_t)y, 0);
 }
 
 /* --- ФС + процессы (утилиты /bin, шелл) --- */

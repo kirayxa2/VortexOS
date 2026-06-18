@@ -8,6 +8,7 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "gdt.h"
+#include "../fs/vfs.h"   /* vfs_close: ELF-нода закрывается при выходе задачи */
 
 /* syscall-стек (точка входа SYSCALL) — переключаем его по-задачно тут же, где и
  * TSS.rsp0, иначе два usermode-процесса делят один kernel-стек на syscall. */
@@ -109,6 +110,8 @@ task_t *task_create(const char *name, void (*entry)(void), uint8_t priority) {
     t->cmdline[0] = 0;
     t->cwd[0] = '/'; t->cwd[1] = 0;   /* стартовый каталог — корень */
     t->uid = 0; t->gid = 0;           /* root; spawn перепишет кредами родителя */
+    t->elf_node = 0;   /* demand paging: ELF-нода ставится в elf_load() */
+    t->n_vmas = 0;     /* VMA-список тоже */
     for (int k = 0; k < TASK_MAX_ALLOCS; k++) t->allocs[k] = 0;
     /* По умолчанию задача живёт в kernel-пространстве. usermode-задача
      * перезапишет это своим user-pml4 (см. userspace_elf_loader_task). */
@@ -216,8 +219,20 @@ void task_exit(void) {
      * и мы прямо сейчас на нём стоим. */
     vmm_switch(vmm_kernel_pml4);
     if (current->pml4 && current->pml4 != (void *)vmm_kernel_pml4) {
+        /* vmm_destroy_user_pml4 теперь сам обходит PT и освобождает все leaf
+         * USER+PRESENT страницы (см. комментарий в vmm.c). Раньше мы делали
+         * это отдельно через vmm_free_vma_pages по диапазонам VMA, но если
+         * первый exception убивал процесс ВНУТРИ освобождения, второй проход
+         * (destroy) натыкался на повреждённые таблицы → kernel #PF. Один
+         * проход безопаснее. */
+        current->n_vmas = 0;
         vmm_destroy_user_pml4((pte_t *)current->pml4);
         current->pml4 = (void *)vmm_kernel_pml4;
+    }
+    /* ELF-нода жила всё время процесса для demand-чтения страниц — закрываем. */
+    if (current->elf_node) {
+        vfs_close((vfs_node_t *)current->elf_node);
+        current->elf_node = 0;
     }
     for (uint8_t k = 0; k < current->n_allocs; k++) {
         kfree(current->allocs[k]);

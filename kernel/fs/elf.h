@@ -82,4 +82,10 @@ elf_load_result_t elf_load(const char *path);
 struct vfs_node;
 struct vfs_node *elf_open_exec(const char *path);
 
+/* Demand paging: попытаться разрезолвить page fault через VMA текущей задачи.
+ * cr2 — faulting address, err — error code из стека исключения.
+ * 0 = страница успешно подгружена и замаплена, -1 = это не наш фолт. */
+struct task;
+int pf_demand_load(struct task *t, uint64_t cr2, uint64_t err);
+
 #endif

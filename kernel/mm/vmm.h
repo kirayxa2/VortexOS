@@ -28,4 +28,11 @@ pte_t *vmm_create_user_pml4(void);
 void   vmm_destroy_user_pml4(pte_t *pml4);
 uint64_t vmm_kernel_virt_to_phys(uint64_t virt);
 
+/* Demand paging cleanup: освободить все present-страницы в диапазоне
+ * [va_start, va_end) данной user-PML4. Используется в task_exit для
+ * лениво-выделенных ELF-страниц. Чужие маппинги (SHM, framebuffer) не
+ * задеты — диапазон ограничен реальными VMA задачи. PTE при этом
+ * также зануляется. */
+void vmm_free_vma_pages(pte_t *pml4, uint64_t va_start, uint64_t va_end);
+
 #endif /* VOS_VMM_H */

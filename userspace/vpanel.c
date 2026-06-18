@@ -17,10 +17,12 @@
 
 #include "vos_abi.h"
 #include "font8x16.h"
+#include "vfont_ui.h"
 
 #define ACCENT     0xFF5B8CFF
-#define BASE_BG    0xD20D0E15u
-#define LINE_BG    (0xB0000000u | (ACCENT & 0x00FFFFFF))
+/* macOS-style frosted: тёмный полупрозрачный без border. Реальный gaussian
+ * blur по обоям дорого — visually это выглядит близко при alpha 0x55-0x70. */
+#define BASE_BG    0x66101218u
 
 #define CHIP_H        18
 #define CHIP_TITLE_MAX 12
@@ -91,62 +93,27 @@ static void draw_text(int x, int y, const char *s, uint32_t fg) {
         s++;
     }
 }
-
-/* --------------------- раскладка чипов (как в старом vwm) ---------------- */
-typedef struct { int x, w; uint64_t id; } chip_t;
-
-static int chips_layout(chip_t *out) {
-    int n = 0;
-    for (int i = 0; i < nwins && n < MAX_WINS; i++) {
-        int len = 0;
-        while (wins[i].title[len] && len < CHIP_TITLE_MAX) len++;
-        if (len == 0) len = 1;
-        out[n].w = len * 8 + 14;
-        out[n].id = wins[i].id;
-        n++;
-    }
-    int x = W - 8 * 8 - 24;            /* правый край пачки — перед часами */
-    for (int k = n - 1; k >= 0; k--) { x -= out[k].w + 6; out[k].x = x; }
-    return n;
+/* UI-текст (AdwaitaSans если загружен, иначе fallback на font8x16). */
+static void draw_ui_text(int x, int y, const char *s, uint32_t fg) {
+    if (vfont_ui) vfont_draw(surf, W, H, x, y, s, fg, 0, vfont_ui);
+    else draw_text(x, y, s, fg);
 }
+static int ui_text_width(const char *s) { return vfont_ui_text_width(s); }
+static int ui_line_height(void)         { return vfont_ui_line_height(); }
 
-/* --------------------- кадр --------------------- */
+/* --------------------- кадр ---------------------
+ * macOS-style: панель показывает только лого, имя ОС и часы.
+ * Чипы запущенных окон и заголовок активного — теперь в доке (vwm). */
 static void compose(void) {
-    for (int j = 0; j < H - 1; j++)
+    /* Без border-полоски снизу — лежит чисто на обоях. Высота полная H. */
+    for (int j = 0; j < H; j++)
         for (int i = 0; i < W; i++)
             surf[(uint32_t)j * W + i] = BASE_BG;
-    for (int i = 0; i < W; i++)
-        surf[(uint32_t)(H - 1) * W + i] = LINE_BG;
 
     int ty = (H - 16) / 2;
     fill_round(8, ty, 16, 16, 5, ACCENT);
     draw_text(12, ty, "V", 0xFFFFFFFF);
-    int lx = 30;
-    draw_text(lx, ty, "VortexOS", 0xFFE8EAF2);
-    lx += 8 * 8;
-
-    for (int i = 0; i < nwins; i++)
-        if (wins[i].focused && wins[i].title[0]) {
-            fill_over(lx + 8, ty + 1, 1, 14, 0xFF3A3F55);
-            draw_text(lx + 16, ty, wins[i].title, 0xFFAFC6E8);
-            break;
-        }
-
-    /* чипы-таскбар: все окна; фокусное — акцент, свёрнутые — приглушены */
-    chip_t chips[MAX_WINS];
-    int n = chips_layout(chips);
-    int cy = (H - CHIP_H) / 2;
-    for (int k = 0; k < n; k++) {
-        const pwin_t *w = &wins[k];
-        uint32_t bg = w->focused ? 0xFF31427A : (w->minimized ? 0xC42A2E3E : 0xE63A4156);
-        fill_round(chips[k].x, cy, chips[k].w, CHIP_H, 9, bg);
-        char buf[CHIP_TITLE_MAX + 1];
-        int i = 0;
-        while (w->title[i] && i < CHIP_TITLE_MAX) { buf[i] = w->title[i]; i++; }
-        buf[i] = 0;
-        draw_text(chips[k].x + 7, (H - 16) / 2, buf,
-                  w->minimized ? 0xFF8B93A8 : 0xFFBDD0F0);
-    }
+    draw_ui_text(30, ty + (16 - ui_line_height()) / 2, "VortexOS", 0xFFE8EAF2);
 
     /* часы */
     uint32_t hms[3];
@@ -155,7 +122,7 @@ static void compose(void) {
     clk[0] = '0' + hms[0] / 10; clk[1] = '0' + hms[0] % 10; clk[2] = ':';
     clk[3] = '0' + hms[1] / 10; clk[4] = '0' + hms[1] % 10; clk[5] = ':';
     clk[6] = '0' + hms[2] / 10; clk[7] = '0' + hms[2] % 10; clk[8] = 0;
-    draw_text(W - 8 * 8 - 10, ty, clk, 0xFFF2F4FA);
+    draw_ui_text(W - ui_text_width("00:00:00") - 10, ty + (16 - ui_line_height()) / 2, clk, 0xFFF2F4FA);
 }
 
 static void commit_all(void) {
@@ -163,6 +130,22 @@ static void commit_all(void) {
     for (int i = 0; i < 8; i++) m.w[i] = 0;
     m.w[0] = VWM_PANEL_COMMIT;
     m.w[1] = 0; m.w[2] = 0; m.w[3] = (uint64_t)W; m.w[4] = (uint64_t)H;
+    vos_ipc_send(wm_pid, &m);
+}
+
+/* Узкий COMMIT: только зона часов. Часы тикают раз в секунду — нет смысла
+ * шлепать всю панель в vwm. */
+static void commit_clock(void) {
+    int clk_w = ui_text_width("00:00:00");
+    int x = W - clk_w - 14;
+    int y = 0;
+    int w = clk_w + 14;     /* небольшой запас по краям */
+    int h = H;
+    vos_msg_t m;
+    for (int i = 0; i < 8; i++) m.w[i] = 0;
+    m.w[0] = VWM_PANEL_COMMIT;
+    m.w[1] = (uint64_t)x; m.w[2] = (uint64_t)y;
+    m.w[3] = (uint64_t)w; m.w[4] = (uint64_t)h;
     vos_ipc_send(wm_pid, &m);
 }
 
@@ -189,20 +172,9 @@ static void on_wins_msg(vos_msg_t *m) {
 }
 
 static void on_click(int mx, int my, int buttons) {
-    if (!(buttons & 1)) return;
-    chip_t chips[MAX_WINS];
-    int n = chips_layout(chips);
-    int cy = (H - CHIP_H) / 2;
-    if (my < cy || my >= cy + CHIP_H) return;
-    for (int k = 0; k < n; k++)
-        if (mx >= chips[k].x && mx < chips[k].x + chips[k].w) {
-            vos_msg_t m;
-            for (int i = 0; i < 8; i++) m.w[i] = 0;
-            m.w[0] = VWM_PANEL_ACTIVATE;
-            m.w[1] = chips[k].id;
-            vos_ipc_send(wm_pid, &m);
-            return;
-        }
+    /* Чипы окон переехали в док (vwm). Кликабельных зон в панели больше нет —
+     * это просто bar с лого и часами. */
+    (void)mx; (void)my; (void)buttons;
 }
 
 /* (Пере)создать поверхность под текущую ширину экрана и приаттачиться к vwm.
@@ -246,6 +218,7 @@ static int panel_attach(void) {
 /* --------------------- main --------------------- */
 void _start(void) {
     wm_pid = vwm_wait_for_wm();
+    vfont_ui_init();   /* AdwaitaSans для текста панели; 0 -> fallback font8x16 */
     if (panel_attach() != 0) { puts("vpanel: attach failed\n"); exit(1); }
     vos_msg_t m;
 
@@ -255,12 +228,13 @@ void _start(void) {
     uint64_t last_sec = (uint64_t)-1;
     for (;;) {
         int got = (int)vos_ipc_recv(&m, 25);   /* тиков: часы тикают ~4 Гц */
-        int dirty = 0;
+        int dirty = 0;          /* нужно скомпонировать заново */
+        int full_commit = 0;    /* COMMIT всего шма (а не только часов) */
         while (got) {
             switch (m.w[0]) {
             case VWM_PANEL_WINS:
                 on_wins_msg(&m);
-                dirty = 1;
+                dirty = 1; full_commit = 1;   /* состав окон → перерисовка */
                 break;
             case VWM_PANEL_CLICK:
                 on_click((int)m.w[1], (int)m.w[2], (int)m.w[3]);
@@ -268,7 +242,7 @@ void _start(void) {
             case VWM_PANEL_REATTACH:
                 /* разрешение сменилось: новая ширина -> новый shm + ATTACH */
                 if (panel_attach() != 0) { puts("vpanel: reattach failed\n"); exit(1); }
-                dirty = 1;
+                dirty = 1; full_commit = 1;
                 break;
             default:
                 break;
@@ -276,7 +250,11 @@ void _start(void) {
             got = (int)vos_ipc_recv(&m, VOS_IPC_NOWAIT);
         }
         uint64_t sec = vos_uptime() / 100;
-        if (sec != last_sec) { last_sec = sec; dirty = 1; }
-        if (dirty) { compose(); commit_all(); }
+        if (sec != last_sec) { last_sec = sec; dirty = 1; }   /* только часы */
+        if (dirty) {
+            compose();
+            if (full_commit) commit_all();
+            else             commit_clock();
+        }
     }
 }

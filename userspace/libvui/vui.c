@@ -3,8 +3,19 @@
  * ============================================================================= */
 #include "vui.h"
 #include "font8x16.h"
+#include "vfont_ui.h"
 #include <stdlib.h>
 #include <string.h>
+
+/* libvui автоматически инициализирует AdwaitaSans при первом вызове vui_text.
+ * Без ленивой инициализации приходилось бы вручную звать в каждом app — это
+ * провоцировало бы упустить и получить fallback'и на font8x16. */
+static int vui_font_initialized = 0;
+static void vui_font_ensure(void) {
+    if (vui_font_initialized) return;
+    vui_font_initialized = 1;
+    vfont_ui_init();
+}
 
 /* ------------------------------- damage ----------------------------------- */
 static void damage_add(vui_win_t *w, int x, int y, int rw, int rh) {
@@ -122,6 +133,13 @@ void vui_frame(vui_win_t *win, int x, int y, int w, int h, uint32_t color) {
 }
 
 void vui_text(vui_win_t *win, int x, int y, const char *s, uint32_t color) {
+    vui_font_ensure();
+    if (vfont_ui) {
+        vfont_draw(win->surf, win->w, win->h, x, y, s, color, 0, vfont_ui);
+        damage_add(win, x, y, vfont_ui_text_width(s), vfont_ui_line_height());
+        return;
+    }
+    /* fallback: bitmap font8x16 */
     int cx = x;
     const char *p = s;
     while (*p) {
@@ -147,6 +165,8 @@ void vui_text(vui_win_t *win, int x, int y, const char *s, uint32_t color) {
 }
 
 int vui_text_width(const char *s) {
+    vui_font_ensure();
+    if (vfont_ui) return vfont_ui_text_width(s);
     return (int)strlen(s) * 8;
 }
 

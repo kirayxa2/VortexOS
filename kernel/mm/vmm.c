@@ -205,6 +205,36 @@ uint64_t vmm_kernel_virt_to_phys(uint64_t virt) {
     return virt_to_phys_hhdm(virt);
 }
 
+/* Demand paging: освободить листовые страницы VMA-диапазона.
+ *
+ * task_exit вызывает эту функцию ПЕРЕД vmm_destroy_user_pml4 для каждой
+ * elf_vma_t задачи. Освобождаем только PHYS-страницы, замапленные в этот
+ * диапазон — таблицы PT/PD/PDPT снимет vmm_destroy_user_pml4. PTE зануляем,
+ * чтобы повторный обход не дёргал страницу дважды.
+ *
+ * Диапазон ограничен реальными VMA процесса, поэтому SHM-сегменты и
+ * framebuffer (тоже USER, но из других подсистем) не задеты. */
+void vmm_free_vma_pages(pte_t *pml4, uint64_t va_start, uint64_t va_end) {
+    if (!pml4 || pml4 == vmm_kernel_pml4) return;
+    if (va_end <= va_start) return;
+    /* Идём по страницам 4 KB — простой и достаточный путь (для PT_LOAD
+     * до ~16 MB это десятки тысяч итераций, всё O(1) на каждую). */
+    for (uint64_t va = va_start; va < va_end; va += 4096) {
+        uint64_t i4 = PML4_IDX(va), i3 = PDPT_IDX(va);
+        uint64_t i2 = PD_IDX(va),    i1 = PT_IDX(va);
+        if (!(pml4[i4] & VMM_PRESENT)) { va = (va | (((uint64_t)1 << 39) - 1)); continue; }
+        pte_t *pdpt = (pte_t *)phys_to_virt(pml4[i4] & PHYS_MASK);
+        if (!(pdpt[i3] & VMM_PRESENT)) { va = (va | (((uint64_t)1 << 30) - 1)); continue; }
+        pte_t *pd = (pte_t *)phys_to_virt(pdpt[i3] & PHYS_MASK);
+        if (!(pd[i2] & VMM_PRESENT))   { va = (va | (((uint64_t)1 << 21) - 1)); continue; }
+        pte_t *pt = (pte_t *)phys_to_virt(pd[i2] & PHYS_MASK);
+        if (pt[i1] & VMM_PRESENT) {
+            pmm_free(pt[i1] & PHYS_MASK);
+            pt[i1] = 0;
+        }
+    }
+}
+
 /* Уничтожить user page table умершего процесса: вернуть PMM ВСЕ страницы
  * самих таблиц нижней половины (PDPT/PD/PT, их выделял get_or_create) и
  * страницу PML4. ЛИСТОВЫЕ физические страницы здесь НЕ трогаем — у каждой

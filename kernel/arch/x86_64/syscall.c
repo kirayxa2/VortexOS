@@ -420,6 +420,23 @@ static int fs_copy_path(uint64_t user_path, char *dst) {
 
 #define FS_IO_MAX (64 * 1024)   /* лимит на один вызов read/write */
 
+/* Demand paging + non-reentrant FS-драйверы: ядро во время vfs_read/write
+ * копирует в/из user-буфера, а fat32.c держит ОДИН глобальный sector_buf.
+ * Если посреди этого копирования user-страница сфолтит, обработчик #PF
+ * выполнит свой vfs_read для ELF — и затрёт sector_buf первого чтения.
+ * Чтобы такого не было, заранее «прогреваем» все страницы user-буфера:
+ * читаем первый байт каждой страницы (+ последний байт буфера), это
+ * провоцирует demand-load до начала реального FS-чтения. После этого
+ * vfs_read идёт по уже замапленным страницам без nested-фолтов. */
+static void user_prefault_buf(uint64_t user_buf, uint64_t len) {
+    if (!user_buf || !len) return;
+    volatile uint8_t *p = (volatile uint8_t *)user_buf;
+    uint64_t end = user_buf + len;
+    for (uint64_t va = user_buf & ~0xFFFULL; va < end; va += 4096)
+        (void)((volatile uint8_t *)va)[0];
+    (void)p[len - 1];   /* и последний байт буфера */
+}
+
 static uint64_t sys_fs_read(uint64_t user_path, uint64_t offset,
                             uint64_t user_buf, uint64_t len) {
     char path[VFS_MAX_PATH];
@@ -430,6 +447,7 @@ static uint64_t sys_fs_read(uint64_t user_path, uint64_t offset,
     if (!node) return (uint64_t)-1;
     uint64_t ret = (uint64_t)-1;
     if (node->type == VFS_FILE) {
+        user_prefault_buf(user_buf, len);
         int32_t got = vfs_read(node, (uint32_t)offset, (uint32_t)len,
                                (uint8_t *)user_buf);
         if (got >= 0) ret = (uint64_t)got;
@@ -448,6 +466,7 @@ static uint64_t sys_fs_write(uint64_t user_path, uint64_t offset,
     if (!node) return (uint64_t)-1;
     uint64_t ret = (uint64_t)-1;
     if (node->type == VFS_FILE) {
+        user_prefault_buf(user_buf, len);   /* см. sys_fs_read */
         int32_t put = vfs_write(node, (uint32_t)offset, (uint32_t)len,
                                 (const uint8_t *)user_buf);
         if (put >= 0) ret = (uint64_t)put;
@@ -698,6 +717,24 @@ static uint64_t sys_fb_present(uint64_t x, uint64_t y, uint64_t w, uint64_t h) {
     return 0;
 }
 
+/* Hardware-курсор через virtio-gpu cursorq. Sprite 64×64 BGRA, hot_x/hot_y.
+ * vwm зовёт один раз при старте → курсор начинает рисовать QEMU поверх
+ * scanout-а, vwm перестаёт его композитить (см. cur_ready в vwm.c). */
+extern int virtio_gpu_cursor_set(const uint32_t *sprite, int hot_x, int hot_y);
+extern int virtio_gpu_cursor_move(int x, int y);
+extern int virtio_gpu_cursor_active(void);
+static uint64_t sys_cursor_set(uint64_t user_sprite, uint64_t hot_x, uint64_t hot_y) {
+    if (!user_sprite || !virtio_gpu_cursor_active()) return (uint64_t)-1;
+    user_prefault_buf(user_sprite, 64 * 64 * 4);   /* demand paging безопасно */
+    return (uint64_t)(int64_t)virtio_gpu_cursor_set(
+        (const uint32_t *)user_sprite, (int)hot_x, (int)hot_y);
+}
+static uint64_t sys_cursor_move(uint64_t x, uint64_t y) {
+    if (!virtio_gpu_cursor_active()) return (uint64_t)-1;
+    return (uint64_t)(int64_t)virtio_gpu_cursor_move(
+        (int)(int64_t)x, (int)(int64_t)y);
+}
+
 /* Структура для событий ввода */
 typedef struct {
     uint8_t type;    /* 0=нет события, 1=мышь, 2=клавиатура */
@@ -818,6 +855,8 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, 
         case 44: return sys_getuid();                  // SYS_GETUID() -> (gid<<32)|uid
         case 45: return sys_setuid(a1, a2);            // SYS_SETUID(uid, gid) root only
         case 46: return sys_display_set_mode(a1, a2);  // SYS_DISPLAY_SET_MODE(w, h)
+        case 47: return sys_cursor_set(a1, a2, a3);    // SYS_CURSOR_SET(sprite, hot_x, hot_y)
+        case 48: return sys_cursor_move(a1, a2);       // SYS_CURSOR_MOVE(x, y)
         default: return (uint64_t)-1;
     }
 }

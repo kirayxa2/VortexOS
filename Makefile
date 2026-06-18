@@ -104,7 +104,7 @@ disk-clean:
 build/disk.img:
 	@mkdir -p build
 	@echo "=== Creating 16MB FAT32 disk image ==="
-	dd if=/dev/zero of=build/disk.img bs=1M count=16
+	dd if=/dev/zero of=build/disk.img bs=1M count=64
 	python3 tools/mkfat32.py build/disk.img
 	@echo "=== Adding test file to disk ==="
 	python3 tools/add_file.py build/disk.img "Hello from FAT32!" test.txt
@@ -119,8 +119,8 @@ vortexfs-disk-clean:
 
 build/vortexfs.img:
 	@mkdir -p build
-	@echo "=== Creating 16MB VortexFS disk image ==="
-	python3 tools/mkvortexfs.py build/vortexfs.img 16
+	@echo "=== Creating 64MB VortexFS disk image ==="
+	python3 tools/mkvortexfs.py build/vortexfs.img 64
 	@echo "=== VortexFS image ready: build/vortexfs.img ==="
 
 build/kernel.bin: $(ALL_OBJS)
@@ -245,18 +245,15 @@ userspace:
 # путь от корня FAT32.
 disk-with-apps: disk userspace
 	@echo "=== Adding userspace programs to FAT32 /bin ==="
-	python3 tools/add_file.py build/disk.img userspace/hello bin/hello
-	python3 tools/add_file.py build/disk.img userspace/vortexgraph bin/vgraph
-	python3 tools/add_file.py build/disk.img userspace/test_window bin/testwin
-	python3 tools/add_file.py build/disk.img userspace/vsh bin/vsh
 	python3 tools/add_file.py build/disk.img userspace/vwm bin/vwm
 	python3 tools/add_file.py build/disk.img userspace/vterm bin/vterm
-	python3 tools/add_file.py build/disk.img userspace/vdemo bin/vdemo
 	python3 tools/add_file.py build/disk.img userspace/vfiles bin/vfiles
-	python3 tools/add_file.py build/disk.img userspace/vuidemo bin/vuidemo
 	python3 tools/add_file.py build/disk.img userspace/vsettings bin/vsettings
 	python3 tools/add_file.py build/disk.img userspace/vpanel bin/vpanel
 	python3 tools/add_file.py build/disk.img userspace/vinit bin/vinit
+	python3 tools/add_file.py build/disk.img userspace/vlogin bin/vlogin
+	python3 tools/add_file.py build/disk.img userspace/vcalc bin/vcalc
+	python3 tools/add_file.py build/disk.img userspace/vedit bin/vedit
 	@echo "=== Adding /bin utilities (ls, cat, rm, find, ...) ==="
 	python3 tools/add_file.py build/disk.img userspace/bin/vctl bin/vctl
 	python3 tools/add_file.py build/disk.img userspace/bin/ls bin/ls
@@ -282,6 +279,12 @@ disk-with-apps: disk userspace
 	@echo "=== Adding vinit service configs (/etc/vinit) ==="
 	python3 tools/add_file.py build/disk.img userspace/etc/vinit/10-vwm.svc etc/vinit/10-vwm.svc
 	python3 tools/add_file.py build/disk.img userspace/etc/vinit/20-panel.svc etc/vinit/20-panel.svc
+	python3 tools/add_file.py build/disk.img userspace/etc/vinit/30-login.svc etc/vinit/30-login.svc
+	@echo "=== Adding TTF font (/etc/fonts) ==="
+	python3 tools/add_file.py build/disk.img --mkdir etc/fonts
+	python3 tools/add_file.py build/disk.img userspace/etc/fonts/JetBrainsMono-Regular.ttf etc/fonts/JetBrainsMono-Regular.ttf
+	python3 tools/add_file.py build/disk.img userspace/etc/fonts/AdwaitaMono-Regular.ttf etc/fonts/AdwaitaMono-Regular.ttf
+	python3 tools/add_file.py build/disk.img userspace/etc/fonts/AdwaitaSans-Regular.ttf etc/fonts/AdwaitaSans-Regular.ttf
 	@echo "=== FAT32 disk with apps ready ==="
 
 # --- VortexFS disk с приложениями (заменяет FAT32 как корневую FS) ----------
@@ -289,18 +292,15 @@ disk-with-apps: disk userspace
 # fallback, но `make vortexfs-with-apps` + `make run` = VortexFS root.
 vortexfs-with-apps: vortexfs-disk userspace
 	@echo "=== Adding userspace programs to VortexFS /bin ==="
-	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/hello bin/hello
-	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vortexgraph bin/vgraph
-	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/test_window bin/testwin
-	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vsh bin/vsh
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vwm bin/vwm
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vterm bin/vterm
-	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vdemo bin/vdemo
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vfiles bin/vfiles
-	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vuidemo bin/vuidemo
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vsettings bin/vsettings
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vpanel bin/vpanel
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vinit bin/vinit
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vlogin bin/vlogin
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vcalc bin/vcalc
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/vedit bin/vedit
 	@echo "=== Adding /bin utilities (ls, cat, rm, find, ...) ==="
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/vctl bin/vctl
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/bin/ls bin/ls
@@ -326,4 +326,10 @@ vortexfs-with-apps: vortexfs-disk userspace
 	@echo "=== Adding vinit service configs (/etc/vinit) ==="
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/etc/vinit/10-vwm.svc etc/vinit/10-vwm.svc
 	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/etc/vinit/20-panel.svc etc/vinit/20-panel.svc
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/etc/vinit/30-login.svc etc/vinit/30-login.svc
+	@echo "=== Adding TTF font (/etc/fonts) ==="
+	python3 tools/add_vortexfs_file.py build/vortexfs.img --mkdir etc/fonts
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/etc/fonts/JetBrainsMono-Regular.ttf etc/fonts/JetBrainsMono-Regular.ttf
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/etc/fonts/AdwaitaMono-Regular.ttf etc/fonts/AdwaitaMono-Regular.ttf
+	python3 tools/add_vortexfs_file.py build/vortexfs.img userspace/etc/fonts/AdwaitaSans-Regular.ttf etc/fonts/AdwaitaSans-Regular.ttf
 	@echo "=== VortexFS disk with apps ready ==="

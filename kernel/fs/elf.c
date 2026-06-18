@@ -7,8 +7,12 @@
 
 extern void* kmalloc(uint64_t size);
 extern void* kmalloc_aligned(uint64_t size, uint64_t align);
+extern void* kmalloc_aligned2(uint64_t size, uint64_t align, void **raw_out);
 extern void fb_puts(const char *s);
 extern pte_t *vmm_kernel_pml4;
+extern uint64_t pmm_alloc(void);
+extern uint64_t pmm_alloc_zero(void);
+extern void     pmm_free(uint64_t phys_addr);
 
 void mem_memset(void *ptr, int value, size_t num) {
     uint8_t *p = (uint8_t *)ptr;
@@ -152,11 +156,23 @@ elf_load_result_t elf_load(const char *path) {
 
     serial_write("[ELF] Valid ELF64 x86_64 executable\n");
 
-    // Load program headers
+    /* Demand paging: вместо чтения всего PT_LOAD сегмента в kmalloc'd буфер
+     * и постраничного маппинга, теперь только регистрируем VMA в текущей
+     * задаче — физические страницы выделяются в обработчике #PF (см.
+     * pf_demand_load ниже) по мере обращения. ELF-узел остаётся открытым
+     * до task_exit, который закроет его. */
+    task_t *cur = sched_current();
+    if (!cur) {
+        serial_write("[ELF] Error: no current task\n");
+        vfs_close(node);
+        return result;
+    }
+    cur->n_vmas = 0;
+
     for (int i = 0; i < ehdr.e_phnum; i++) {
         Elf64_Phdr phdr;
         uint64_t offset = ehdr.e_phoff + (i * ehdr.e_phentsize);
-        
+
         if (vfs_read(node, offset, sizeof(Elf64_Phdr), (uint8_t*)&phdr) != sizeof(Elf64_Phdr)) {
             serial_write("[ELF] Error: Could not read program header\n");
             continue;
@@ -165,182 +181,30 @@ elf_load_result_t elf_load(const char *path) {
         if (phdr.p_type != PT_LOAD) continue;
         if (phdr.p_memsz == 0) continue;
 
-        serial_write("[ELF] Loading segment: vaddr=");
-        // Simple hex print
-        char hexbuf[20];
-        uint64_t addr = phdr.p_vaddr;
-        int pos = 0;
-        hexbuf[pos++] = '0';
-        hexbuf[pos++] = 'x';
-        for (int shift = 60; shift >= 0; shift -= 4) {
-            int digit = (addr >> shift) & 0xF;
-            hexbuf[pos++] = digit < 10 ? '0' + digit : 'a' + digit - 10;
-        }
-        hexbuf[pos] = '\0';
-        serial_write(hexbuf);
-        serial_write("\n");
-
-        // Calculate alignment offset within page
-        uint64_t vaddr_offset = phdr.p_vaddr & 0xFFF;
-        
-        // Allocate physical memory for segment, page-aligned
-        // Add extra space for alignment offset
-        /* ФИКС УТЕЧКИ: raw-указатель kmalloc регистрируем на текущей задаче —
-         * task_exit сделает kfree. Раньше сегменты жили вечно (сотни КБ на
-         * каждый запуск приложения). */
-        void *seg_raw = 0;
-        void *segment_phys = kmalloc_aligned2(phdr.p_memsz + vaddr_offset + 4096, 4096, &seg_raw);
-        if (!segment_phys) {
-            serial_write("[ELF] Error: Out of memory\n");
+        if (cur->n_vmas >= TASK_MAX_VMAS) {
+            serial_write("[ELF] Error: too many PT_LOAD segments\n");
             vfs_close(node);
             return result;
         }
-        if (task_track_alloc(0, seg_raw) < 0)
-            serial_write("[ELF] WARN: alloc list full, segment will leak\n");
 
-        // Zero out entire allocation (for BSS and alignment padding)
-        mem_memset(segment_phys, 0, phdr.p_memsz + vaddr_offset);
+        uint64_t va_start = phdr.p_vaddr & ~0xFFFULL;                       /* page-align вниз */
+        uint64_t va_end   = (phdr.p_vaddr + phdr.p_memsz + 0xFFFULL) & ~0xFFFULL; /* вверх */
+        /* file_offset для page va: file_offset + (va - va_start). При aligned
+         * p_vaddr (vaddr_offset = 0) это совпадает с phdr.p_offset. */
+        uint64_t vaddr_offset = phdr.p_vaddr & 0xFFFULL;
+        uint64_t file_off_base = phdr.p_offset - vaddr_offset;
 
-        // Load file data if present - IMPORTANT: add vaddr_offset!
-        if (phdr.p_filesz > 0) {
-            if (vfs_read(node, phdr.p_offset, phdr.p_filesz, (uint8_t*)segment_phys + vaddr_offset) != phdr.p_filesz) {
-                serial_write("[ELF] Error: Could not read segment data\n");
-                vfs_close(node);
-                return result;
-            }
-        }
-
-        // Get physical address via page table walk (correct for heap memory)
-        // NOTE: vmm_kernel_virt_to_phys uses HHDM arithmetic which is WRONG for heap
-        // Heap is mapped via pmm_alloc, not HHDM. Use page table walk instead.
-        uint64_t segment_virt = (uint64_t)segment_phys;
-        // segment_phys was allocated with kmalloc_aligned(4096) so it IS page-aligned
-        // Walk the kernel page table to find the real physical address
-        uint64_t segment_phys_raw = vmm_virt_to_phys(vmm_kernel_pml4, segment_virt);
-        if (!segment_phys_raw) {
-            serial_write("[ELF] Error: vmm_virt_to_phys returned 0 for heap buffer!\n");
-            vfs_close(node);
-            return result;
-        }
-        uint64_t segment_phys_aligned = segment_phys_raw; // Already page-aligned
-        
-        serial_write("[ELF] segment_virt=");
-        char svbuf[20];
-        int svp = 0;
-        svbuf[svp++] = '0';
-        svbuf[svp++] = 'x';
-        for (int shift = 60; shift >= 0; shift -= 4) {
-            int digit = (segment_virt >> shift) & 0xF;
-            svbuf[svp++] = digit < 10 ? '0' + digit : 'a' + digit - 10;
-        }
-        svbuf[svp] = '\0';
-        serial_write(svbuf);
-        
-        serial_write(", segment_phys_raw=");
-        char sprb[20];
-        int spr = 0;
-        sprb[spr++] = '0';
-        sprb[spr++] = 'x';
-        for (int shift = 60; shift >= 0; shift -= 4) {
-            int digit = (segment_phys_raw >> shift) & 0xF;
-            sprb[spr++] = digit < 10 ? '0' + digit : 'a' + digit - 10;
-        }
-        sprb[spr] = '\0';
-        serial_write(sprb);
-        
-        serial_write(", aligned=");
-        char spab[20];
-        int spa = 0;
-        spab[spa++] = '0';
-        spab[spa++] = 'x';
-        for (int shift = 60; shift >= 0; shift -= 4) {
-            int digit = (segment_phys_aligned >> shift) & 0xF;
-            spab[spa++] = digit < 10 ? '0' + digit : 'a' + digit - 10;
-        }
-        spab[spa] = '\0';
-        serial_write(spab);
-        serial_write("\n");
-        
-        // Map to userspace vaddr
-        uint64_t vaddr_start = phdr.p_vaddr & ~0xFFF; // Page align
-        // vaddr_offset already calculated above
-        
-        serial_write("[ELF] Mapping ");
-        
-        // Calculate number of pages needed (INCLUDING offset!)
-        size_t total_size = phdr.p_memsz + vaddr_offset;
-        size_t num_pages = (total_size + 4095) / 4096;
-        
-        char npbuf[20];
-        int np = 0;
-        npbuf[np++] = '0' + (num_pages / 10);
-        npbuf[np++] = '0' + (num_pages % 10);
-        npbuf[np] = '\0';
-        serial_write(npbuf);
-        serial_write(" pages, offset=");
-        char obuf[20];
-        int op = 0;
-        obuf[op++] = '0';
-        obuf[op++] = 'x';
-        for (int shift = 12; shift >= 0; shift -= 4) {
-            int digit = (vaddr_offset >> shift) & 0xF;
-            obuf[op++] = digit < 10 ? '0' + digit : 'a' + digit - 10;
-        }
-        obuf[op] = '\0';
-        serial_write(obuf);
-        serial_write("\n");
-        
-        for (size_t p = 0; p < num_pages; p++) {
-            uint64_t vaddr = vaddr_start + (p * 4096);
-            /* Получаем физический адрес каждой страницы отдельно — куча
-             * не гарантирует физическую непрерывность страниц. */
-            uint64_t kvirt_page = (segment_virt & ~0xFFFULL) + (p * 4096);
-            uint64_t paddr = vmm_virt_to_phys(vmm_kernel_pml4, kvirt_page);
-            if (!paddr) {
-                serial_write("  [ELF] WARN: vmm_virt_to_phys=0 for page ");
-                serial_write("\n");
-                continue;
-            }
-            
-            serial_write("  [ELF] Map page vaddr=");
-            char vbuf[20];
-            int vp = 0;
-            vbuf[vp++] = '0';
-            vbuf[vp++] = 'x';
-            for (int shift = 60; shift >= 0; shift -= 4) {
-                int digit = (vaddr >> shift) & 0xF;
-                vbuf[vp++] = digit < 10 ? '0' + digit : 'a' + digit - 10;
-            }
-            vbuf[vp] = '\0';
-            serial_write(vbuf);
-            
-            serial_write(" -> paddr=");
-            char pbuf[20];
-            int pp = 0;
-            pbuf[pp++] = '0';
-            pbuf[pp++] = 'x';
-            for (int shift = 60; shift >= 0; shift -= 4) {
-                int digit = (paddr >> shift) & 0xF;
-                pbuf[pp++] = digit < 10 ? '0' + digit : 'a' + digit - 10;
-            }
-            pbuf[pp] = '\0';
-            serial_write(pbuf);
-            serial_write("\n");
-            
-            // Map into USER page table as user-accessible
-            vmm_map(user_pml4, vaddr, paddr, VMM_PRESENT | VMM_WRITABLE | VMM_USER);
-            
-            // DEBUG: Verify the mapping has USER flag
-            uint64_t verify_phys = vmm_virt_to_phys(user_pml4, vaddr);
-            if (!verify_phys) {
-                serial_write("  [ELF] ERROR: Just-mapped page not visible!\n");
-            }
-        }
-
-        serial_write("[ELF] Mapped to userspace vaddr\n");
+        elf_vma_t *v = &cur->vmas[cur->n_vmas++];
+        v->vaddr_start    = va_start;
+        v->vaddr_end      = va_end;
+        v->file_offset    = file_off_base;
+        v->file_end_vaddr = phdr.p_vaddr + phdr.p_filesz;
+        v->flags = VMM_PRESENT | VMM_WRITABLE | VMM_USER;
     }
 
-    vfs_close(node);
+    /* ELF-узел сохраняем в задаче — pf_demand_load будет читать страницы
+     * из него по запросу, а task_exit закроет его. */
+    cur->elf_node = node;
     
     // Return the entry point from ELF header
     result.entry_point = ehdr.e_entry;
@@ -392,4 +256,62 @@ elf_load_result_t elf_load(const char *path) {
     serial_write("[ELF] User stack mapped at 0x800000\n");
 
     return result;
+}
+
+/* =============================================================================
+ * pf_demand_load — обработчик page fault от idt.c.
+ *
+ * Вызывается ТОЛЬКО для user-mode #PF (CPL=3). Если cr2 попадает в один из
+ * VMA текущей задачи — выделяем физическую страницу через pmm_alloc, читаем
+ * нужный кусок файла (или зануляем, если за filesz), мапим в user_pml4.
+ * После return обратно в idt.c инструкция CPU перезапускается и теперь
+ * видит замапленную страницу.
+ *
+ * Не наша зона ответственности (cr2 вне всех VMA / err указывает на
+ * нарушение прав, а не на отсутствующую страницу) — возвращаем -1, и
+ * idt.c убивает задачу как раньше.
+ * ============================================================================= */
+int pf_demand_load(task_t *t, uint64_t cr2, uint64_t err) {
+    if (!t || !t->elf_node) return -1;
+    /* Бит 0 err: 0 = страница не present (наш случай), 1 = protection fault.
+     * Protection fault (запись в read-only и т.п.) — это уже не demand load. */
+    if (err & 0x1) return -1;
+    /* Бит 3 err: reserved-bit set — баг в таблицах, не наш случай. */
+    if (err & 0x8) return -1;
+
+    uint64_t page_va = cr2 & ~0xFFFULL;
+
+    for (uint8_t i = 0; i < t->n_vmas; i++) {
+        elf_vma_t *v = &t->vmas[i];
+        if (page_va < v->vaddr_start || page_va >= v->vaddr_end) continue;
+
+        uint64_t phys = pmm_alloc();
+        if (!phys) return -1;
+
+        /* Запись в свежую страницу через HHDM (всё физическое отображено
+         * по +HHDM_OFFSET, см. vmm_init). */
+        uint8_t *kbuf = (uint8_t *)(phys + HHDM_OFFSET);
+        mem_memset(kbuf, 0, 4096);
+
+        /* Загружаем содержимое файла, если эта страница не целиком в BSS. */
+        if (page_va < v->file_end_vaddr) {
+            uint64_t file_off = v->file_offset + (page_va - v->vaddr_start);
+            uint64_t bytes = 4096;
+            if (page_va + 4096 > v->file_end_vaddr)
+                bytes = v->file_end_vaddr - page_va;
+            int32_t got = vfs_read((vfs_node_t *)t->elf_node,
+                                   (uint32_t)file_off,
+                                   (uint32_t)bytes,
+                                   kbuf);
+            if (got < 0) {
+                pmm_free(phys);
+                return -1;
+            }
+            /* Хвост страницы за filesz уже занулён memset'ом выше. */
+        }
+
+        vmm_map((pte_t *)t->pml4, page_va, phys, v->flags);
+        return 0;
+    }
+    return -1;
 }

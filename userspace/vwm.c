@@ -22,18 +22,28 @@
 
 #include "vos_abi.h"
 #include "font8x16.h"
+#include "vfont_ui.h"
+
+/* vwm — standalone-бинарь без libc. GCC при копии больших структур
+ * (vwin_t с 8 KB title-cache) генерирует вызов memcpy — подсовываем свой. */
+void *memcpy(void *dst, const void *src, unsigned long n) {
+    unsigned char *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
 
 /* ---------------------------------------------------------------------------
  * Геометрия и палитра (соответствуют kernel simple_wm, чтобы вид не менялся)
  * ------------------------------------------------------------------------- */
-#define TITLEBAR_H    26
-#define WIN_CORNER    10
-#define WIN_SHADOW    10
-#define WIN_SHADOW_OY 4
+#define TITLEBAR_H    32   /* GNOME-стиль: более высокий заголовок */
+#define WIN_CORNER    12   /* GNOME-стиль: больше скругление */
+#define WIN_SHADOW    18   /* больше радиус — мягче */
+#define WIN_SHADOW_OY 8    /* смещение вниз: тень больше снизу, как в Windows/macOS */
 #define WIN_MARGIN    (WIN_SHADOW + WIN_SHADOW_OY)
-#define BTN_R         5
-#define BTN_GAP       16
-#define BTN_X0        14
+#define BTN_R         6    /* GNOME-стиль: чуть больше кнопки */
+#define BTN_GAP       22   /* GNOME-стиль: отступ между кнопками */
+#define BTN_X0        14   /* отступ от правого края до первой кнопки (справа) */
 
 #define RESIZE_BORDER 6
 #define RZ_TOP_INNER  3   /* зона ресайза ВНУТРИ титлбара — узкая, чтобы не съедать drag */
@@ -66,6 +76,14 @@ static uint8_t mouse_buttons;
 /* ---------------------------------------------------------------------------
  * Окна
  * ------------------------------------------------------------------------- */
+/* Состояние scale-from-dock анимации окна. */
+#define ANIM_NONE        0
+#define ANIM_OPENING     1   /* растёт из dock-launcher'а */
+#define ANIM_CLOSING     2   /* стягивается к launcher; по окончании — close_window */
+#define ANIM_MINIMIZING  3   /* стягивается к чипу окна; по окончании — minimized = 1 */
+#define ANIM_RESTORING   4   /* растёт из чипа окна; по окончании — обычная отрисовка */
+#define ANIM_MS          240
+
 typedef struct {
     uint64_t id;                /* 0 = слот свободен */
     uint64_t owner_pid;         /* клиент, чтобы слать события */
@@ -76,11 +94,48 @@ typedef struct {
     int maximized;              /* 🟢 развёрнуто на весь рабочий стол    */
     int rest_x, rest_y, rest_w, rest_h;  /* геометрия до maximize        */
     char title[32];
+    /* TTF-кэш заголовка: alpha-coverage bitmap. Пересчитывается ТОЛЬКО при
+     * смене win->title (см. win_invalidate_title_cache). При drag — просто
+     * блит через alpha без TTF/stb_truetype. Хватит на title 256x32. */
+    uint8_t  title_cov[256 * 32];
+    int      title_cw, title_ch;
+    int      title_cached;      /* 0 = надо перерисовать в кэш */
+    /* Scale-from-dock анимация. t ∈ [0..1] идёт от src к dst (lerp).
+     *   OPENING:  src = dock-icon-rect, dst = окно (win-geom)
+     *   CLOSING:  src = окно (win-geom),  dst = dock-icon-rect
+     * anim_start_t — PIT-тики (vos_uptime()), длительность ANIM_MS мс
+     * (= ANIM_MS/10 тиков, PIT у нас 100 Гц). */
+    int      anim_state;
+    uint64_t anim_start_t;
+    int      anim_src_x, anim_src_y, anim_src_w, anim_src_h;
+    int      anim_dst_x, anim_dst_y, anim_dst_w, anim_dst_h;
+    int      dock_kind;         /* для CLOSING-анимации: куда стягиваться;
+                                 * -1 = не из дока, целимся в центр дока */
+    /* Bbox последнего отрисованного кадра анимации — нужен для damage
+     * union(prev, current): чтобы не перерисовывать обои на пол-экрана
+     * каждый тик, а чистить только «уехавшую» зону. */
+    int      anim_prev_x, anim_prev_y, anim_prev_w, anim_prev_h;
+    int      anim_has_prev;
+
 } vwin_t;
+
+/* Chrome subsurface: ОДИН глобальный буфер на все окна — иначе 16 × 164 KB
+ * раздуют BSS и не влезут в VortexFS. На drag фокус не меняется, окно одно —
+ * один rebuild + N blits, идеально. Когда rendered_for_id меняется (фокус
+ * перескочил, рисуем другое окно) — пересобираем. */
+#define CHROME_MAX_W 1280
+static uint32_t g_chrome_buf[CHROME_MAX_W * TITLEBAR_H];
+static uint64_t g_chrome_for_id = 0;
+static int      g_chrome_w = 0;
+static int      g_chrome_focused = 0;
 
 static vwin_t windows[MAX_WINDOWS];
 static uint64_t next_win_id = 1;
 static uint64_t focused_id = 0;
+
+/* Lock screen: если != 0, рисуем только окно с этим id — обои/панель/док
+ * /остальные окна СКРЫТЫ. Используется vlogin'ом. UNLOCK -> 0. */
+static uint64_t g_lock_win = 0;
 
 /* drag / resize — порт состояний из kernel simple_wm */
 static struct {
@@ -234,6 +289,116 @@ static void draw_string_t(int x, int y, const char *s, uint32_t fg) {
         s++;
     }
 }
+/* UI-текст (заголовки окон, тултипы дока): AdwaitaSans если загружен,
+ * иначе fallback на встроенный bitmap font8x16 (draw_string_t). bg=0 ->
+ * прозрачный фон (рисуем только глифы). */
+static void draw_ui_text(int x, int y, const char *s, uint32_t fg) {
+    if (vfont_ui) vfont_draw(bb, (int)fbw, (int)fbh, x, y, s, fg, 0, vfont_ui);
+    else draw_string_t(x, y, s, fg);
+}
+
+/* ---------------------------------------------------------------------------
+ * Title-cache: TTF — самая дорогая операция в кадре vwm (растеризация
+ * через stb_truetype с alpha-блендингом). Заголовок окна не меняется во
+ * время drag/resize, так что один раз растеризуем его в alpha-coverage
+ * bitmap, а потом просто блитим этот bitmap с переменным цветом fg.
+ * ------------------------------------------------------------------------- */
+static void title_cache_rebuild(vwin_t *win) {
+    win->title_cw = 0;
+    win->title_ch = 0;
+    if (!vfont_ui || !vfont_ui->ok) { win->title_cached = 1; return; }
+
+    int tw = vfont_ui_text_width(win->title);
+    int th = vfont_ui_line_height();
+    if (tw > 256) tw = 256;
+    if (th > 32)  th = 32;
+    if (tw <= 0 || th <= 0) { win->title_cached = 1; return; }
+
+    for (int i = 0; i < tw * th; i++) win->title_cov[i] = 0;
+
+    /* Бежим по символам, складываем alpha-coverage из atlas в наш bitmap. */
+    vfont_t *f = vfont_ui;
+    float cur_x = 0.f;
+    int baseline_y = f->ascent;
+    const char *s = win->title;
+    while (*s) {
+        int cp = (unsigned char)*s++;
+        if (cp < VF_FIRST || cp >= VF_FIRST + VF_COUNT) {
+            cur_x += f->ch_w;
+            continue;
+        }
+        stbtt_bakedchar *bc = &f->glyphs[cp - VF_FIRST];
+        int gw = (int)(bc->x1 - bc->x0);
+        int gh = (int)(bc->y1 - bc->y0);
+        if (gw <= 0 || gh <= 0) { cur_x += bc->xadvance; continue; }
+        int sx = (int)(cur_x + 0.5f) + (int)(bc->xoff + 0.5f);
+        int sy = baseline_y + (int)(bc->yoff + 0.5f);
+        for (int row = 0; row < gh; row++) {
+            int py = sy + row;
+            if (py < 0 || py >= th) continue;
+            int ay = (int)bc->y0 + row;
+            const unsigned char *arow = f->atlas + (unsigned int)ay * VF_ATLAS_W;
+            uint8_t *drow = &win->title_cov[(unsigned int)py * tw];
+            for (int col = 0; col < gw; col++) {
+                int px = sx + col;
+                if (px < 0 || px >= tw) continue;
+                int ax = (int)bc->x0 + col;
+                unsigned int a = arow[ax];
+                if (!a) continue;
+                if (a > drow[px]) drow[px] = (uint8_t)a;   /* max-merge */
+            }
+        }
+        cur_x += bc->xadvance;
+    }
+    win->title_cw = tw;
+    win->title_ch = th;
+    win->title_cached = 1;
+}
+
+/* Блит кэшированного title в bb по заданному цвету fg (используя только
+ * coverage bitmap). Это горячий путь — без TTF, без stb_truetype. */
+static void title_cache_blit(vwin_t *win, int x, int y, uint32_t fg) {
+    if (!win->title_cached) return;
+    if (win->title_cw <= 0 || win->title_ch <= 0) {
+        /* TTF не доступен — fallback на bitmap-шрифт. */
+        draw_string_t(x, y, win->title, fg);
+        return;
+    }
+    int tw = win->title_cw, th = win->title_ch;
+    /* Клип к damage-rect (тот же, что у chrome). */
+    int x0 = 0, y0 = 0, x1 = tw, y1 = th;
+    if (x < clip_x0) x0 = clip_x0 - x;
+    if (y < clip_y0) y0 = clip_y0 - y;
+    if (x + tw > clip_x1) x1 = clip_x1 - x;
+    if (y + th > clip_y1) y1 = clip_y1 - y;
+    if (x0 >= x1 || y0 >= y1) return;
+
+    unsigned int fr = (fg >> 16) & 0xFF;
+    unsigned int fgc = (fg >>  8) & 0xFF;
+    unsigned int fb  =  fg        & 0xFF;
+
+    for (int j = y0; j < y1; j++) {
+        uint32_t *drow = &bb[(uint32_t)(y + j) * fbw + x];
+        const uint8_t *cov = &win->title_cov[(uint32_t)j * tw];
+        for (int i = x0; i < x1; i++) {
+            unsigned int a = cov[i];
+            if (!a) continue;
+            if (a == 255) {
+                drow[i] = fg;
+            } else {
+                uint32_t d = drow[i];
+                unsigned int ia = 255u - a;
+                unsigned int r = (fr  * a + ((d >> 16) & 0xFF) * ia) / 255u;
+                unsigned int g = (fgc * a + ((d >>  8) & 0xFF) * ia) / 255u;
+                unsigned int b = (fb  * a + ( d        & 0xFF) * ia) / 255u;
+                drow[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+}
+/* Ширина и высота строки текущим UI-шрифтом (для центрирования) */
+static int ui_text_width(const char *s)  { return vfont_ui_text_width(s); }
+static int ui_line_height(void)          { return vfont_ui_line_height(); }
 /* Текст с мягкой тенью — читаемость на любых обоях (метки иконок стола). */
 static void draw_string_sh(int x, int y, const char *s, uint32_t fg) {
     int cx = x;
@@ -355,7 +520,10 @@ enum {
     CUR_NSHAPES
 };
 
-static const char *const cur_rows_arrow[19] = {
+/* macOS-style курсор: чёрная заливка (`.`), белая обводка по контуру (`X`).
+ * Аккуратная, тонкая стрелка 12×18. На любых обоях видно за счёт двойного
+ * цвета — то же что делает Aqua: outer-white outline, inner-black fill. */
+static const char *const cur_rows_arrow[18] = {
     "X           ",
     "XX          ",
     "X.X         ",
@@ -369,12 +537,11 @@ static const char *const cur_rows_arrow[19] = {
     "X.........X ",
     "X......XXXXX",
     "X...X..X    ",
-    "X..XX..X    ",
+    "X..X.X..X   ",
     "X.X  X..X   ",
-    "XX   X..X   ",
-    "X     X..X  ",
-    "      X..X  ",
-    "       XX   ",
+    "XX    X..X  ",
+    "       XX X ",
+    "        XXX ",
 };
 static const char *const cur_rows_size_h[9] = {
     "    X         X    ",
@@ -450,7 +617,7 @@ typedef struct {
 } cur_shape_t;
 
 static const cur_shape_t cur_shapes[CUR_NSHAPES] = {
-    [CUR_ARROW]     = { 12, 19, 0, 0, cur_rows_arrow     },
+    [CUR_ARROW]     = { 12, 18, 0, 0, cur_rows_arrow     },
     [CUR_SIZE_H]    = { 19,  9, 9, 4, cur_rows_size_h    },
     [CUR_SIZE_V]    = {  9, 19, 4, 9, cur_rows_size_v    },
     [CUR_SIZE_NWSE] = { 15, 15, 7, 7, cur_rows_size_nwse },
@@ -459,8 +626,38 @@ static const cur_shape_t cur_shapes[CUR_NSHAPES] = {
 
 static int cur_shape = CUR_ARROW;             /* текущая форма (hover)      */
 
+/* Hardware-курсор: если virtio-gpu cursorq доступна, ядро рисует sprite
+ * в отдельном слое, и vwm полностью отказывается от композита спрайта.
+ * Это снимает per-frame work с курсора и оставляет его плавным даже когда
+ * сцена тормозит (анимация, drag тяжёлого окна). */
+static int hw_cursor_ok = 0;
+
 /* где курсор «запечён» в back buffer после последнего кадра */
 static int last_cx, last_cy, last_cw, last_ch, last_cur_valid = 0;
+
+/* Подготовить спрайт стрелки 64×64 BGRA и отдать ядру для HW-курсора.
+ * cur_rows_arrow — 12×19 ASCII-art: 'X' = чёрный контур, '.' = белая
+ * заливка. На virtio-gpu фиксированный размер 64×64; рисуем стрелку в
+ * верхний-левый угол с hot_x=0/hot_y=0 (как было в исходных hx/hy). */
+static void hw_cursor_init(void) {
+    static uint32_t sprite[64 * 64] __attribute__((aligned(16)));
+    for (int i = 0; i < 64 * 64; i++) sprite[i] = 0;          /* прозрачный */
+    const cur_shape_t *s = &cur_shapes[CUR_ARROW];
+    for (int j = 0; j < s->h && j < 64; j++) {
+        const char *row = s->rows[j];
+        for (int i = 0; i < s->w && i < 64; i++) {
+            char c = row[i];
+            uint32_t px = 0;
+            if (c == 'X')      px = 0xFF000000u;              /* чёрный  */
+            else if (c == '.') px = 0xFFFFFFFFu;              /* белый   */
+            sprite[j * 64 + i] = px;
+        }
+    }
+    if (vos_cursor_set(sprite, s->hx, s->hy) == 0) {
+        hw_cursor_ok = 1;
+        vos_cursor_move(mouse_x, mouse_y);
+    }
+}
 
 static void cursor_sprite(const cur_shape_t *s, int x, int y) {
     for (int j = 0; j < s->h; j++) {
@@ -563,6 +760,7 @@ static void fill_wall(int x, int y, int w, int h) {
 #define DOCK_PAD    12
 #define DOCK_GAP    12
 #define DOCK_BOTTOM 16
+#define DOCK_SEP_W  16   /* зазор + место под разделительную полоску */
 
 /* Ярлыки приложений (бывшие иконки рабочего стола — стол оставляем чистым
  * под будущие пользовательские виджеты/папки/ярлыки, как в macOS). */
@@ -570,17 +768,46 @@ typedef struct { const char *path; const char *label; int kind; } dock_item_t;
 static const dock_item_t dock_items[] = {
     { "/bin/vterm",  "Terminal", 0 },
     { "/bin/vfiles", "Files",    1 },
-    { "/bin/vdemo",  "Window",   2 },
+    { "/bin/vcalc",  "Calculator", 2 },
     { "/bin/vsettings", "Settings", 3 },
 };
 #define DOCK_NITEMS ((int)(sizeof(dock_items) / sizeof(dock_items[0])))
 
-static int dock_hover = -1;
+static int dock_hover = -1;     /* индекс: 0..DOCK_NITEMS-1 launcher,
+                                 *         DOCK_NITEMS+k — k-е окно */
 static int dock_pressed = 0;
 
+/* Pending spawn от dock-launcher'а: запомнили rect иконки и время, ждём
+ * пока приложение пришлёт VWM_CREATE. on_create привяжет к окну OPENING
+ * анимацию из этого rect. TTL 200 тиков (2 сек). */
+static int      pending_open_valid = 0;
+static int      pending_open_x, pending_open_y, pending_open_w, pending_open_h;
+static int      pending_open_path_kind = -1;   /* для match'а с тем же лаунчером (если нужно) */
+static uint64_t pending_open_t = 0;
+
+/* Сколько окон сейчас живёт (для раскладки чипов справа от разделителя). */
+static int dock_window_count(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) if (windows[i].id) n++;
+    return n;
+}
+/* Маппинг dock-slot (0..N-1) -> индекс в windows[]. */
+static int dock_slot_to_winidx(int slot) {
+    int n = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!windows[i].id) continue;
+        if (n == slot) return i;
+        n++;
+    }
+    return -1;
+}
+
 static void dock_geometry(int *dx, int *dy, int *dw, int *dh) {
+    int nwin = dock_window_count();
+    int total = DOCK_NITEMS + nwin;
+    int sep = (nwin > 0) ? DOCK_SEP_W : 0;
     int h = DOCK_ICON + DOCK_PAD * 2;
-    int w = DOCK_NITEMS * DOCK_ICON + (DOCK_NITEMS - 1) * DOCK_GAP + DOCK_PAD * 2;
+    int w = total * DOCK_ICON + (total - 1) * DOCK_GAP + DOCK_PAD * 2 + sep;
     *dx = ((int)fbw - w) / 2;
     *dy = (int)fbh - h - DOCK_BOTTOM;
     *dw = w; *dh = h;
@@ -589,14 +816,17 @@ static void dock_icon_rect(int idx, int *ix, int *iy) {
     int dx, dy, dw, dh;
     dock_geometry(&dx, &dy, &dw, &dh);
     (void)dw; (void)dh;
-    *ix = dx + DOCK_PAD + idx * (DOCK_ICON + DOCK_GAP);
+    int x = dx + DOCK_PAD + idx * (DOCK_ICON + DOCK_GAP);
+    if (idx >= DOCK_NITEMS) x += DOCK_SEP_W;   /* зазор после разделителя */
+    *ix = x;
     *iy = dy + DOCK_PAD;
 }
 static int dock_hit(int mx, int my) {
     int dx, dy, dw, dh;
     dock_geometry(&dx, &dy, &dw, &dh);
     if (mx < dx || mx >= dx + dw || my < dy || my >= dy + dh) return -1;
-    for (int k = 0; k < DOCK_NITEMS; k++) {
+    int total = DOCK_NITEMS + dock_window_count();
+    for (int k = 0; k < total; k++) {
         int ix, iy; dock_icon_rect(k, &ix, &iy);
         if (mx >= ix && mx < ix + DOCK_ICON && my >= iy && my < iy + DOCK_ICON)
             return k;
@@ -652,13 +882,19 @@ static void dock_draw_tile(int kind, int x, int y, int s, int pressed) {
         fill_rect(x + 8,  y + 14, 14, 5,  fold);    /* язычок */
         fill_rect(x + 8,  y + 18, 32, 18, fold);    /* корпус */
         fill_rect(x + 8,  y + 18, 32, 3,  foldhi);  /* блик   */
-    } else if (kind == 2) {                /* Window: демо-окно */
-        fill_round(x, y, s, s, 11, 0xFFEAEAF0, 255);
-        fill_rect(x + 8,  y + 10, 32, 28, 0xFFFFFFFF);
-        fill_rect(x + 8,  y + 10, 32, 7,  0xFF3D6FB5);
-        fill_rect(x + 12, y + 22, 24, 2,  0xFFB8C2D0);
-        fill_rect(x + 12, y + 27, 24, 2,  0xFFB8C2D0);
-        fill_rect(x + 12, y + 32, 16, 2,  0xFFB8C2D0);
+    } else if (kind == 2) {                /* Calculator */
+        fill_round(x, y, s, s, 11, 0xFF1A1E2A, 255);
+        for (int i = 3; i < s - 3; i++) dock_put_blend(x + i, y + 2, 0xFFFFFFFF, 16);
+        /* Дисплей сверху */
+        fill_rect(x + 7,  y + 8,  34, 9,  0xFF0E1118);
+        /* Кнопки 3×3 */
+        uint32_t b = 0xFF3C4054, op = 0xFFFF9F2D;
+        for (int row = 0; row < 3; row++) {
+            for (int col = 0; col < 3; col++) {
+                fill_rect(x + 7 + col * 11, y + 20 + row * 8, 8, 6, b);
+            }
+            fill_rect(x + 7 + 3 * 11, y + 20 + row * 8, 8, 6, op);  /* столбец операций */
+        }
     } else {                               /* Settings: шестерёнка */
         fill_round(x, y, s, s, 11, 0xFF2A2A36, 255);
         for (int i = 3; i < s - 3; i++) dock_put_blend(x + i, y + 2, 0xFFFFFFFF, 16);
@@ -675,39 +911,125 @@ static void dock_draw_tile(int kind, int x, int y, int s, int pressed) {
         fill_circle(cx, cy, 4, 0xFF2A2A36);   /* отверстие */
     }
 }
+/* Чип запущенного окна: серая плитка с инициалом, плюс индикатор-точка снизу
+ * (запущено всегда, цвет акцентом для focused, приглушённый для minimized). */
+static void dock_draw_window_tile(int slot, int x, int y, int s, int pressed) {
+    if (pressed) { x += 1; y += 1; }
+    int wi = dock_slot_to_winidx(slot);
+    if (wi < 0) return;
+    vwin_t *w = &windows[wi];
+    int focused  = (w->id == focused_id) && !w->minimized;
+    int minimized = w->minimized;
+
+    uint32_t bg = focused ? 0xFF3A4566 : (minimized ? 0xFF1A1E2A : 0xFF2A2F44);
+    fill_round(x, y, s, s, 11, bg, 255);
+    for (int i = 3; i < s - 3; i++) dock_put_blend(x + i, y + 2, 0xFFFFFFFF, 16);
+
+    /* Инициал из заголовка — крупный, по центру. */
+    char init[2] = { 0, 0 };
+    for (int i = 0; w->title[i]; i++) {
+        char c = w->title[i];
+        if (c == ' ' || c == '\t') continue;
+        if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+        init[0] = c;
+        break;
+    }
+    if (!init[0]) init[0] = '?';
+    int tw = ui_text_width(init);
+    int lh = ui_line_height();
+    uint32_t fg = minimized ? 0xFF9099AC : 0xFFEDF0F8;
+    draw_ui_text(x + (s - tw) / 2, y + (s - lh) / 2, init, fg);
+
+    /* Индикатор-точка под чипом. */
+    int dot_y = y + s - 3;
+    int dot_x = x + s / 2;
+    uint32_t dot = focused ? 0xFF5B8CFF : 0xFF9099AC;
+    fill_circle(dot_x, dot_y, 2, dot);
+}
+
 static void draw_dock(void) {
     int dx, dy, dw, dh;
     dock_geometry(&dx, &dy, &dw, &dh);
-    int r = dh / 2;
+    int nwin = dock_window_count();
+    int total = DOCK_NITEMS + nwin;
+    /* macOS-style: мягкий round-rect, не круглые торцы. Радиус ~28% высоты
+     * (~20 px при dh=72) даёт характерный «squircle-ish» силуэт дока. */
+    int r = dh * 28 / 100;
     fill_round(dx - 2, dy + 5, dw + 4, dh, r, 0xFF000000, 45);
     fill_round(dx, dy, dw, dh, r, 0xFF22222F, 205);
     for (int i = r; i < dw - r; i++) dock_put_blend(dx + i, dy + 1, 0xFFFFFFFF, 30);
-    for (int k = 0; k < DOCK_NITEMS; k++) {
+
+    /* Вертикальный разделитель между лаунчерами и чипами окон. */
+    if (nwin > 0) {
+        int last_lx, last_ly;
+        dock_icon_rect(DOCK_NITEMS - 1, &last_lx, &last_ly);
+        (void)last_ly;
+        int sep_x = last_lx + DOCK_ICON + DOCK_GAP + (DOCK_SEP_W - 1) / 2;
+        int sep_y0 = dy + DOCK_PAD + 4;
+        int sep_y1 = dy + dh - DOCK_PAD - 4;
+        for (int y = sep_y0; y < sep_y1; y++)
+            dock_put_blend(sep_x, y, 0xFFFFFFFF, 60);
+    }
+
+    for (int k = 0; k < total; k++) {
         int ix, iy; dock_icon_rect(k, &ix, &iy);
         int hovered = (dock_hover == k);
         int pressed = (dock_pressed && dock_hover == k);
         if (hovered)
             fill_round(ix - 4, iy - 4, DOCK_ICON + 8, DOCK_ICON + 8, 14,
                        0xFFFFFFFF, pressed ? 60 : 35);
-        dock_draw_tile(dock_items[k].kind, ix, iy, DOCK_ICON, pressed);
+        if (k < DOCK_NITEMS)
+            dock_draw_tile(dock_items[k].kind, ix, iy, DOCK_ICON, pressed);
+        else
+            dock_draw_window_tile(k - DOCK_NITEMS, ix, iy, DOCK_ICON, pressed);
     }
-    if (dock_hover >= 0 && dock_hover < DOCK_NITEMS) {   /* тултип-подпись */
-        const char *t = dock_items[dock_hover].label;
-        int len = 0; while (t[len]) len++;
-        int tw = len * 8 + 14, th = 22;
+
+    /* Тултип: для лаунчера — label, для чипа окна — полный title. */
+    if (dock_hover >= 0 && dock_hover < total) {
+        const char *t;
+        char tbuf[40];
+        if (dock_hover < DOCK_NITEMS) {
+            t = dock_items[dock_hover].label;
+        } else {
+            int wi = dock_slot_to_winidx(dock_hover - DOCK_NITEMS);
+            if (wi < 0) return;
+            int n = 0;
+            while (windows[wi].title[n] && n < (int)sizeof(tbuf) - 1) {
+                tbuf[n] = windows[wi].title[n]; n++;
+            }
+            tbuf[n] = 0;
+            t = tbuf;
+        }
+        int tw = ui_text_width(t) + 14, th = 22;
         int ix, iy; dock_icon_rect(dock_hover, &ix, &iy);
         (void)iy;
         int tx = ix + DOCK_ICON / 2 - tw / 2;
         int ty = dy - th - 8;
         fill_round(tx, ty + 2, tw, th, th / 2, 0xFF000000, 60);
         fill_round(tx, ty, tw, th, th / 2, 0xFF22222F, 230);
-        draw_string_t(tx + 7, ty + (th - 16) / 2, t, 0xFFF0F2F8);
+        draw_ui_text(tx + 7, ty + (th - ui_line_height()) / 2, t, 0xFFF0F2F8);
     }
 }
 static void dock_bounds(int *x, int *y, int *w, int *h) {
-    int dx, dy, dw, dh;
-    dock_geometry(&dx, &dy, &dw, &dh);
-    *x = dx - 4; *y = dy - 34; *w = dw + 8; *h = dh + 42;   /* + тултип сверху */
+    int dy_unused, dh_curr;
+    {
+        int _x, _w;
+        dock_geometry(&_x, &dy_unused, &_w, &dh_curr);
+        (void)_x; (void)_w;
+    }
+    /* Док растёт/сжимается при изменении набора окон. Чтобы при удалении
+     * окна старый «хвост» обоев был перерисован, инвалидируем сразу
+     * максимально возможную ширину дока (DOCK_NITEMS + MAX_WINDOWS).
+     * Лишняя зона — это всё равно бэк-буфер, пересылается только видимый
+     * dmg-rect. */
+    int total_max = DOCK_NITEMS + MAX_WINDOWS;
+    int sep = DOCK_SEP_W;
+    int max_w = total_max * DOCK_ICON + (total_max - 1) * DOCK_GAP + DOCK_PAD * 2 + sep;
+    int max_x = ((int)fbw - max_w) / 2;
+    *x = max_x - 4;
+    *y = dy_unused - 34;             /* + тултип сверху */
+    *w = max_w + 8;
+    *h = dh_curr + 42;
 }
 
 /* ---------------------------------------------------------------------------
@@ -754,6 +1076,9 @@ static void panel_bounds(int *x, int *y, int *w, int *h) {
  * (id, idx/count, flags, title 23+0). count=0 -> одно msg с w1=0.
  * Зовём при любом изменении набора/фокуса/заголовков — дёшево (<=16 msgs). */
 static void panel_send_wins(void) {
+    /* Любой commit состава/состояния окон требует перерисовки дока:
+     * чипы окон живут справа от вертикального разделителя. */
+    dock_dirty = 1;
     if (!panel_pid) return;
     vos_msg_t m;
     int count = 0;
@@ -823,65 +1148,121 @@ static int isqrt32(int v) {
 static uint8_t shadow_alut[WIN_SHADOW * WIN_SHADOW];   /* d2 -> alpha */
 static void shadow_lut_init(void) {
     for (int d2 = 0; d2 < WIN_SHADOW * WIN_SHADOW; d2++) {
-        int a = 78 * (WIN_SHADOW - isqrt32(d2)) / WIN_SHADOW;
+        int a = 72 * (WIN_SHADOW - isqrt32(d2)) / WIN_SHADOW;
         shadow_alut[d2] = (uint8_t)(a > 0 ? a : 0);
     }
 }
+/* Тень в стиле Windows/macOS: асимметричная. Сверху почти нет, снизу и бокам — есть.
+ * Реализация: вертикальный модификатор альфы — dy>0 (ниже окна) полная сила,
+ * dy<0 (выше окна) сильно затухает до нуля, бока — половина силы. */
 static void win_draw_shadow(int wx, int wy, int ww, int wh) {
-    const int S = WIN_SHADOW, oy = WIN_SHADOW_OY;
-    int x0 = wx - S, y0 = wy - S + oy;
-    int x1 = wx + ww + S, y1 = wy + wh + S + oy;
-    const int r = WIN_CORNER;
+    const int S = WIN_SHADOW;
+    /* Бокс вокруг окна где рисуем тень */
+    int x0 = wx - S,     y0 = wy - S / 3;   /* сверху мало */
+    int x1 = wx + ww + S, y1 = wy + wh + S; /* снизу полно */
 
-    /* 1) внешние полосы: верх/низ — во всю ширину, бока — между ними */
+    /* Клипуем бокс к damage-rect/экрану ОДИН РАЗ — внутри цикла больше
+     * никаких per-pixel проверок границ. Тень — чисто чёрная (RGB=0),
+     * поэтому формула блендинга упрощается до dst = dst * (255-a) / 255. */
+    if (x0 < clip_x0) x0 = clip_x0;
+    if (y0 < clip_y0) y0 = clip_y0;
+    if (x1 > clip_x1) x1 = clip_x1;
+    if (y1 > clip_y1) y1 = clip_y1;
+    if (x0 >= x1 || y0 >= y1) goto corners;
+
     for (int y = y0; y < y1; y++) {
         int dy = 0;
-        if (y < wy)            dy = wy - y;
+        if (y < wy)            dy = y - wy;
         else if (y >= wy + wh) dy = y - (wy + wh) + 1;
 
-        if (dy == 0) {
-            /* строка на уровне окна: тень только слева и справа */
-            for (int x = x0; x < wx; x++) {
-                int dx = wx - x;
-                if (dx * dx >= S * S) continue;
-                int a = shadow_alut[dx * dx];
-                if (a) blend_px(x, y, (uint32_t)a << 24);
-            }
-            for (int x = wx + ww; x < x1; x++) {
-                int dx = x - (wx + ww) + 1;
-                if (dx * dx >= S * S) continue;
-                int a = shadow_alut[dx * dx];
-                if (a) blend_px(x, y, (uint32_t)a << 24);
-            }
-            continue;
+        int vmul;
+        if (dy > 0)         vmul = 256;
+        else if (dy == 0)   vmul = 140;
+        else {
+            int fade = S / 3 + dy;
+            vmul = (fade > 0) ? (fade * 256 / (S / 3)) : 0;
+            if (vmul > 140) vmul = 140;
         }
-        if (dy * dy >= S * S) continue;
-        for (int x = x0; x < x1; x++) {
-            int dx = 0;
-            if (x < wx)            dx = wx - x;
-            else if (x >= wx + ww) dx = x - (wx + ww) + 1;
-            int d2 = dx * dx + dy * dy;
+        if (vmul <= 0) continue;
+
+        uint32_t *row = &bb[(uint32_t)y * fbw];
+        int ady = dy < 0 ? -dy : dy;
+        int inside_y = (dy == 0);   /* строка внутри по вертикали */
+
+        /* Делим строку на три отрезка: левый край (dx>0), середина (внутри
+         * окна по X — пропускаем если inside_y), правый край (dx>0).
+         * Внутри окна тень не нужна — её закроет окно. */
+        int mid_x0 = wx, mid_x1 = wx + ww;
+        if (mid_x0 < x0) mid_x0 = x0;
+        if (mid_x1 > x1) mid_x1 = x1;
+
+        /* Левая «дуга» */
+        for (int x = x0; x < mid_x0; x++) {
+            int dx = wx - x;
+            int d2 = dx * dx + ady * ady;
             if (d2 >= S * S) continue;
-            int a = shadow_alut[d2];
-            if (a) blend_px(x, y, (uint32_t)a << 24);
+            int a = (int)shadow_alut[d2] * vmul >> 8;
+            if (a <= 0) continue;
+            uint32_t *p = &row[x];
+            uint32_t d = *p;
+            uint32_t ia = 255u - (uint32_t)a;
+            uint32_t r = ((d >> 16) & 0xFF) * ia / 255u;
+            uint32_t g = ((d >>  8) & 0xFF) * ia / 255u;
+            uint32_t b = ( d        & 0xFF) * ia / 255u;
+            *p = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+        /* Середина: только если строка ВЫШЕ/НИЖЕ окна (там нет блита) */
+        if (!inside_y) {
+            for (int x = mid_x0; x < mid_x1; x++) {
+                int d2 = ady * ady;
+                if (d2 >= S * S) continue;
+                int a = (int)shadow_alut[d2] * vmul >> 8;
+                if (a <= 0) continue;
+                uint32_t *p = &row[x];
+                uint32_t d = *p;
+                uint32_t ia = 255u - (uint32_t)a;
+                uint32_t r = ((d >> 16) & 0xFF) * ia / 255u;
+                uint32_t g = ((d >>  8) & 0xFF) * ia / 255u;
+                uint32_t b = ( d        & 0xFF) * ia / 255u;
+                *p = 0xFF000000u | (r << 16) | (g << 8) | b;
+            }
+        }
+        /* Правая «дуга» */
+        for (int x = mid_x1; x < x1; x++) {
+            int dx = x - (wx + ww) + 1;
+            int d2 = dx * dx + ady * ady;
+            if (d2 >= S * S) continue;
+            int a = (int)shadow_alut[d2] * vmul >> 8;
+            if (a <= 0) continue;
+            uint32_t *p = &row[x];
+            uint32_t d = *p;
+            uint32_t ia = 255u - (uint32_t)a;
+            uint32_t r = ((d >> 16) & 0xFF) * ia / 255u;
+            uint32_t g = ((d >>  8) & 0xFF) * ia / 255u;
+            uint32_t b = ( d        & 0xFF) * ia / 255u;
+            *p = 0xFF000000u | (r << 16) | (g << 8) | b;
         }
     }
 
-    /* 2) угловые выемки ВНУТРИ окна (за скруглением) — ровная тень a=78;
-     * поверх неё потом ложится AA-скругление титлбара/низа */
-    const uint32_t ca = (uint32_t)shadow_alut[0] << 24;
-    for (int k = 0; k < 4; k++) {
-        int bx = (k & 1) ? ww - r : 0;
-        int by = (k & 2) ? wh - r : 0;
-        int cx = (k & 1) ? ww - r : r;
-        int cy = (k & 2) ? wh - r : r;
-        for (int j = 0; j < r; j++)
-            for (int i = 0; i < r; i++) {
-                int lx = bx + i, ly = by + j;
-                int ddx = lx - cx, ddy = ly - cy;
-                if (ddx * ddx + ddy * ddy <= r * r) continue;
-                blend_px(wx + lx, wy + ly, ca);
-            }
+corners:
+    /* угловые выемки внутри окна (за скруглением) — мало пикселей, оставляем
+     * как было, через blend_px (с его клипом). */
+    {
+        const int r  = WIN_CORNER;
+        const uint32_t ca = (uint32_t)shadow_alut[0] * 140 / 256 << 24;
+        for (int k = 0; k < 4; k++) {
+            int bx = (k & 1) ? ww - r : 0;
+            int by = (k & 2) ? wh - r : 0;
+            int cx = (k & 1) ? ww - r : r;
+            int cy = (k & 2) ? wh - r : r;
+            for (int j = 0; j < r; j++)
+                for (int i = 0; i < r; i++) {
+                    int lx = bx + i, ly = by + j;
+                    int ddx = lx - cx, ddy = ly - cy;
+                    if (ddx * ddx + ddy * ddy <= r * r) continue;
+                    blend_px(wx + lx, wy + ly, ca);
+                }
+        }
     }
 }
 /* Титлбар: вертикальный градиент ctop->cbot + AA-скругление верхних углов. */
@@ -957,9 +1338,13 @@ static void draw_round_border(int x, int y, int w, int fh, int r, uint32_t color
 }
 static int win_button_hit(const vwin_t *win, int mx, int my) {
     int cy = win->y + TITLEBAR_H / 2;
+    /* кнопки справа: close=0, min=1, max=2 */
+    int bx_close = win->x + win->w - BTN_X0;
+    int bx_min   = bx_close - BTN_GAP;
+    int bx_max   = bx_min   - BTN_GAP;
+    int bxs[3]   = { bx_close, bx_min, bx_max };
     for (int k = 0; k < 3; k++) {
-        int cx = win->x + BTN_X0 + k * BTN_GAP;
-        int dx = mx - cx, dy = my - cy;
+        int dx = mx - bxs[k], dy = my - cy;
         if (dx * dx + dy * dy <= (BTN_R + 2) * (BTN_R + 2)) return k;
     }
     return -1;
@@ -992,6 +1377,181 @@ static int resize_edge_hit(const vwin_t *win, int mx, int my) {
     return edge;
 }
 
+/* ---------------------------------------------------------------------------
+ * Scale-from-dock анимация: интерполяция геометрии + общая альфа окна.
+ * ------------------------------------------------------------------------- */
+/* Прогресс [0..1] с ease-in-out (cubic) — медленный старт и финал, выраженная
+ * середина: окно «разгоняется» от иконки и «припарковывается» у цели. */
+static float anim_progress(vwin_t *win) {
+    uint64_t now = vos_uptime();
+    uint64_t elapsed_ticks = (now >= win->anim_start_t) ? (now - win->anim_start_t) : 0;
+    int elapsed_ms = (int)elapsed_ticks * 10;   /* PIT 100 Гц */
+    if (elapsed_ms >= ANIM_MS) return 1.f;
+    float t = (float)elapsed_ms / (float)ANIM_MS;
+    if (t < 0.5f) {
+        return 4.f * t * t * t;
+    } else {
+        float u = -2.f * t + 2.f;
+        return 1.f - (u * u * u) * 0.5f;
+    }
+}
+
+/* Bbox анимирующегося окна — union(src, dst). Genie-эффект растягивает
+ * строки по кривой между этими двумя rect'ами, поэтому union покрывает
+ * всё что может появиться на экране. Используется для damage и win_intersects.
+ * alpha больше не нужен извне — он вычисляется per-row внутри draw_window_anim. */
+static void anim_current(vwin_t *win, int *x, int *y, int *w, int *h, int *alpha) {
+    int sx = win->anim_src_x, sy = win->anim_src_y;
+    int sw = win->anim_src_w, sh = win->anim_src_h;
+    int dx = win->anim_dst_x, dy = win->anim_dst_y;
+    int dw = win->anim_dst_w, dh = win->anim_dst_h;
+    int x0 = (sx < dx) ? sx : dx;
+    int y0 = (sy < dy) ? sy : dy;
+    int x1 = (sx + sw > dx + dw) ? sx + sw : dx + dw;
+    int y1 = (sy + sh > dy + dh) ? sy + sh : dy + dh;
+    *x = x0; *y = y0; *w = x1 - x0; *h = y1 - y0;
+    if (*w < 1) *w = 1;
+    if (*h < 1) *h = 1;
+    if (alpha) *alpha = 255;
+}
+
+/* Helper: row-blit одной строки src в bb с горизонтальным scale (fixed-point)
+ * и заданной альфой. Используется как genie-эффектом (по строке), так и
+ * обычным sample-блитом (для tail-renderer'ов, см. ниже). */
+static inline void blit_row_scaled_alpha(const uint32_t *srow, int sw,
+                                         int dst_y, int dst_x, int dst_w,
+                                         unsigned int alpha) {
+    if (alpha == 0 || dst_w <= 0) return;
+    if (dst_y < clip_y0 || dst_y >= clip_y1) return;
+    int x0 = dst_x, x1 = dst_x + dst_w;
+    int sx0_off = 0;
+    if (x0 < clip_x0) { sx0_off = clip_x0 - x0; x0 = clip_x0; }
+    if (x1 > clip_x1) x1 = clip_x1;
+    if (x0 >= x1) return;
+    uint32_t sx_step = ((uint32_t)sw << 16) / (uint32_t)dst_w;
+    uint32_t sx_fp   = (uint32_t)sx0_off * sx_step;
+    uint32_t *drow = &bb[(uint32_t)dst_y * fbw];
+    unsigned int A  = alpha;
+    unsigned int ia = 255u - A;
+    for (int i = x0; i < x1; i++, sx_fp += sx_step) {
+        int sx = (int)(sx_fp >> 16);
+        if (sx >= sw) sx = sw - 1;
+        uint32_t src = srow[sx];
+        uint32_t d = drow[i];
+        unsigned int r = ((src >> 16) & 0xFF) * A / 255u + ((d >> 16) & 0xFF) * ia / 255u;
+        unsigned int g = ((src >>  8) & 0xFF) * A / 255u + ((d >>  8) & 0xFF) * ia / 255u;
+        unsigned int b = ( src        & 0xFF) * A / 255u + ( d        & 0xFF) * ia / 255u;
+        drow[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
+    }
+}
+
+/* Genie/Magic-Lamp: каждая source-row получает свой row_t с «волновой»
+ * задержкой по высоте окна — верхние ряды первыми долетают к финальной
+ * позиции (OPENING) или последними покидают её (CLOSING). Получается
+ * характерное «выползание» из дока, как в macOS.
+ *
+ * Источник = pixels клиента (sw × sh, включая полосу под титлбаром, она
+ * заполняется приглушённым фоном — chrome во время анимации не рисуется).
+ * Цель (на t=1) = реальная геометрия окна. Точка-источник (на t=0) = центр
+ * dock-icon (src rect 48×48). */
+static void draw_window_anim(vwin_t *win) {
+    if (!win->pixels) return;
+
+    /* Прогресс всей анимации с easing (медленный старт/финал). */
+    float t = anim_progress(win);
+    /* «Растущее» направление: OPENING и RESTORING — растёт от дока к окну;
+     * CLOSING/MINIMIZING — обратно. */
+    int opening = (win->anim_state == ANIM_OPENING ||
+                   win->anim_state == ANIM_RESTORING);
+    int sw = win->w;
+    int sh = win->h + TITLEBAR_H;
+
+    /* Дocк-точка (центр src rect): на t=0 здесь — все ряды. */
+    int dock_cx = win->anim_src_x + win->anim_src_w / 2;
+    int dock_cy = win->anim_src_y + win->anim_src_h / 2;
+    int dock_hw = win->anim_src_w / 2;
+
+    /* Финальная геометрия окна (на t=1): прямоугольник реальной позиции. */
+    int win_x = win->anim_dst_x;
+    int win_y = win->anim_dst_y;
+    int win_w = win->anim_dst_w;
+    /* anim_dst_h ~ полная высота окна с титлбаром, используем sh из pixels
+     * (sh == anim_dst_h, мы их так и задавали при start). */
+
+    /* Волна: 0.55 — половина окна уже на финальной позиции, половина ещё в
+     * пути. Большие значения = более выраженный «жидкий» эффект. */
+    const float WAVE = 0.55f;
+    const float scale = 1.f + WAVE;
+
+    /* Заполнение между соседними dst_y, чтобы не было gap'ов. Идём по
+     * source-rows j ∈ [0, sh). prev_dst_y хранит y предыдущей row. */
+    int last_dst_y = -10000;
+    int titlebar_h = TITLEBAR_H;
+    uint32_t base_color = 0xFF1E2330u;
+
+    for (int j = 0; j < sh; j++) {
+        float row_delay = (float)j / (float)(sh - 1);
+        if (!opening) row_delay = 1.f - row_delay;   /* при closing нижние первыми */
+        float lt = t * scale - row_delay * WAVE;
+        if (lt < 0.f) lt = 0.f;
+        if (lt > 1.f) lt = 1.f;
+        /* В opening на ранних кадрах lt близко к 0 — все ряды толпой в доке,
+         * их видно как одну плотную точку. Это нормально. */
+        float inv = 1.f - lt;
+
+        /* Горизонталь: левый/правый край интерполируем между dock и окном. */
+        int dx_left  = (int)(inv * (dock_cx - dock_hw) + lt * win_x);
+        int dx_right = (int)(inv * (dock_cx + dock_hw) + lt * (win_x + win_w));
+        int dst_w    = dx_right - dx_left;
+        /* Вертикаль: центр строки между dock_cy и win_y + j. */
+        int dst_y = (int)(inv * dock_cy + lt * (win_y + j));
+
+        /* Альфа: opening fade-in, closing fade-out (по локальному прогрессу
+         * каждой row — выходит «жидкое» исчезание). */
+        float a = opening ? lt : inv;
+        unsigned int alpha = (unsigned int)(a * 255.f);
+        if (alpha > 255) alpha = 255;
+
+        /* Источник: если j внутри полосы титлбара — берём «крышечку» из
+         * базового цвета (это row из 1 пикселя растягивается). Иначе — реальная
+         * строка контента. */
+        const uint32_t *srow;
+        uint32_t one_px;
+        int row_sw;
+        if (j < titlebar_h) {
+            one_px = base_color;
+            srow = &one_px;
+            row_sw = 1;
+        } else {
+            srow = &win->pixels[(uint32_t)(j - titlebar_h) * win->w];
+            row_sw = sw;
+        }
+
+        /* Заполняем целевые y между last_dst_y и dst_y (включительно) —
+         * без gap'ов даже при быстром смещении строк. */
+        int y_from = (last_dst_y == -10000) ? dst_y : last_dst_y + 1;
+        int y_to   = dst_y;
+        if (y_to < y_from) { int tmp = y_from; y_from = y_to; y_to = tmp; }
+        for (int y = y_from; y <= y_to; y++)
+            blit_row_scaled_alpha(srow, row_sw, y, dx_left, dst_w, alpha);
+        last_dst_y = dst_y;
+    }
+}
+
+/* Bbox анимирующегося окна для damage. */
+static void anim_bbox(vwin_t *win, int *x, int *y, int *w, int *h) {
+    int sx = win->anim_src_x, sy = win->anim_src_y;
+    int sw = win->anim_src_w, sh = win->anim_src_h;
+    int dx = win->anim_dst_x, dy = win->anim_dst_y;
+    int dw = win->anim_dst_w, dh = win->anim_dst_h;
+    int x0 = (sx < dx) ? sx : dx;
+    int y0 = (sy < dy) ? sy : dy;
+    int x1 = (sx + sw > dx + dw) ? sx + sw : dx + dw;
+    int y1 = (sy + sh > dy + dh) ? sy + sh : dy + dh;
+    *x = x0 - 4; *y = y0 - 4;
+    *w = x1 - x0 + 8; *h = y1 - y0 + 8;
+}
+
 /* Какую форму курсора показывает данный edge-битмаск */
 static int edge_to_shape(int edge) {
     int h = edge & (RZ_LEFT | RZ_RIGHT);
@@ -1006,45 +1566,172 @@ static int edge_to_shape(int edge) {
     if (v) return CUR_SIZE_V;
     return CUR_ARROW;
 }
+/* Helpers для render'а chrome в локальный буфер (без bb/clip — координаты
+ * 0..w/0..TITLEBAR_H в chrome_buf). */
+static inline void cb_put(uint32_t *cb, int w, int h, int x, int y, uint32_t c) {
+    if (x < 0 || x >= w || y < 0 || y >= h) return;
+    cb[y * w + x] = c;
+}
+static inline void cb_blend(uint32_t *cb, int w, int h, int x, int y, uint32_t argb) {
+    if (x < 0 || x >= w || y < 0 || y >= h) return;
+    uint32_t a = (argb >> 24) & 0xFF;
+    if (a == 0) return;
+    uint32_t *p = &cb[y * w + x];
+    if (a == 0xFF) { *p = 0xFF000000u | (argb & 0x00FFFFFF); return; }
+    uint32_t dst = *p;
+    uint32_t fr = (argb >> 16) & 0xFF, fgc = (argb >> 8) & 0xFF, fbl = argb & 0xFF;
+    uint32_t br = (dst >> 16) & 0xFF, bgc = (dst >> 8) & 0xFF, bbl = dst & 0xFF;
+    uint32_t rr = (fr  * a + br  * (255 - a)) / 255;
+    uint32_t gg = (fgc * a + bgc * (255 - a)) / 255;
+    uint32_t bb_= (fbl * a + bbl * (255 - a)) / 255;
+    *p = 0xFF000000u | (rr << 16) | (gg << 8) | bb_;
+}
+static inline void cb_fill_circle(uint32_t *cb, int w, int h, int cx, int cy, int r, uint32_t color) {
+    for (int j = -r; j <= r; j++)
+        for (int i = -r; i <= r; i++)
+            if (i * i + j * j <= r * r)
+                cb_put(cb, w, h, cx + i, cy + j, color);
+}
+
+/* Перерисовать g_chrome_buf для окна. Без AA-углов снизу (они зависят от
+ * обоев под окном, делаются live в draw_window_chrome). */
+static void chrome_rebuild(vwin_t *win) {
+    int focused = (win->id == focused_id);
+    int w = win->w;
+    if (w <= 0 || w > CHROME_MAX_W) { g_chrome_for_id = 0; return; }
+    int h = TITLEBAR_H;
+    uint32_t *cb = g_chrome_buf;
+
+    /* 1. Фон титлбара с AA-скруглением верхних углов (как fill_round_top). */
+    uint32_t tb_color = focused ? 0xFF353550 : 0xFF252535;
+    uint32_t rgb = tb_color & 0x00FFFFFF;
+    int r = WIN_CORNER;
+    if (r * 2 > w) r = w / 2;
+    if (r > h) r = h;
+    for (int j = 0; j < h; j++) {
+        for (int i = 0; i < w; i++) {
+            if (j < r && (i < r || i >= w - r)) {
+                int cx = (i < r) ? r : (w - r);
+                int cov = circ_cov(i, j, cx, r, r);
+                if (cov <= 0) { cb[j * w + i] = 0; continue; }
+                if (cov >= 255) cb[j * w + i] = tb_color;
+                else {
+                    /* AA по AA-краю: храним пиксель с alpha=cov и rgb цвета
+                     * титлбара. chrome_blit на финале сделает src-over с тем
+                     * что в bb (обои/тень) — без чёрного «гало». */
+                    cb[j * w + i] = ((uint32_t)cov << 24) | rgb;
+                }
+            } else {
+                cb[j * w + i] = tb_color;
+            }
+        }
+    }
+
+    /* 2. Тонкий блик поверх. */
+    for (int i = WIN_CORNER; i < w - WIN_CORNER; i++)
+        cb_blend(cb, w, h, i, 0, 0x18FFFFFFu);
+
+    /* 3. Кнопки (круги). */
+    int cy = TITLEBAR_H / 2;
+    int bx_close = w - BTN_X0;
+    int bx_min   = bx_close - BTN_GAP;
+    int bx_max   = bx_min   - BTN_GAP;
+    uint32_t cclose = focused ? 0xFFFF5F56 : 0xFF4A4A5A;
+    uint32_t cmin   = focused ? 0xFFFFBD2E : 0xFF4A4A5A;
+    uint32_t cmax   = focused ? 0xFF27C93F : 0xFF4A4A5A;
+    cb_fill_circle(cb, w, h, bx_max,   cy, BTN_R, cmax);
+    cb_fill_circle(cb, w, h, bx_min,   cy, BTN_R, cmin);
+    cb_fill_circle(cb, w, h, bx_close, cy, BTN_R, cclose);
+
+    if (focused) {
+        const uint32_t g = 0x96000000u;
+        for (int d = -2; d <= 2; d++) {
+            cb_blend(cb, w, h, bx_close + d, cy + d, g);
+            if (d) cb_blend(cb, w, h, bx_close + d, cy - d, g);
+            cb_blend(cb, w, h, bx_min   + d, cy, g);
+            cb_blend(cb, w, h, bx_max   + d, cy, g);
+            if (d) cb_blend(cb, w, h, bx_max, cy + d, g);
+        }
+    }
+
+    /* Верхний border (1px) — рисуется на каждый кадр live, потому что
+     * focused может меняться, а у нас всё в этой функции и так привязано. */
+    uint32_t bord = focused ? 0xFF454560u : 0xFF2E2E3Au;
+    for (int i = r; i < w - r; i++)
+        cb_put(cb, w, h, i, 0, bord);
+    for (int j = r; j < h; j++) {
+        cb_put(cb, w, h, 0,     j, bord);
+        cb_put(cb, w, h, w - 1, j, bord);
+    }
+
+    g_chrome_for_id  = win->id;
+    g_chrome_w       = w;
+    g_chrome_focused = focused;
+}
+
+/* Блит chrome полосы в bb с клипом — используется на горячем пути. */
+static void chrome_blit(vwin_t *win) {
+    if (g_chrome_for_id != win->id) return;
+    int w = g_chrome_w, h = TITLEBAR_H;
+    int sx = win->x, sy = win->y;
+    int x0 = sx, y0 = sy, x1 = sx + w, y1 = sy + h;
+    int cx0 = 0, cy0 = 0;
+    if (x0 < clip_x0) { cx0 = clip_x0 - x0; x0 = clip_x0; }
+    if (y0 < clip_y0) { cy0 = clip_y0 - y0; y0 = clip_y0; }
+    if (x1 > clip_x1) x1 = clip_x1;
+    if (y1 > clip_y1) y1 = clip_y1;
+    if (x0 >= x1 || y0 >= y1) return;
+    for (int j = y0; j < y1; j++) {
+        uint32_t *drow = &bb[(uint32_t)j * fbw + x0];
+        const uint32_t *srow = &g_chrome_buf[(j - sy) * w + cx0];
+        int n = x1 - x0;
+        for (int i = 0; i < n; i++) {
+            uint32_t s = srow[i];
+            /* alpha=0 — «вне chrome» (углы за AA): не трогаем bb, там обои/
+             * окна сзади. Полное непрозрачное — простая копия. Промежуточная
+             * альфа — стандартный src-over blend. */
+            uint32_t a = s >> 24;
+            if (a == 0) continue;
+            if (a == 0xFF) { drow[i] = s; continue; }
+            uint32_t d = drow[i];
+            uint32_t ia = 255u - a;
+            uint32_t r = (((s >> 16) & 0xFF) * a + ((d >> 16) & 0xFF) * ia) / 255u;
+            uint32_t g = (((s >>  8) & 0xFF) * a + ((d >>  8) & 0xFF) * ia) / 255u;
+            uint32_t b = (( s        & 0xFF) * a + ( d        & 0xFF) * ia) / 255u;
+            drow[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
 static void draw_window_chrome(vwin_t *win) {
     int focused = (win->id == focused_id);
     int fh = win->h + TITLEBAR_H;
 
     win_draw_shadow(win->x, win->y, win->w, fh);
 
-    if (focused)
-        fill_round_top(win->x, win->y, win->w, TITLEBAR_H, WIN_CORNER,
-                       0xFF434A6A, 0xFF2D3148);
-    else
-        fill_round_top(win->x, win->y, win->w, TITLEBAR_H, WIN_CORNER,
-                       0xFF2B2D3C, 0xFF222330);
-    for (int i = WIN_CORNER; i < win->w - WIN_CORNER; i++)
-        blend_px(win->x + i, win->y, 0x30FFFFFFu);
-
-    uint32_t cclose = focused ? 0xFFFF5F56 : 0xFF565664;
-    uint32_t cmin   = focused ? 0xFFFFBD2E : 0xFF565664;
-    uint32_t cmax   = focused ? 0xFF27C93F : 0xFF565664;
-    int cy = win->y + TITLEBAR_H / 2;
-    int bx = win->x + BTN_X0;
-    fill_circle(bx,               cy, BTN_R, cclose);
-    fill_circle(bx + BTN_GAP,     cy, BTN_R, cmin);
-    fill_circle(bx + 2 * BTN_GAP, cy, BTN_R, cmax);
-    if (focused) {
-        /* глифы на светофорах (×  –  +) — тёмные поверх цвета кнопки */
-        const uint32_t g = 0x96000000u;
-        for (int d = -2; d <= 2; d++) {
-            blend_px(bx + d, cy + d, g);            /* ×  close    */
-            if (d) blend_px(bx + d, cy - d, g);
-            blend_px(bx + BTN_GAP + d, cy, g);      /* –  minimize */
-            blend_px(bx + 2 * BTN_GAP + d, cy, g);  /* +  maximize */
-            if (d) blend_px(bx + 2 * BTN_GAP, cy + d, g);
-        }
+    /* Chrome subsurface: один глобальный prerendered буфер. Пересчитываем
+     * когда (id, w, focused) изменились. На drag окно не меняется — один
+     * rebuild на старте, остальные кадры — только blit. */
+    if (g_chrome_for_id != win->id ||
+        g_chrome_w     != win->w  ||
+        g_chrome_focused != focused) {
+        chrome_rebuild(win);
     }
+    chrome_blit(win);
 
-    int tx = win->x + BTN_X0 + 2 * BTN_GAP + BTN_R + 10;
-    draw_string_t(tx, win->y + (TITLEBAR_H - 16) / 2, win->title,
-                  focused ? 0xFFEDEFF6 : 0xFF9A9DB0);
+    /* Заголовок по центру — из cached coverage bitmap, без TTF. Title
+     * блитится поверх chrome (чтобы цвет fg менялся по focused без
+     * пересборки chrome). */
+    if (!win->title_cached) title_cache_rebuild(win);
+    int title_w = win->title_cw ? win->title_cw : ui_text_width(win->title);
+    int title_h = win->title_ch ? win->title_ch : ui_line_height();
+    int tx = win->x + (win->w - title_w) / 2;
+    if (tx < win->x + 8) tx = win->x + 8;
+    title_cache_blit(win, tx, win->y + (TITLEBAR_H - title_h) / 2,
+                     focused ? 0xFFEDEFF6 : 0xFF7A7A9A);
 
+    /* Save-under для AA нижних углов — они нужны live, потому что под
+     * окном могут быть обои/окна с любым цветом. */
     const int rb = WIN_CORNER;
     uint32_t bgL[WIN_CORNER * WIN_CORNER], bgR[WIN_CORNER * WIN_CORNER];
     if (rb * 2 <= win->w && rb <= fh) {
@@ -1062,8 +1749,8 @@ static void draw_window_chrome(vwin_t *win) {
     if (rb * 2 <= win->w && rb <= fh)
         round_bottom_aa(win->x, win->y, win->w, fh, rb, bgL, bgR);
 
-    /* активное окно очерчено акцентом (как в Plasma), остальные — нейтрально */
-    uint32_t bord = focused ? ACCENT : 0xFF363642u;
+    /* Боковая+нижняя рамка (1px). Верхняя строка уже в chrome_buf. */
+    uint32_t bord = focused ? 0xFF454560u : 0xFF2E2E3Au;
     draw_round_border(win->x, win->y, win->w, fh, WIN_CORNER, bord);
 }
 
@@ -1079,9 +1766,18 @@ static void draw_window_chrome(vwin_t *win) {
  * физически неоткуда взяться: каждый пиксель кадра собран с нуля.
  * ------------------------------------------------------------------------- */
 static int win_intersects(const vwin_t *win, int rx, int ry, int rw, int rh) {
-    int m = WIN_MARGIN;
-    int wx = win->x - m, wy = win->y - m;
-    int ww = win->w + 2 * m, wh = win->h + TITLEBAR_H + 2 * m;
+    int wx, wy, ww, wh;
+    if (win->anim_state != ANIM_NONE) {
+        /* Анимирующееся окно занимает интерполированный rect, не реальный. */
+        int ax, ay, aw, ah, alpha;
+        anim_current((vwin_t *)win, &ax, &ay, &aw, &ah, &alpha);
+        (void)alpha;
+        wx = ax - 4; wy = ay - 4; ww = aw + 8; wh = ah + 8;
+    } else {
+        int m = WIN_MARGIN;
+        wx = win->x - m; wy = win->y - m;
+        ww = win->w + 2 * m; wh = win->h + TITLEBAR_H + 2 * m;
+    }
     if (wx >= rx + rw || wx + ww <= rx) return 0;
     if (wy >= ry + rh || wy + wh <= ry) return 0;
     return 1;
@@ -1096,6 +1792,22 @@ static void compose_rect_from(int rx, int ry, int rw, int rh, int start_idx) {
     clip_set(rx, ry, rw, rh);
     if (clip_empty()) { clip_reset(); return; }
 
+    /* Lock screen: рисуем тёмный фон и ТОЛЬКО lock-окно. Никаких чужих окон,
+     * панели и дока. (start_idx тут не используем — режим обзора прямой.) */
+    if (g_lock_win) {
+        fill_rect(rx, ry, rw, rh, 0xFF1A1A24u);
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            vwin_t *win = &windows[i];
+            if (win->id != g_lock_win || !win->pixels) continue;
+            if (!win_intersects(win, rx, ry, rw, rh)) continue;
+            /* Lock-окно рисуем БЕЗ chrome — экран блокировки сам себе chrome. */
+            blit_buffer(win->x, win->y, win->w, win->h, win->pixels);
+            break;
+        }
+        clip_reset();
+        return;
+    }
+
     if (start_idx < 0) {
         fill_wall(rx, ry, rw, rh);
         start_idx = 0;
@@ -1105,7 +1817,10 @@ static void compose_rect_from(int rx, int ry, int rw, int rh, int start_idx) {
         vwin_t *win = &windows[i];
         if (!win->id || !win->pixels || win->minimized) continue;
         if (!win_intersects(win, rx, ry, rw, rh)) continue;
-        draw_window_chrome(win);
+        if (win->anim_state != ANIM_NONE)
+            draw_window_anim(win);    /* масштабированная миниатюра + fade */
+        else
+            draw_window_chrome(win);
     }
     {
         int px, py, pw, ph;
@@ -1146,6 +1861,7 @@ static void compose_damage(int rx, int ry, int rw, int rh) {
     for (int i = 0; i < MAX_WINDOWS; i++) {
         vwin_t *win = &windows[i];
         if (!win->id || !win->pixels || win->minimized) continue;
+        if (win->anim_state != ANIM_NONE) continue;   /* не накрывает полностью */
         int bx, by, bw, bh;
         win_opaque_body(win, &bx, &by, &bw, &bh);
         if (bw <= 0 || bh <= 0) continue;
@@ -1192,8 +1908,10 @@ static void frame(void) {
     for (int i = 0; i < damage_count; i++)
         compose_damage(damage[i].x, damage[i].y, damage[i].w, damage[i].h);
 
-    /* курсор — верхний слой: дорисовать в каждый затронутый регион */
-    {
+    /* курсор — верхний слой: дорисовать в каждый затронутый регион.
+     * При HW-курсоре спрайт рисует QEMU поверх scanout — пропускаем
+     * полностью, в bb ничего не пишем, cursor damage не нужен. */
+    if (!hw_cursor_ok) {
         int cx, cy, cw, ch;
         cursor_rect(&cx, &cy, &cw, &ch);
         const cur_shape_t *s = &cur_shapes[cur_shape];
@@ -1229,16 +1947,81 @@ static void render_all(void) {
 static void render_region(int rx, int ry, int rw, int rh) {
     if (rw <= 0 || rh <= 0) return;
     dmg_add(rx, ry, rw, rh);
-    if (cursor_moved) { cursor_moved = 0; dmg_cursor(); }
+    if (cursor_moved) {
+        cursor_moved = 0;
+        if (!hw_cursor_ok) dmg_cursor();
+    }
     frame();
 }
 
 /* Кадр по тику (порт wm_tick_render): выбирает самый дешёвый путь. */
 static uint64_t last_panel_sec = 0;
 
+/* Forward: close_window и finalize_minimize определены ниже, а вызываются
+ * из tick_render по окончании CLOSING/MINIMIZING анимаций. */
+static void close_window(vwin_t *win);
+static void finalize_minimize(vwin_t *win);
+
+/* Есть ли хоть одно анимирующееся окно (для плавности — рендер каждый тик). */
+static int anim_any_active(void) {
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        if (windows[i].id && windows[i].anim_state != ANIM_NONE) return 1;
+    return 0;
+}
+
 static void tick_render(void) {
     uint64_t sec = vos_uptime() / 100;
     if (sec != last_panel_sec) { last_panel_sec = sec; panel_dirty = 1; }
+
+    /* Scale-from-dock анимации: на каждом тике продвигаем все active окна.
+     * По завершении OPENING — переход к нормальной отрисовке. По завершении
+     * CLOSING — реальный close_window. На каждом активном кадре анимации
+     * invalidate'им bbox(src ∪ dst), чтобы был перерисован обои/окна под
+     * движущейся миниатюрой. */
+    uint64_t now = vos_uptime();
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        vwin_t *win = &windows[i];
+        if (!win->id || win->anim_state == ANIM_NONE) continue;
+        uint64_t elapsed = (now >= win->anim_start_t) ? (now - win->anim_start_t) : 0;
+        int elapsed_ms = (int)elapsed * 10;
+
+        /* Damage = текущий rect анимации (+ предыдущий если был) — узкая
+         * полоса между двумя кадрами, а не половина экрана. */
+        int cx, cy, cw, ch, alpha;
+        anim_current(win, &cx, &cy, &cw, &ch, &alpha);
+        (void)alpha;
+        int margin = 6;
+        dmg_add(cx - margin, cy - margin, cw + 2 * margin, ch + 2 * margin);
+        if (win->anim_has_prev) {
+            dmg_add(win->anim_prev_x - margin, win->anim_prev_y - margin,
+                    win->anim_prev_w + 2 * margin, win->anim_prev_h + 2 * margin);
+        }
+        win->anim_prev_x = cx; win->anim_prev_y = cy;
+        win->anim_prev_w = cw; win->anim_prev_h = ch;
+        win->anim_has_prev = 1;
+        needs_redraw = 1;
+
+        if (elapsed_ms >= ANIM_MS) {
+            /* На завершении — окно встанет на финальное место (или закроется).
+             * Перерисовать old prev_rect (там был последний кадр) + destination
+             * rect, чтобы остатков не было. */
+            dmg_add(win->anim_prev_x - margin, win->anim_prev_y - margin,
+                    win->anim_prev_w + 2 * margin, win->anim_prev_h + 2 * margin);
+            if (win->anim_state == ANIM_CLOSING) {
+                close_window(win);
+            } else if (win->anim_state == ANIM_MINIMIZING) {
+                win->anim_state = ANIM_NONE;
+                win->anim_has_prev = 0;
+                finalize_minimize(win);
+            } else {
+                int m = WIN_MARGIN;
+                dmg_add(win->x - m, win->y - m,
+                        win->w + 2 * m, win->h + TITLEBAR_H + 2 * m);
+                win->anim_state = ANIM_NONE;
+                win->anim_has_prev = 0;
+            }
+        }
+    }
 
     if (needs_redraw) {
         needs_redraw = 0;
@@ -1295,7 +2078,7 @@ static void tick_render(void) {
     }
     if (cursor_moved) {
         cursor_moved = 0;
-        dmg_cursor();
+        if (!hw_cursor_ok) dmg_cursor();  /* HW-курсор: damage не нужен */
     }
     frame();
 }
@@ -1305,6 +2088,27 @@ static void render_window_region(vwin_t *win) {
     int m = WIN_MARGIN;
     render_region(win->x - m, win->y - m,
                   win->w + 2 * m, win->h + TITLEBAR_H + 2 * m);
+}
+
+/* Per-client damage: клиент COMMIT'ит конкретный rect в координатах своего
+ * shm (без титлбара, т.е. (0,0) = верх контента). vwm перерисовывает только
+ * пересечение этой зоны со своей экранной геометрией окна. Если rect = весь
+ * shm — поведение совпадает с render_window_region.
+ *
+ * Клипуем к содержимому окна (без титлбара/border'ов), потому что damage от
+ * клиента описывает только контент. Перевод в экранные координаты:
+ *   screen_x = win->x + cx,  screen_y = win->y + TITLEBAR_H + cy. */
+static void render_commit_region(vwin_t *win, int cx, int cy, int cw, int ch) {
+    if (cw <= 0 || ch <= 0) { render_window_region(win); return; }
+    /* Клип к содержимому окна. */
+    if (cx < 0) { cw += cx; cx = 0; }
+    if (cy < 0) { ch += cy; cy = 0; }
+    if (cx + cw > win->w) cw = win->w - cx;
+    if (cy + ch > win->h) ch = win->h - cy;
+    if (cw <= 0 || ch <= 0) return;
+    /* Перерисовка ровно содержимого, без overdraw chrome/тени. Тень/титлбар
+     * не пострадают: они не лежат в этой зоне. */
+    render_region(win->x + cx, win->y + TITLEBAR_H + cy, cw, ch);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1358,6 +2162,64 @@ static void close_window(vwin_t *win) {
     send_event(pid, VWM_EV_CLOSE, id, 0, 0);   /* клиент должен выйти */
 }
 
+/* Найти dock-icon-rect, куда лететь при CLOSING. По kind, если знаем;
+ * иначе — центр дока (нейтральная цель). */
+static void close_target_rect(int kind, int *tx, int *ty, int *tw, int *th) {
+    if (kind >= 0) {
+        for (int k = 0; k < DOCK_NITEMS; k++) {
+            if (dock_items[k].kind == kind) {
+                int ix, iy;
+                dock_icon_rect(k, &ix, &iy);
+                *tx = ix; *ty = iy;
+                *tw = DOCK_ICON; *th = DOCK_ICON;
+                return;
+            }
+        }
+    }
+    int dx, dy, dw, dh;
+    dock_geometry(&dx, &dy, &dw, &dh);
+    *tw = DOCK_ICON; *th = DOCK_ICON;
+    *tx = dx + (dw - *tw) / 2;
+    *ty = dy + (dh - *th) / 2;
+}
+
+/* Rect чипа окна в доке (для minimize/restore анимации). win_idx — индекс
+ * окна в windows[]. Возврат 0 = нет такого чипа (например, нет окон). */
+static int win_chip_rect(int win_idx, int *tx, int *ty, int *tw, int *th) {
+    int slot = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!windows[i].id) continue;
+        if (i == win_idx) {
+            int ix, iy;
+            dock_icon_rect(DOCK_NITEMS + slot, &ix, &iy);
+            *tx = ix; *ty = iy;
+            *tw = DOCK_ICON; *th = DOCK_ICON;
+            return 1;
+        }
+        slot++;
+    }
+    return 0;
+}
+
+/* Запустить CLOSING-анимацию. По окончании tick_render позовёт close_window. */
+static void start_close_anim(vwin_t *win) {
+    if (win->anim_state == ANIM_CLOSING) return;  /* уже летим */
+    int tx, ty, tw, th;
+    close_target_rect(win->dock_kind, &tx, &ty, &tw, &th);
+    win->anim_state   = ANIM_CLOSING;
+    win->anim_start_t = vos_uptime();
+    win->anim_src_x = win->x;
+    win->anim_src_y = win->y;
+    win->anim_src_w = win->w;
+    win->anim_src_h = win->h + TITLEBAR_H;
+    win->anim_dst_x = tx;
+    win->anim_dst_y = ty;
+    win->anim_dst_w = tw;
+    win->anim_dst_h = th;
+    win->anim_has_prev = 0;
+    needs_redraw = 1;
+}
+
 /* Применить новую геометрию окна: при смене РАЗМЕРА чистим поверхность под
  * новый stride и просим клиента перерисоваться (EV_RESIZE) — тот же контракт,
  * что и у ресайза мышью. */
@@ -1375,12 +2237,11 @@ static void win_apply_geometry(vwin_t *win, int nx, int ny, int nw, int nh) {
 
 /* 🟡 Свернуть: окно исчезает со стола, появляется чипом в панели.
  * Клиент НЕ трогаем — его поверхность жива, COMMIT'ы просто не рисуем. */
-static void minimize_window(vwin_t *win) {
+/* Финализация minimize — вызывается из tick по окончании анимации. */
+static void finalize_minimize(vwin_t *win) {
     win->minimized = 1;
-    if (drag.active && drag.win_id == win->id) drag.active = 0;
-    if (rz.active && rz.win_id == win->id) rz.active = 0;
     if (focused_id == win->id) {
-        focused_id = 0;                 /* фокус — верхнему из оставшихся */
+        focused_id = 0;
         for (int i = MAX_WINDOWS - 1; i >= 0; i--)
             if (windows[i].id && !windows[i].minimized) {
                 focused_id = windows[i].id;
@@ -1391,12 +2252,47 @@ static void minimize_window(vwin_t *win) {
     panel_send_wins();
 }
 
-/* Развернуть из панели: показать, дать фокус, поднять наверх. */
+static void minimize_window(vwin_t *win) {
+    if (win->anim_state == ANIM_MINIMIZING) return;
+    int win_idx = -1;
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        if (&windows[i] == win) { win_idx = i; break; }
+    int tx, ty, tw, th;
+    if (win_idx < 0 || !win_chip_rect(win_idx, &tx, &ty, &tw, &th))
+        close_target_rect(win->dock_kind, &tx, &ty, &tw, &th);
+    win->anim_state   = ANIM_MINIMIZING;
+    win->anim_start_t = vos_uptime();
+    win->anim_src_x = win->x; win->anim_src_y = win->y;
+    win->anim_src_w = win->w; win->anim_src_h = win->h + TITLEBAR_H;
+    win->anim_dst_x = tx; win->anim_dst_y = ty;
+    win->anim_dst_w = tw; win->anim_dst_h = th;
+    win->anim_has_prev = 0;
+    if (drag.active && drag.win_id == win->id) drag.active = 0;
+    if (rz.active && rz.win_id == win->id) rz.active = 0;
+    needs_redraw = 1;
+}
+
 static void restore_window(vwin_t *win) {
     uint64_t id = win->id;
     win->minimized = 0;
     focused_id = id;
-    raise_window(id);                   /* win после этого невалиден */
+    raise_window(id);
+    vwin_t *w = find_window(id);
+    if (w) {
+        int win_idx = -1;
+        for (int i = 0; i < MAX_WINDOWS; i++)
+            if (&windows[i] == w) { win_idx = i; break; }
+        int sx, sy, sw, sh;
+        if (win_idx < 0 || !win_chip_rect(win_idx, &sx, &sy, &sw, &sh))
+            close_target_rect(w->dock_kind, &sx, &sy, &sw, &sh);
+        w->anim_state   = ANIM_RESTORING;
+        w->anim_start_t = vos_uptime();
+        w->anim_src_x = sx; w->anim_src_y = sy;
+        w->anim_src_w = sw; w->anim_src_h = sh;
+        w->anim_dst_x = w->x; w->anim_dst_y = w->y;
+        w->anim_dst_w = w->w; w->anim_dst_h = w->h + TITLEBAR_H;
+        w->anim_has_prev = 0;
+    }
     needs_redraw = 1;
     panel_send_wins();
 }
@@ -1458,6 +2354,9 @@ static void on_mouse_move(int dx, int dy) {
     if (mouse_y < 0) mouse_y = 0;
     if (mouse_x >= (int)fbw) mouse_x = (int)fbw - 1;
     if (mouse_y >= (int)fbh) mouse_y = (int)fbh - 1;
+    /* HW-курсор: позиция отдаётся напрямую в virtio-gpu, минуя back buffer.
+     * Курсор плавный даже когда vwm рендерит 5 FPS. */
+    if (hw_cursor_ok) vos_cursor_move(mouse_x, mouse_y);
 
     if (rz.active) {
         vwin_t *win = find_window(rz.win_id);
@@ -1555,6 +2454,16 @@ static void on_mouse_button(uint8_t buttons) {
     mouse_buttons = buttons;
     int mx = mouse_x, my = mouse_y;
 
+    /* Lock-screen: все клики ТОЛЬКО lock-окну, дока/панели/других окон нет. */
+    if (g_lock_win) {
+        vwin_t *w = find_window(g_lock_win);
+        if (w) {
+            send_event4(w->owner_pid, VWM_EV_MOUSE, w->id,
+                        (uint64_t)mx, (uint64_t)my, (uint64_t)buttons);
+        }
+        return;
+    }
+
     /* --- Dock поверх окон --- */
     int dh = dock_hit(mx, my);
     if (buttons & 1) {
@@ -1562,8 +2471,38 @@ static void on_mouse_button(uint8_t buttons) {
             dock_hover = dh;
             dock_pressed = 1;
             dock_dirty = 1;
-            if (active_window_count() < MAX_WINDOWS)
-                vos_spawn(dock_items[dh].path);
+            if (dh < DOCK_NITEMS) {
+                /* Лаунчер: запустить приложение. Запоминаем rect иконки —
+                 * первое окно от этого приложения (придёт через VWM_CREATE)
+                 * получит OPENING-анимацию роста из этого прямоугольника. */
+                if (active_window_count() < MAX_WINDOWS) {
+                    int ix, iy;
+                    dock_icon_rect(dh, &ix, &iy);
+                    pending_open_x = ix; pending_open_y = iy;
+                    pending_open_w = DOCK_ICON; pending_open_h = DOCK_ICON;
+                    pending_open_path_kind = dock_items[dh].kind;
+                    pending_open_t = vos_uptime();
+                    pending_open_valid = 1;
+                    vos_spawn(dock_items[dh].path);
+                }
+            } else {
+                /* Чип запущенного окна: minimized -> восстановить; focused ->
+                 * свернуть; иначе — поднять и сфокусировать. */
+                int wi = dock_slot_to_winidx(dh - DOCK_NITEMS);
+                if (wi >= 0) {
+                    vwin_t *w = &windows[wi];
+                    if (w->minimized) {
+                        restore_window(w);
+                    } else if (w->id == focused_id) {
+                        minimize_window(w);
+                    } else {
+                        focused_id = w->id;
+                        raise_window(w->id);
+                        needs_redraw = 1;
+                        panel_send_wins();
+                    }
+                }
+            }
             return;
         }
         if (dh == -2) return;
@@ -1594,7 +2533,7 @@ static void on_mouse_button(uint8_t buttons) {
                           my >= win->y && my < win->y + win->h + TITLEBAR_H);
             if (!inside) continue;
             int b = win_button_hit(win, mx, my);
-            if (b == 0) { close_window(win); return; }     /* 🔴 закрыть    */
+            if (b == 0) { start_close_anim(win); return; } /* 🔴 закрыть (анимация → реальный close в tick) */
             if (b == 1) { minimize_window(win); return; }  /* 🟡 свернуть   */
             if (b == 2) {                                  /* 🟢 развернуть */
                 focused_id = win->id;
@@ -1756,6 +2695,28 @@ static void on_create(vos_msg_t *m) {
     int i = 0;
     while (t[i] && i < 31) { win->title[i] = t[i]; i++; }
     win->title[i] = 0;
+    win->title_cached = 0;       /* title-cache: пересчитаем при первом draw */
+
+    /* Scale-from-dock OPENING: если пользователь только что кликнул иконку
+     * в доке (pending_open_valid + TTL не вышел), окно начинает с rect
+     * иконки и растёт до своих win->x/y/w/h. */
+    win->anim_state = ANIM_NONE;
+    win->dock_kind  = -1;
+    if (pending_open_valid && vos_uptime() - pending_open_t < 600) {
+        win->anim_state = ANIM_OPENING;
+        win->anim_start_t = vos_uptime();
+        win->anim_src_x = pending_open_x;
+        win->anim_src_y = pending_open_y;
+        win->anim_src_w = pending_open_w;
+        win->anim_src_h = pending_open_h;
+        win->anim_dst_x = win->x;
+        win->anim_dst_y = win->y;
+        win->anim_dst_w = win->w;
+        win->anim_dst_h = win->h + TITLEBAR_H;
+        win->dock_kind  = pending_open_path_kind;
+        win->anim_has_prev = 0;
+        pending_open_valid = 0;
+    }
 
     focused_id = win->id;
     send_event(sender, VWM_CREATED, win->id, shm_id, 0);
@@ -1888,7 +2849,26 @@ static void handle_msg(vos_msg_t *m) {
         on_panel_attach(m);
         break;
     case VWM_PANEL_COMMIT:
-        if (m->w[7] == panel_pid) panel_dirty = 1;
+        /* Per-client damage: vpanel шлёт rect только изменённой области
+         * (часы — узкий прямоугольник). Добавляем damage точечно вместо
+         * перерисовки всей панели. Если rect нулевой (legacy) — старое
+         * поведение через panel_dirty. */
+        if (m->w[7] == panel_pid) {
+            int cx = (int)m->w[1];
+            int cy = (int)m->w[2];
+            int cw = (int)m->w[3];
+            int ch = (int)m->w[4];
+            if (cw > 0 && ch > 0 && (cx | cy | cw | ch)) {
+                int px, py, pw, ph;
+                panel_bounds(&px, &py, &pw, &ph);
+                /* Координаты vpanel'а — относительно его surf (которая
+                 * накладывается в (px,py)). Перевод в экранные: +px,+py. */
+                dmg_add(px + cx, py + cy, cw, ch);
+                needs_redraw = 1;
+            } else {
+                panel_dirty = 1;
+            }
+        }
         break;
     case VWM_PANEL_ACTIVATE:
         if (m->w[7] == panel_pid) {
@@ -1906,17 +2886,55 @@ static void handle_msg(vos_msg_t *m) {
     case VWM_COMMIT: {
         vwin_t *win = find_window(m->w[1]);
         if (win && win->owner_pid == m->w[7]) {
-            /* Пиксели уже в shm — просто перерисовываем область окна.
-             * Если сцена и так грязная, кадр по тику всё перерисует. */
+            /* Per-client damage: w2/w3/w4/w5 — rect в координатах shm
+             * (контент окна без титлбара). Клиенты, шлющие весь shm,
+             * передают (0,0,win_w,win_h) — поведение совпадает с full
+             * перерисовкой как было раньше. */
+            int cx = (int)m->w[2];
+            int cy = (int)m->w[3];
+            int cw = (int)m->w[4];
+            int ch = (int)m->w[5];
             if (win->minimized)
-                ;   /* свёрнуто: пиксели в shm обновились, рисовать нечего */
+                ;
+            else if (win->anim_state != ANIM_NONE)
+                needs_redraw = 1;     /* во время анимации перерисует tick */
             else if (!needs_redraw && !drag.active && !rz.active)
-                render_window_region(win);
+                render_commit_region(win, cx, cy, cw, ch);
             else
                 needs_redraw = 1;
         }
         break;
     }
+    case VWM_LOCK: {
+        /* Окно-владелец lock'а должно существовать и принадлежать отправителю. */
+        vwin_t *win = find_window(m->w[1]);
+        if (win && win->owner_pid == m->w[7]) {
+            g_lock_win = win->id;
+            focused_id = win->id;
+            /* Растягиваем lock-окно на весь экран без титлбара. */
+            win->x = 0; win->y = 0;
+            win->w = (int)fbw; win->h = (int)fbh;
+            /* Клиенту нужен resize, чтобы перерисоваться под новый размер. */
+            send_event(win->owner_pid, VWM_EV_RESIZE, win->id,
+                       (uint64_t)win->w, (uint64_t)win->h);
+            damage_full = 1;
+            needs_redraw = 1;
+        }
+        break;
+    }
+    case VWM_UNLOCK:
+        if (g_lock_win) {
+            /* Снимаем lock И сразу убираем lock-окно (если клиент ещё его не
+             * закрыл). Без этого vlogin'овский фуллскрин-сюрфейс продолжал бы
+             * рисоваться поверх обоев как обычное окно. */
+            vwin_t *lw = find_window(g_lock_win);
+            g_lock_win = 0;
+            if (lw && lw->owner_pid == m->w[7]) win_drop(lw);
+            damage_full = 1;
+            needs_redraw = 1;
+            panel_send_wins();
+        }
+        break;
     default:
         break;
     }
@@ -1970,11 +2988,16 @@ void _start(void) {
 
     /* 3. Становимся WM: сервис + весь ввод наш */
     shadow_lut_init();
+    vfont_ui_init();   /* AdwaitaSans для заголовков окон и тултипов дока; 0 -> fallback font8x16 */
     vos_svc_register(VOS_SVC_WM);
     vos_input_grab();
 
     mouse_x = (int)fbw / 2;
     mouse_y = (int)fbh / 2;
+
+    /* HW-курсор через virtio-gpu cursorq. cursor_move шлёт UPDATE_CURSOR
+     * (не MOVE) с resource_id — это needed для visibility на QEMU. */
+    hw_cursor_init();
 
     puts("vwm: userspace window manager up\n");
 
@@ -1988,16 +3011,23 @@ void _start(void) {
     uint64_t last_frame = 0;
     vos_msg_t m;
     for (;;) {
-        int got = (int)vos_ipc_recv(&m, 1);
+        /* В покое — ждём 1 тик (10ms) на ipc_recv. На drag/resize — НЕ ждём:
+         * mouse-events прилетают быстрее тика, и сон между ними даёт лаг
+         * окна за курсором. NOWAIT даёт busy-loop, но фактически блокируется
+         * на rendered_frame (~30 FPS), CPU не сгорит. */
+        int wait = (drag.active || rz.active) ? VOS_IPC_NOWAIT : 1;
+        int got = (int)vos_ipc_recv(&m, wait);
         while (got) {
             handle_msg(&m);
             got = (int)vos_ipc_recv(&m, VOS_IPC_NOWAIT);  /* выгребаем всё */
         }
-        /* Во время drag/resize рисуем каждый тик (до ~100 FPS): кадр после
-         * оптимизаций дешёвый, а плавность перетаскивания решает. В покое —
-         * раз в 2 тика, как раньше. */
         uint64_t now = vos_uptime();
-        uint64_t interval = (drag.active || rz.active) ? 1 : 2;
+        /* На drag/resize рендерим максимально часто — окно следует за
+         * курсором без задержки. В покое — раз в 2 тика. */
+        int cursor_hot = !hw_cursor_ok && cursor_moved;
+        int hot = drag.active || rz.active || anim_any_active() ||
+                  cursor_hot || needs_redraw || panel_dirty || dock_dirty;
+        uint64_t interval = (drag.active || rz.active) ? 0 : (hot ? 1 : 2);
         if (now - last_frame >= interval) {
             tick_render();
             last_frame = now;

@@ -15,6 +15,7 @@
 
 #include "vos_abi.h"
 #include "font8x16.h"
+#include "vfont_ui.h"
 
 #define START_W 460
 #define START_H 340
@@ -82,7 +83,32 @@ static void draw_rect(int x, int y, int w, int h, uint32_t c) {
         }
     }
 }
+/* UI-текст: AdwaitaSans если шрифт загружен, иначе fallback на bitmap font.
+ * draw_text — координаты теперь baseline-top (как у font8x16, верх ячейки).
+ * Ширина текста: text_w() — у пропорционального TTF меряется через xadvance,
+ * у fallback'а — len*8. */
+static int  text_w(const char *s);
+static int  text_h(void);
+static void draw_text_bitmap_(int x, int y, const char *s, uint32_t fg);
+
 static void draw_text(int x, int y, const char *s, uint32_t fg) {
+    if (vfont_ui) {
+        vfont_draw(surf, win_w, win_h, x, y, s, fg, 0, vfont_ui);
+        return;
+    }
+    draw_text_bitmap_(x, y, s, fg);
+}
+static int text_w(const char *s) {
+    if (vfont_ui) return vfont_ui_text_width(s);
+    int n = 0; while (s && s[n]) n++;
+    return n * 8;
+}
+static int text_h(void) {
+    if (vfont_ui) return vfont_ui_line_height();
+    return 16;
+}
+
+static void draw_text_bitmap_(int x, int y, const char *s, uint32_t fg) {
     int cx = x;
     while (*s) {
         uint8_t idx = (uint8_t)*s;
@@ -196,8 +222,8 @@ static void render(void) {
         /* размер справа (только файлы) */
         if (entries[idx].type == VOS_DT_FILE) {
             char sz[12];
-            int len = u_to_dec(entries[idx].size, sz);
-            draw_text(lw - PAD - len * 8, y + 2, sz, COL_DIM);
+            (void)u_to_dec(entries[idx].size, sz);
+            draw_text(lw - PAD - text_w(sz), y + 2, sz, COL_DIM);
         }
     }
 
@@ -227,7 +253,8 @@ static void render(void) {
         draw_text(PAD, sy + 3, buf, COL_DIM);
     }
     if (selected >= 0 && selected < n_entries)
-        draw_text(PAD + 9 * 8 + 16, sy + 3, entries[selected].name, COL_FG);
+        draw_text(PAD + text_w("999 items") + 16, sy + 3,
+                  entries[selected].name, COL_FG);
 
     vwm_commit(wm_pid, win_id, 0, 0, win_w, win_h);
 }
@@ -295,6 +322,7 @@ static void on_mouse(int mx, int my, int buttons) {
 /* ----------------------------- main -------------------------------------- */
 void _start(void) {
     wm_pid = vwm_wait_for_wm();
+    vfont_ui_init();   /* AdwaitaSans для UI; 0 -> fallback на font8x16 */
     win_id = vwm_create_window(wm_pid, "vfiles", START_W, START_H, &surf);
     if (!win_id) {
         puts("vfiles: failed to create window\n");
