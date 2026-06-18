@@ -162,6 +162,9 @@ typedef struct {
                                   должна пересоздать shm под новую ширину и
                                   заново прислать VWM_PANEL_ATTACH */
 #define VWM_PANEL_H        28  /* высота панели (= PANEL_H в vwm) */
+#define VWM_LAUNCHER_TOGGLE 47 /* vpanel->wm: клик по лого V — открыть/закрыть
+                                * лаунчер (/bin/vmenu). vwm спавнит его, повторный
+                                * клик закрывает через close_window. */
 
 /* --- Lock screen ---------------------------------------------------------
  * vlogin: при старте шлёт LOCK -> vwm прячет панель/док/обои и рисует только

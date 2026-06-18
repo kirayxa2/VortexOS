@@ -92,6 +92,10 @@ typedef struct {
     uint64_t shm_id;
     int minimized;              /* 🟡 свёрнуто: не рисуем, чип в панели  */
     int maximized;              /* 🟢 развёрнуто на весь рабочий стол    */
+    int popup;                  /* borderless popup (лаунчер vmenu): без
+                                 * титлбара/тени-декораций, контент во весь
+                                 * фрейм (как lock-окно), не drag/resize,
+                                 * topmost, закрывается по клику снаружи.   */
     int rest_x, rest_y, rest_w, rest_h;  /* геометрия до maximize        */
     char title[32];
     /* TTF-кэш заголовка: alpha-coverage bitmap. Пересчитывается ТОЛЬКО при
@@ -136,6 +140,15 @@ static uint64_t focused_id = 0;
 /* Lock screen: если != 0, рисуем только окно с этим id — обои/панель/док
  * /остальные окна СКРЫТЫ. Используется vlogin'ом. UNLOCK -> 0. */
 static uint64_t g_lock_win = 0;
+
+/* Лаунчер (/bin/vmenu): спавнится по VWM_LAUNCHER_TOGGLE от vpanel (клик по лого
+ * V). g_vmenu_pid — pid спавненного процесса (запоминаем при spawn), g_vmenu_id —
+ * id его окна (фиксируем в on_create при совпадении owner_pid). Toggle закрывает
+ * окно через close_window (graceful: win_drop + VWM_EV_CLOSE), а не kill, т.к.
+ * vwm не реагирует на смерть процесса сам. Обе переменные сбрасываются в win_drop
+ * (само-закрытие после выбора приложения) и при повторном toggle. */
+static uint64_t g_vmenu_pid = 0;
+static uint64_t g_vmenu_id  = 0;
 
 /* drag / resize — порт состояний из kernel simple_wm */
 static struct {
@@ -788,14 +801,14 @@ static uint64_t pending_open_t = 0;
 /* Сколько окон сейчас живёт (для раскладки чипов справа от разделителя). */
 static int dock_window_count(void) {
     int n = 0;
-    for (int i = 0; i < MAX_WINDOWS; i++) if (windows[i].id) n++;
+    for (int i = 0; i < MAX_WINDOWS; i++) if (windows[i].id && !windows[i].popup) n++;
     return n;
 }
 /* Маппинг dock-slot (0..N-1) -> индекс в windows[]. */
 static int dock_slot_to_winidx(int slot) {
     int n = 0;
     for (int i = 0; i < MAX_WINDOWS; i++) {
-        if (!windows[i].id) continue;
+        if (!windows[i].id || windows[i].popup) continue;   /* popup не в доке */
         if (n == slot) return i;
         n++;
     }
@@ -1083,7 +1096,7 @@ static void panel_send_wins(void) {
     vos_msg_t m;
     int count = 0;
     for (int i = 0; i < MAX_WINDOWS; i++)
-        if (windows[i].id) count++;
+        if (windows[i].id && !windows[i].popup) count++;   /* popup не в таскбаре */
     if (count == 0) {
         for (int k = 0; k < 8; k++) m.w[k] = 0;
         m.w[0] = VWM_PANEL_WINS;
@@ -1093,7 +1106,7 @@ static void panel_send_wins(void) {
     int idx = 0;
     for (int i = 0; i < MAX_WINDOWS; i++) {
         vwin_t *w = &windows[i];
-        if (!w->id) continue;
+        if (!w->id || w->popup) continue;       /* popup не в таскбаре */
         for (int k = 0; k < 8; k++) m.w[k] = 0;
         m.w[0] = VWM_PANEL_WINS;
         m.w[1] = w->id;
@@ -1754,6 +1767,19 @@ static void draw_window_chrome(vwin_t *win) {
     draw_round_border(win->x, win->y, win->w, fh, WIN_CORNER, bord);
 }
 
+/* Borderless popup (лаунчер vmenu): контент во весь фрейм, без титлбара,
+ * скруглений и chrome. Лёгкая drop-shadow «отрывает» меню от фона, плюс 1px
+ * рамка. Геометрия как у lock-окна: контент в (win->x, win->y, w, h). */
+static void draw_popup(vwin_t *win) {
+    win_draw_shadow(win->x, win->y, win->w, win->h);
+    blit_buffer(win->x, win->y, win->w, win->h, win->pixels);
+    uint32_t bord = 0xFF454560u;
+    fill_rect(win->x,              win->y,              win->w, 1,      bord);
+    fill_rect(win->x,              win->y + win->h - 1, win->w, 1,      bord);
+    fill_rect(win->x,              win->y,              1,      win->h, bord);
+    fill_rect(win->x + win->w - 1, win->y,              1,      win->h, bord);
+}
+
 /* ---------------------------------------------------------------------------
  * Рендер «как у взрослых» (схема Hyprland/KWin в миниатюре):
  *   1) события копят damage-прямоугольники (dmg_add / dmg_all / dmg_cursor);
@@ -1773,6 +1799,11 @@ static int win_intersects(const vwin_t *win, int rx, int ry, int rw, int rh) {
         anim_current((vwin_t *)win, &ax, &ay, &aw, &ah, &alpha);
         (void)alpha;
         wx = ax - 4; wy = ay - 4; ww = aw + 8; wh = ah + 8;
+    } else if (win->popup) {
+        /* Popup: контент без титлбара, bounds = контент + поле под тень. */
+        int m = WIN_SHADOW;
+        wx = win->x - m; wy = win->y - m;
+        ww = win->w + 2 * m; wh = win->h + 2 * m;
     } else {
         int m = WIN_MARGIN;
         wx = win->x - m; wy = win->y - m;
@@ -1817,7 +1848,9 @@ static void compose_rect_from(int rx, int ry, int rw, int rh, int start_idx) {
         vwin_t *win = &windows[i];
         if (!win->id || !win->pixels || win->minimized) continue;
         if (!win_intersects(win, rx, ry, rw, rh)) continue;
-        if (win->anim_state != ANIM_NONE)
+        if (win->popup)
+            draw_popup(win);          /* borderless, без титлбара */
+        else if (win->anim_state != ANIM_NONE)
             draw_window_anim(win);    /* масштабированная миниатюра + fade */
         else
             draw_window_chrome(win);
@@ -1862,6 +1895,7 @@ static void compose_damage(int rx, int ry, int rw, int rh) {
         vwin_t *win = &windows[i];
         if (!win->id || !win->pixels || win->minimized) continue;
         if (win->anim_state != ANIM_NONE) continue;   /* не накрывает полностью */
+        if (win->popup) continue;     /* popup-геометрия иная — не occluder */
         int bx, by, bw, bh;
         win_opaque_body(win, &bx, &by, &bw, &bh);
         if (bw <= 0 || bh <= 0) continue;
@@ -2140,6 +2174,8 @@ static uint64_t mouse_press_win = 0;
  * страницы реально освобождаются, когда отпустят оба. После release пиксели
  * трогать нельзя — маппинг снят. */
 static void win_drop(vwin_t *win) {
+    if (g_vmenu_id == win->id) { g_vmenu_id = 0; g_vmenu_pid = 0; }
+    win->popup = 0;            /* слот переиспользуется — флаг не наследуем */
     if (focused_id == win->id) focused_id = 0;
     if (drag.active && drag.win_id == win->id) drag.active = 0;
     if (rz.active && rz.win_id == win->id) rz.active = 0;
@@ -2331,6 +2367,7 @@ static void update_cursor_shape(void) {
             for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
                 vwin_t *win = &windows[i];
                 if (!win->id || win->minimized) continue;
+                if (win->popup) continue;   /* popup не ресайзится — стрелка */
                 int owns = (mouse_x >= win->x - RESIZE_BORDER &&
                             mouse_x <= win->x + win->w + RESIZE_BORDER &&
                             mouse_y >= win->y - RESIZE_BORDER &&
@@ -2462,6 +2499,33 @@ static void on_mouse_button(uint8_t buttons) {
                         (uint64_t)mx, (uint64_t)my, (uint64_t)buttons);
         }
         return;
+    }
+
+    /* --- Popup-лаунчер (vmenu): пока открыт — модальный. Клик внутри
+     * форвардим как content-mouse (без титлбар-офсета); клик снаружи закрывает
+     * меню (Kali-поведение). Док/панель/окна недоступны, пока меню открыто. --- */
+    if (g_vmenu_id) {
+        vwin_t *pw = find_window(g_vmenu_id);
+        if (pw && pw->popup) {
+            int inside = (mx >= pw->x && mx < pw->x + pw->w &&
+                          my >= pw->y && my < pw->y + pw->h);
+            if (buttons & 1) {
+                if (inside) {
+                    send_event4(pw->owner_pid, VWM_EV_MOUSE, pw->id,
+                                (uint64_t)(mx - pw->x),
+                                (uint64_t)(my - pw->y), (uint64_t)buttons);
+                    mouse_press_win = pw->id;
+                } else {
+                    close_window(pw);          /* клик мимо — закрыть лаунчер */
+                }
+            } else if (mouse_press_win == pw->id) {
+                send_event4(pw->owner_pid, VWM_EV_MOUSE, pw->id,
+                            (uint64_t)(mx - pw->x),
+                            (uint64_t)(my - pw->y), 0);
+                mouse_press_win = 0;
+            }
+            return;
+        }
     }
 
     /* --- Dock поверх окон --- */
@@ -2691,6 +2755,14 @@ static void on_create(vos_msg_t *m) {
         if (win->y + win->h + TITLEBAR_H > (int)fbh)
             win->y = imax(PANEL_H, (int)fbh - win->h - TITLEBAR_H - 8);
     }
+    /* Лаунчер: запоминаем id его окна и заякориваем под лого V (слева, под
+     * панелью) — так popup появляется рядом с кнопкой V, как задумано. */
+    if (sender == g_vmenu_pid && g_vmenu_pid) {
+        g_vmenu_id = win->id;
+        win->popup = 1;            /* borderless popup, без титлбара */
+        win->x = 8;
+        win->y = PANEL_H + 6;
+    }
     const char *t = (const char *)&m->w[3];
     int i = 0;
     while (t[i] && i < 31) { win->title[i] = t[i]; i++; }
@@ -2880,6 +2952,20 @@ static void handle_msg(vos_msg_t *m) {
                     raise_window(win->id);   /* win невалиден дальше */
                     panel_send_wins();
                 }
+            }
+        }
+        break;
+    case VWM_LAUNCHER_TOGGLE:
+        /* Клик по лого V в панели. Открыт -> закрыть (graceful close_window:
+         * win_drop + VWM_EV_CLOSE, vmenu сам выйдет). Закрыт -> спавнить. */
+        if (m->w[7] == panel_pid) {
+            vwin_t *mw = g_vmenu_id ? find_window(g_vmenu_id) : 0;
+            if (mw) {
+                close_window(mw);          /* win_drop сбросит g_vmenu_id/pid */
+            } else {
+                g_vmenu_id = 0; g_vmenu_pid = 0;   /* окно умерло без DESTROY */
+                int64_t pid = (int64_t)vos_spawn("/bin/vmenu");
+                if (pid > 0) g_vmenu_pid = (uint64_t)pid;
             }
         }
         break;

@@ -172,9 +172,17 @@ static void on_wins_msg(vos_msg_t *m) {
 }
 
 static void on_click(int mx, int my, int buttons) {
-    /* Чипы окон переехали в док (vwm). Кликабельных зон в панели больше нет —
-     * это просто bar с лого и часами. */
-    (void)mx; (void)my; (void)buttons;
+    /* Чипы окон переехали в док (vwm). Единственная кликабельная зона панели —
+     * лого V + надпись «VortexOS» слева: открывает/закрывает лаунчер (vmenu).
+     * Координаты приходят в системе панели (screen, т.к. панель в (0,0)). */
+    if (!(buttons & 1)) return;
+    int hit_w = 30 + ui_text_width("VortexOS") + 8;   /* лого@8..24 + текст@30.. */
+    if (mx >= 4 && mx < hit_w && my >= 0 && my < H) {
+        vos_msg_t m;
+        for (int i = 0; i < 8; i++) m.w[i] = 0;
+        m.w[0] = VWM_LAUNCHER_TOGGLE;
+        vos_ipc_send(wm_pid, &m);
+    }
 }
 
 /* (Пере)создать поверхность под текущую ширину экрана и приаттачиться к vwm.
